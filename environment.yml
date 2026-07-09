@@ -1,0 +1,16 @@
+name: roman-mast-tools
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - numpy
+  - matplotlib
+  - astropy
+  - astroquery
+  - tqdm
+  - keyring
+  - python-dotenv
+  - requests
+  - pip
+  - pip:
+    - roman-datamodels
