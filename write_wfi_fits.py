@@ -1,14 +1,18 @@
-"""Stream all 18 Roman WFI SCAs and write them as compressed FITS files with SIP WCS headers.
+"""Stream Roman WFI SCAs as FITS HDUs and write them to disk or DS9.
 
-Output: one FITS file per SCA named sca_NN.fits[.fz] in the directory given by output_dir.
-When more than one exposure is selected (via range or wildcard), a sub-folder exp<NN> is
-created inside output_dir for each exposure.
-Uses FITS tile compression (Rice by default) via CompImageHDU.  DS9, Imviz, and astropy
-all read .fz files transparently.  Typical compression ratio ~3-4x for sky-background-limited
-detector images.
+write_wfi_fits: Stream all 18 Roman WFI SCAs and write them as compressed FITS files with SIP WCS headers.
+  Output: one FITS file per SCA named sca_NN.fits[.fz] in the directory given by output_dir.
+  When more than one exposure is selected (via range or wildcard), a sub-folder exp<NN> is
+  created inside output_dir for each exposure.
+  Uses FITS tile compression (Rice by default) via CompImageHDU.  DS9, Imviz, and astropy
+  all read .fz files transparently.  Typical compression ratio ~3-4x for sky-background-limited
+  detector images.
+  The SIP approximation is accurate to ~0.1 px across the chip, which is sufficient
+  for DS9 mosaicking and most analysis tools.
 
-The SIP approximation is accurate to ~0.1 px across the chip, which is sufficient
-for DS9 mosaicking and most analysis tools.
+stream_to_ds9: Stream Roman WFI SCAs directly into DS9 without writing to disk.
+  Uses pyds9 to load each SCA as a separate frame in DS9, with full WCS headers.
+  Allows real-time interactive inspection of streaming data.
 """
 
 import keyring, keyring.backends.null
@@ -19,6 +23,7 @@ warnings.filterwarnings('ignore')
 
 import os
 import re
+import io
 import argparse
 import csv
 import numpy as np
@@ -32,6 +37,173 @@ from streaming_utils import (
 )
 from export_metadata_csv import flatten_metadata
 from query_utils import add_query_args, prompt_query_params, resolve_query
+
+try:
+    import pyds9
+except ImportError:
+    pyds9 = None
+
+
+def stream_to_ds9(visit_id, exp_spec=1, data_level=2, sip_degree=4, verbose=False, sca_spec=None, ds9_target=None):
+    """Stream Roman WFI SCAs directly into DS9 without writing to disk.
+
+    Args:
+        visit_id (str): Roman visit ID (e.g., '0012401001001002001')
+        exp_spec (int | str | None): Exposure selector — single int, range string
+            ('1-3'), comma list ('1,2,5'), or None for all (default 1)
+        data_level (int): Data level (1=uncal, 2=cal, default 2)
+        sip_degree (int): SIP polynomial degree (default 4)
+        verbose (bool): Show detailed output (default False)
+        sca_spec (str | None): SCA selector — range string ('1-5'), comma list ('1,3,5'),
+            or None for all (default None)
+        ds9_target (str | None): DS9 target name for pyds9. If None, uses default DS9 instance.
+
+    Returns:
+        pyds9.DS9: The DS9 instance with loaded data.
+
+    Raises:
+        ImportError: If pyds9 is not installed.
+        ValueError: If MAST_API_TOKEN is not available or DS9 is not running.
+    """
+
+    if pyds9 is None:
+        raise ImportError(
+            "pyds9 is required for stream_to_ds9. Install with: pip install pyds9"
+        )
+
+    # Get MAST token
+    mast_token = get_MAST_token()
+    if not mast_token:
+        raise ValueError("MAST_API_TOKEN not found in .env file")
+
+    print("="*80)
+    print(f"Streaming WFI to DS9")
+    print("="*80)
+    print(f"Visit ID:           {visit_id}")
+    print(f"Exposure spec:      {exp_spec}")
+    print(f"SCA spec:           {sca_spec or 'all'}")
+    print(f"Data level:         {data_level}")
+    print(f"SIP degree:         {sip_degree}")
+    print()
+
+    # --- Query -------------------------------------------------------------------
+    q = resolve_query(
+        visit_id,
+        exp_spec=str(exp_spec) if exp_spec is not None else None,
+        data_level=data_level,
+        sca_spec=sca_spec
+    )
+
+    # Build list of unique (visit_id, exp_num) pairs from the summary.
+    visit_exp_pairs = []
+    for vid in sorted(q.summary.keys()):
+        for exp_num in sorted(q.summary[vid]['exposures']):
+            visit_exp_pairs.append((vid, exp_num))
+
+    if len(visit_exp_pairs) > 1:
+        raise ValueError(
+            f"stream_to_ds9 currently supports a single exposure per call. "
+            f"Found {len(visit_exp_pairs)} exposures. Use exp_spec to select a single exposure."
+        )
+
+    vid, exp_num = visit_exp_pairs[0]
+
+    # Connect to DS9
+    try:
+        if ds9_target:
+            d = pyds9.DS9(target=ds9_target)
+        else:
+            d = pyds9.DS9()
+    except Exception as e:
+        raise ValueError(
+            f"Failed to connect to DS9: {e}\n"
+            f"Make sure DS9 is running: ds9 &"
+        )
+
+    print("Streaming data from MAST...")
+    buffer_dict = stream_file_group_to_buffer(q.urls, exp_num=exp_num, mast_token=mast_token)
+
+    print("Building in-memory mosaic MEF...")
+    print("-" * 80)
+
+    # Build a single MEF: empty PrimaryHDU + one ImageHDU per SCA, each with its
+    # own SIP WCS.  This is the on-the-wire equivalent of `ds9 -mosaic *.fits`:
+    # the XPA access point `fits mosaicimage wcs` treats every image extension
+    # as a tile and stitches them by WCS into a single frame.
+    hdulist = fits.HDUList([fits.PrimaryHDU()])
+
+    n_loaded = 0
+    for scanum in sorted(buffer_dict):
+        buf = buffer_dict.get(scanum)
+        if buf is None:
+            if verbose:
+                print(f'  SCA {scanum:02d}: no buffer, skipping')
+            continue
+
+        buf.seek(0)
+        dm   = rdm.open(buf)
+        data = dm.data[...].astype(np.float32)
+
+        # --- Build WCS header ---
+        wcs  = dm.meta.wcs
+        hdr = wcs.to_fits_sip(
+            bounding_box=wcs.bounding_box,
+            degree=sip_degree,
+        )
+
+        # Do NOT stamp SIMPLE/BITPIX/NAXIS* — astropy sets those from the data
+        # when the HDU is built; pre-stamping them can conflict with ImageHDU.
+        hdr['EXTNAME'] = f'SCA{scanum:02d}'
+        hdr['VISITID'] = (vid, 'Roman visit ID')
+        hdr['EXPNUM']  = (exp_num, 'Exposure number within visit')
+        hdr['SCANUM']  = (scanum, 'SCA number (1-18)')
+
+        # Copy useful metadata fields if present
+        for src, dest, comment in [
+            ('meta.exposure.start_time',      'DATE-BEG', 'Exposure start (UTC)'),
+            ('meta.exposure.end_time',        'DATE-END', 'Exposure end (UTC)'),
+            ('meta.exposure.effective_exposure_time', 'EXPTIME', 'Effective exposure time [s]'),
+            ('meta.instrument.detector',      'DETECTOR', 'Detector name'),
+            ('meta.instrument.optical_element', 'FILTER', 'Optical element / filter'),
+        ]:
+            try:
+                val = dm
+                for attr in src.split('.'):
+                    val = getattr(val, attr)
+                hdr[dest] = (str(val), comment)
+            except AttributeError:
+                pass
+
+        hdulist.append(fits.ImageHDU(data=data, header=hdr, name=f'SCA{scanum:02d}'))
+        print(f'  SCA {scanum:02d}: added to mosaic  ({data.shape[0]}x{data.shape[1]} pixels)')
+        n_loaded += 1
+
+    print("-" * 80)
+
+    if n_loaded == 0:
+        close_buffer_streams(buffer_dict)
+        raise ValueError("No SCA data was streamed; nothing to load into DS9.")
+
+    # Serialize the MEF to a byte buffer and pipe it to DS9 via XPA.
+    # `fits mosaicimage wcs` = "treat every image HDU as a mosaic tile aligned
+    # by WCS", which is exactly what `ds9 -mosaic *.fits` does on the CLI.
+    mef_buf = io.BytesIO()
+    hdulist.writeto(mef_buf)
+    mef_bytes = mef_buf.getvalue()
+
+    print(f"Piping {len(mef_bytes)/1e6:.0f} MB MEF into DS9 as WCS mosaic...")
+    d.set('frame delete all')
+    d.set('frame new')
+    d.set('fits mosaicimage wcs', mef_bytes)
+    d.set('zoom to fit')
+
+    # Clean up
+    close_buffer_streams(buffer_dict)
+
+    print(f"\nLoaded {n_loaded} SCAs as a single WCS mosaic in DS9")
+    print(f"Visit {vid} / Exposure {exp_num}")
+
+    return d
 
 
 def write_wfi_fits(visit_id, exp_spec=1, data_level=2, output_dir=None, sip_degree=4, compress=False, verbose=False, sca_spec=None):
@@ -359,31 +531,39 @@ def write_wfi_fits(visit_id, exp_spec=1, data_level=2, output_dir=None, sip_degr
 def main():
     """Interactive or command-line entry point."""
     parser = argparse.ArgumentParser(
-        description='Stream Roman WFI SCAs and write as compressed FITS files with SIP WCS headers.',
+        description='Stream Roman WFI SCAs to disk or DS9.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Write to disk (compressed FITS files)
   python write_wfi_fits.py 0012401001001002001 --exp-num 1
   python write_wfi_fits.py 0012401001001002001 --exp-num 2 --data-level 1 --compress
   python write_wfi_fits.py 0012401001001002001 --exp-range 1-3 --output-dir /tmp/fits
-  python write_wfi_fits.py 0012401001001002001 --output-dir /tmp/fits --sip-degree 3
-  python write_wfi_fits.py  (interactive mode)
+
+  # Stream to DS9 (requires DS9 running and pyds9 installed)
+  python write_wfi_fits.py 0012401001001002001 --exp-num 1 --to-ds9
+  python write_wfi_fits.py 0012401001001002001 --exp-num 2 --data-level 1 --to-ds9 --sip-degree 3
+
+  # Interactive mode
+  python write_wfi_fits.py
         """)
 
     add_query_args(parser, visit_wildcard=False, exp_mode='flexible', sca_mode='all')
     parser.add_argument('--output-dir', default=None,
-                        help='Output directory for FITS files')
+                        help='Output directory for FITS files (disk mode only)')
     parser.add_argument('--sip-degree', type=int, default=None,
                         help='SIP polynomial degree (default: 4)')
     parser.add_argument('--compress', action='store_true',
-                        help='Use RICE tile compression (.fits.fz) instead of plain FITS')
+                        help='Use RICE tile compression (.fits.fz) instead of plain FITS (disk mode only)')
+    parser.add_argument('--to-ds9', action='store_true',
+                        help='Stream directly to DS9 instead of writing to disk')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Show detailed output')
 
     args = parser.parse_args()
 
     if args.visit_id is None:
-        print("Roman WFI FITS Writer")
+        print("Roman WFI Data Streamer")
         print("=" * 70)
         params = prompt_query_params(
             visit_wildcard=False,
@@ -402,34 +582,54 @@ Examples:
         sip_degree_str = input("Enter SIP degree (default 4): ").strip()
         sip_degree = int(sip_degree_str) if sip_degree_str else 4
 
-        compress_str = input("Use RICE compression? (y/n, default n): ").strip().lower()
-        compress = compress_str == 'y'
+        mode_str = input("Output mode? (disk/ds9, default disk): ").strip().lower()
+        to_ds9 = mode_str == 'ds9'
 
-        verbose_str = input("Verbose output? (y/n, default n): ").strip().lower()
-        verbose = verbose_str == 'y'
+        if to_ds9:
+            verbose_str = input("Verbose output? (y/n, default n): ").strip().lower()
+            verbose = verbose_str == 'y'
+            output_dir = None
+            compress = False
+        else:
+            compress_str = input("Use RICE compression? (y/n, default n): ").strip().lower()
+            compress = compress_str == 'y'
 
-        output_dir = None
+            verbose_str = input("Verbose output? (y/n, default n): ").strip().lower()
+            verbose = verbose_str == 'y'
+
+            output_dir = None
     else:
         visit_id = args.visit_id
         exp_spec = args.exp_range or (args.exp_num if args.exp_num is not None else 1)
         sca_spec = args.scas
         data_level = args.data_level if args.data_level is not None else 2
         sip_degree = args.sip_degree if args.sip_degree is not None else 4
+        to_ds9 = args.to_ds9
         compress = args.compress
         verbose = args.verbose
         output_dir = args.output_dir
 
     try:
-        write_wfi_fits(
-            visit_id=visit_id,
-            exp_spec=exp_spec,
-            data_level=data_level,
-            output_dir=output_dir,
-            sip_degree=sip_degree,
-            compress=compress,
-            verbose=verbose,
-            sca_spec=sca_spec,
-        )
+        if to_ds9:
+            stream_to_ds9(
+                visit_id=visit_id,
+                exp_spec=exp_spec,
+                data_level=data_level,
+                sip_degree=sip_degree,
+                verbose=verbose,
+                sca_spec=sca_spec,
+            )
+        else:
+            write_wfi_fits(
+                visit_id=visit_id,
+                exp_spec=exp_spec,
+                data_level=data_level,
+                output_dir=output_dir,
+                sip_degree=sip_degree,
+                compress=compress,
+                verbose=verbose,
+                sca_spec=sca_spec,
+            )
     except Exception as e:
         print(f"\nERROR: {e}")
         import traceback
