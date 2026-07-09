@@ -277,7 +277,7 @@ def write_wfi_fits(visit_id, exp_spec=1, data_level=2, output_dir=None, sip_degr
             print(f"✓ Metadata written to: {csv_file}")
 
         print(f'\nFiles in: {exp_dir}/')
-        print(f'Open in DS9:  ds9 -mosaicimage wcs {exp_dir}/sca_*.{ext}')
+        print(f'Open in DS9:  ds9 -mosaic {exp_dir}/sca_*.{ext}')
 
         # --- Clean up -----------------------------------------------------------
         close_buffer_streams(buffer_dict)
