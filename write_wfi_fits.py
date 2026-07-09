@@ -103,6 +103,9 @@ def write_wfi_fits(visit_id, exp_spec=1, data_level=2, output_dir=None, sip_degr
 
     ext = 'fits.fz' if compress else 'fits'
 
+    # Collect all metadata rows across all exposures for top-level CSV
+    all_metadata_rows = []
+
     # --- Loop over (visit_id, exp_num) pairs ---
     for vid, exp_num in visit_exp_pairs:
         if multi_exposure:
@@ -276,11 +279,74 @@ def write_wfi_fits(visit_id, exp_spec=1, data_level=2, output_dir=None, sip_degr
 
             print(f"✓ Metadata written to: {csv_file}")
 
+            # Accumulate for top-level CSV
+            all_metadata_rows.extend(metadata_rows)
+
         print(f'\nFiles in: {exp_dir}/')
         print(f'Open in DS9:  ds9 -mosaic {exp_dir}/sca_*.{ext}')
 
         # --- Clean up -----------------------------------------------------------
         close_buffer_streams(buffer_dict)
+
+    # --- Write aggregated top-level metadata CSV --------------------------------
+    if all_metadata_rows and multi_exposure:
+        # Collect all unique keys from metadata rows
+        all_keys = set()
+        for row in all_metadata_rows:
+            all_keys.update(row.keys())
+
+        all_keys = sorted(all_keys)
+
+        # Reorder keys with user-specified priority order
+        priority_keys = [
+            'visit', 'exposure', 'sca',
+            'data_shape', 'data_dtype', 'data_min', 'data_max', 'data_mean', 'data_nan_pixels', 'data_valid_pixels',
+            'meta.exposure.effective_exposure_time',
+            'meta.exposure.start_time',
+            'meta.exposure.end_time',
+            'meta.exposure.frame_time',
+            'meta.exposure.hga_move',
+            'meta.exposure.ma_table_id',
+            'meta.file_date',
+            'meta.pointing.target_aperture',
+            'meta.exposure.ma_table_name',
+            'meta.rcs.active',
+            'meta.rcs.bank',
+            'meta.rcs.counts',
+            'meta.rcs.electronics',
+            'meta.rcs.led',
+            'meta.source_catalog.tweakreg_catalog_name',
+            'meta.statistics.good_pixel_fraction',
+            'meta.statistics.image_median',
+            'meta.statistics.image_rms',
+            'meta.statistics.zodiacal_light',
+            'meta.pointing.target_dec',
+            'meta.pointing.target_ra',
+        ]
+
+        ordered_keys = [k for k in priority_keys if k in all_keys]
+        remaining_keys = sorted([k for k in all_keys if k not in ordered_keys])
+        ordered_keys.extend(remaining_keys)
+
+        # Generate top-level CSV filename
+        top_csv_file = os.path.join(base_dir, f'metadata_all_level{data_level}.csv')
+
+        print(f"\nWriting aggregated metadata CSV: {top_csv_file}")
+        print(f"  Rows (all SCAs): {len(all_metadata_rows)}")
+        print(f"  Columns (mnemonics): {len(ordered_keys)}")
+
+        with open(top_csv_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=ordered_keys, restval='')
+            writer.writeheader()
+
+            for row in all_metadata_rows:
+                # Fill missing values
+                for key in ordered_keys:
+                    if key not in row:
+                        row[key] = ''
+                writer.writerow(row)
+
+        print(f"✓ Aggregated metadata written to: {top_csv_file}")
 
     print(f'\nAll done.')
     if multi_exposure:
