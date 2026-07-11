@@ -126,13 +126,21 @@ def stream_to_ds9(visit_id, exp_spec=1, data_level=2, sip_degree=4, verbose=Fals
     print("Building in-memory mosaic MEF...")
     print("-" * 80)
 
-    # Build a single MEF: empty PrimaryHDU + one ImageHDU per SCA, each with its
-    # own SIP WCS.  This is the on-the-wire equivalent of `ds9 -mosaic *.fits`:
-    # the XPA access point `fits mosaicimage wcs` treats every image extension
-    # as a tile and stitches them by WCS into a single frame.
-    hdulist = fits.HDUList([fits.PrimaryHDU()])
+    # Build two parallel MEFs: one for the science data, one for the DQ (bad-
+    # pixel) array.  Both use the same SIP WCS per SCA, so DS9 can stitch them
+    # as WCS mosaics and overlay the DQ mosaic as a mask on the data frame.
+    # `fits mosaicimage wcs` treats every image extension as a tile and
+    # stitches by WCS — the equivalent of `ds9 -mosaic *.fits` on the CLI.
+    data_hdulist = fits.HDUList([fits.PrimaryHDU()])
+    dq_hdulist   = fits.HDUList([fits.PrimaryHDU()])
+
+    # Guide-star window polygons in world coords, one per SCA, drawn as an
+    # fk5 region overlay on the mosaic frame.
+    gs_region_lines = []
 
     n_loaded = 0
+    n_dq     = 0
+    n_gs     = 0
     for scanum in sorted(buffer_dict):
         buf = buffer_dict.get(scanum)
         if buf is None:
@@ -174,8 +182,57 @@ def stream_to_ds9(visit_id, exp_spec=1, data_level=2, sip_degree=4, verbose=Fals
             except AttributeError:
                 pass
 
-        hdulist.append(fits.ImageHDU(data=data, header=hdr, name=f'SCA{scanum:02d}'))
-        print(f'  SCA {scanum:02d}: added to mosaic  ({data.shape[0]}x{data.shape[1]} pixels)')
+        data_hdulist.append(fits.ImageHDU(data=data, header=hdr.copy(), name=f'SCA{scanum:02d}'))
+
+        # --- Guide-star window region --------------------------------------
+        # meta.guide_star.window_[xy]{start,stop} defines a rectangular window
+        # in SCA pixel coords (1-based FITS convention).  Project its four
+        # corners through the SCA's gwcs to sky and emit an fk5 polygon so
+        # the region lands on the correct tile of the WCS mosaic.
+        try:
+            gs = dm.meta.guide_star
+            x0 = int(gs.window_xstart)
+            x1 = int(gs.window_xstop)
+            y0 = int(gs.window_ystart)
+            y1 = int(gs.window_ystop)
+            # gwcs pixel_to_world uses 0-based pixel coords; FITS window_* are
+            # 1-based, so subtract 1 for the transform.
+            xs = np.array([x0, x1, x1, x0], dtype=float) - 1.0
+            ys = np.array([y0, y0, y1, y1], dtype=float) - 1.0
+            sky = wcs(xs, ys)  # returns (ra, dec) in degrees
+            ra_corners, dec_corners = sky[0], sky[1]
+            if np.all(np.isfinite(ra_corners)) and np.all(np.isfinite(dec_corners)):
+                coords = ','.join(f'{r:.8f},{d:.8f}'
+                                  for r, d in zip(ra_corners, dec_corners))
+                gs_region_lines.append(
+                    f'polygon({coords}) # color=green width=2 text={{SCA{scanum:02d} GS}}'
+                )
+                n_gs += 1
+        except AttributeError:
+            pass
+        except Exception as e:
+            if verbose:
+                print(f'  SCA {scanum:02d}: guide-star region skipped ({e})')
+
+        # --- DQ / bad-pixel mask -------------------------------------------
+        # Roman ImageModel exposes `dq` as a per-pixel bitmask (uint32); any
+        # non-zero bit means the pixel is flagged as bad.  For a DS9 mask
+        # overlay we only need the "is bad?" boolean — cast to uint8 so the
+        # mosaic MEF stays small.
+        try:
+            dq = np.asarray(dm.dq[...])
+            dq_mask = (dq != 0).astype(np.uint8)
+            dq_hdr = hdr.copy()
+            dq_hdr['BUNIT']   = 'flag'
+            dq_hdr['CONTENT'] = ('DQ_MASK', 'Non-zero = bad pixel (any DQ bit set)')
+            dq_hdulist.append(fits.ImageHDU(data=dq_mask, header=dq_hdr, name=f'DQ{scanum:02d}'))
+            n_dq += 1
+            print(f'  SCA {scanum:02d}: added to mosaic  ({data.shape[0]}x{data.shape[1]} pixels, '
+                  f'{int(dq_mask.sum())} bad pixels)')
+        except AttributeError:
+            print(f'  SCA {scanum:02d}: added to mosaic  ({data.shape[0]}x{data.shape[1]} pixels, '
+                  f'no DQ layer)')
+
         n_loaded += 1
 
     print("-" * 80)
@@ -184,23 +241,55 @@ def stream_to_ds9(visit_id, exp_spec=1, data_level=2, sip_degree=4, verbose=Fals
         close_buffer_streams(buffer_dict)
         raise ValueError("No SCA data was streamed; nothing to load into DS9.")
 
-    # Serialize the MEF to a byte buffer and pipe it to DS9 via XPA.
-    # `fits mosaicimage wcs` = "treat every image HDU as a mosaic tile aligned
-    # by WCS", which is exactly what `ds9 -mosaic *.fits` does on the CLI.
-    mef_buf = io.BytesIO()
-    hdulist.writeto(mef_buf)
-    mef_bytes = mef_buf.getvalue()
+    # Serialize the data MEF and pipe it to DS9 via XPA.
+    data_buf = io.BytesIO()
+    data_hdulist.writeto(data_buf)
+    data_bytes = data_buf.getvalue()
 
-    print(f"Piping {len(mef_bytes)/1e6:.0f} MB MEF into DS9 as WCS mosaic...")
+    print(f"Piping {len(data_bytes)/1e6:.0f} MB data MEF into DS9 as WCS mosaic...")
     d.set('frame delete all')
     d.set('frame new')
-    d.set('fits mosaicimage wcs', mef_bytes)
+    d.set('fits mosaicimage wcs', data_bytes)
+
+    # --- Overlay DQ as a mask -----------------------------------------------
+    # DS9's mask feature draws non-zero pixels of a second image on top of the
+    # current frame in a chosen color, aligned by WCS.  This is the on-the-wire
+    # equivalent of `File → Open As → Mask` from the DS9 GUI, done as another
+    # WCS mosaic so the mask tiles line up with the data tiles.
+    if n_dq > 0:
+        dq_buf = io.BytesIO()
+        dq_hdulist.writeto(dq_buf)
+        dq_bytes = dq_buf.getvalue()
+
+        print(f"Piping {len(dq_bytes)/1e6:.1f} MB DQ mask MEF into DS9 as overlay...")
+        d.set('mask clear')
+        d.set('mask color red')
+        d.set('mask transparency 50')
+        d.set('mask mark nonzero')
+        d.set('fits mask mosaicimage wcs', dq_bytes)
+
+    # --- Guide-star region overlay ------------------------------------------
+    # Send the fk5 polygons for all SCAs' guide-star windows as a single
+    # DS9 region file over XPA.
+    if gs_region_lines:
+        region_text = "# Region file format: DS9 version 4.1\nfk5\n" + \
+                      "\n".join(gs_region_lines) + "\n"
+        print(f"Sending {n_gs} guide-star window regions to DS9...")
+        d.set('regions delete all')
+        d.set('regions', region_text)
+
     d.set('zoom to fit')
 
     # Clean up
     close_buffer_streams(buffer_dict)
 
-    print(f"\nLoaded {n_loaded} SCAs as a single WCS mosaic in DS9")
+    extras = []
+    if n_dq:
+        extras.append(f'DQ mask overlay ({n_dq} SCAs)')
+    if n_gs:
+        extras.append(f'{n_gs} guide-star regions')
+    suffix = f" with {' + '.join(extras)}" if extras else ''
+    print(f"\nLoaded {n_loaded} SCAs as a single WCS mosaic in DS9{suffix}")
     print(f"Visit {vid} / Exposure {exp_num}")
 
     return d
