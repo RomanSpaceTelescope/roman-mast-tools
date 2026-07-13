@@ -88,11 +88,9 @@ def group_file_urls(mast_token=None, visit_id=None, exp_num='*', data_level=1, m
         exp_num = f'*{exp_num:04}'
 
     if data_level != 'gw':
-        search = {
-            'visit_id': visit_id,
-            'observation_id': exp_num,
-            'productLevel': data_level
-        }
+        search = {'visit_id': visit_id}
+        if exp_num != '*':
+            search['observation_id'] = exp_num
     else:
         guide_window_id = visit_id
         if exp_num != '*':
@@ -100,7 +98,6 @@ def group_file_urls(mast_token=None, visit_id=None, exp_num='*', data_level=1, m
         search = {
             'visit_id': visit_id,
             'guide_window_id': guide_window_id,
-            'productLevel': 1
         }
 
     results = missions.query_criteria(**search, select_cols=col_list)
@@ -314,23 +311,21 @@ def get_exp_num(filename):
     return int(search_result.group(1))
 
 
-def get_MAST_token(env_filepath='.env'):
-    """Get the MAST API authentication token from a .env file.
-    The API token must be set in a .env file as:
-    MAST_API_TOKEN=<token>
+def get_MAST_token(token_filepath='mast_api_token.txt'):
+    """Get the MAST API authentication token from a text file.
+    The API token must be stored in the file as a single line containing the token.
 
     Args:
-        env_filepath (str, optional): Filepath to the .env file. Defaults to local '.env' file.
+        token_filepath (str, optional): Filepath to the token file. Defaults to 'mast_api_token.txt'.
 
     Returns:
-        str: MAST API authentication token.   
+        str: MAST API authentication token, or None if file not found or empty.
     """
 
-    # Loading environment variables
-    dotenv.load_dotenv(env_filepath)
-
-    # Pulling MAST API token from environment variables.
-    mast_token = os.environ.get("MAST_API_TOKEN")
-
-    return mast_token
+    try:
+        with open(token_filepath, 'r') as f:
+            mast_token = f.read().strip()
+        return mast_token if mast_token else None
+    except FileNotFoundError:
+        return None
 

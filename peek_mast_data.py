@@ -159,17 +159,22 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  python peek_mast_data.py 0012401001001002001
+  python peek_mast_data.py 0012401001001002001 --exposure 4
   python peek_mast_data.py --program 114 --pass 57 --detector WFI04
   python peek_mast_data.py --visit-id 0011401057001001001 --exposure 4
   python peek_mast_data.py --program 114 --data-level 1
   python peek_mast_data.py                       (interactive)
         """,
     )
+    parser.add_argument('visit_id', nargs='?', default=None,
+                        help='Visit ID as a positional argument (e.g. 0012401001001002001)')
     parser.add_argument('--program',   type=int, default=None, help='APT program ID (e.g. 114)')
     parser.add_argument('--pass',      dest='pass_', type=int, default=None,
                         metavar='PASS', help='Pass number (e.g. 57)')
     parser.add_argument('--detector',  default=None, help='Detector, e.g. WFI04')
-    parser.add_argument('--visit-id',  default=None, help='Visit ID, e.g. 0011401057001001001')
+    parser.add_argument('--visit-id',  dest='visit_id_flag', default=None,
+                        help='Visit ID as a flag (e.g. 0011401057001001001)')
     parser.add_argument('--exposure',  type=int, default=None,
                         help='Exposure number (matches trailing 4 digits of observation_id)')
     parser.add_argument('--data-level', default='2',
@@ -179,8 +184,10 @@ Examples:
 
     args = parser.parse_args()
 
+    visit_id = args.visit_id or args.visit_id_flag
+
     any_flag = any(v is not None for v in [
-        args.program, args.pass_, args.detector, args.visit_id, args.exposure,
+        args.program, args.pass_, args.detector, visit_id, args.exposure,
     ])
 
     try:
@@ -194,7 +201,7 @@ Examples:
                 program=args.program,
                 pass_=args.pass_,
                 detector=args.detector,
-                visit_id=args.visit_id,
+                visit_id=visit_id,
                 exposure=args.exposure,
                 data_level=parse_level(args.data_level),
                 max_rows=args.max_rows,

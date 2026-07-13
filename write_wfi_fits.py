@@ -33,6 +33,7 @@ from astropy.io import fits
 from streaming_utils import (
     stream_file_group_to_buffer,
     close_buffer_streams,
+    get_MAST_token,
 )
 from export_metadata_csv import flatten_metadata
 from query_utils import add_query_args, prompt_query_params, resolve_query
