@@ -9,7 +9,10 @@ Public surface
 --------------
     flatten_metadata(obj, prefix='')     → dict[str, scalar]  (dot-notation keys)
     extract_row(af, sca, exposure)       → dict for one SCA (data stats + meta)
-    export_csv(res, indices, scas, out)  → path to written CSV
+    extract_rows(af_dict, exposure, ...) → rows for an already-streamed af_dict
+    write_csv(rows, output)              → path to written CSV
+    write_metadata_csv(af_dict, exp, ...) → one-shot for a single exposure
+    export_csv(res, indices, scas, out)  → path to written CSV (streams + writes)
 
 CLI mirrors roman_fits.py — use the standard --program / --pass / --visit-id
 / etc. filters to find exposures, then --exposures / --scas to pick which
@@ -196,6 +199,36 @@ def extract_row(af, sca_num: int, exposure: Exposure) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Row extraction from an already-streamed exposure
+# ---------------------------------------------------------------------------
+
+def extract_rows(af_dict: dict, exposure: Exposure) -> list:
+    """Extract CSV rows from an in-memory `{sca: AsdfFile}` dict.
+
+    Companion to `roman_fits.to_fits_files` / `to_ds9` — those consume the
+    same af_dict, so callers who already streamed the exposure for FITS/DS9
+    output can drop the metadata CSV for free without re-streaming.
+    """
+    rows: list = []
+    for sca_num in sorted(af_dict):
+        af = af_dict[sca_num]
+        if af is None:
+            _log(f"  SCA {sca_num:02d}: no data — skipping (metadata)")
+            continue
+        try:
+            rows.append(extract_row(af, sca_num, exposure))
+        except Exception as e:
+            _log(f"  SCA {sca_num:02d}: extract failed: {e}")
+            rows.append({
+                'visit_id': exposure.visit_id,
+                'exposure': exposure.exposure,
+                'sca': sca_num,
+                'error': str(e),
+            })
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # CSV writer
 # ---------------------------------------------------------------------------
 
@@ -207,8 +240,8 @@ def _order_keys(all_keys):
     return ordered + remaining
 
 
-def _default_output(res: DataResults, exposures):
-    """Auto-generate a CSV filename from the exposures being exported."""
+def _default_output_for_exposures(exposures):
+    """Auto-generate a CSV filename from a list of Exposure objects."""
     if not exposures:
         return 'metadata.csv'
     if len(exposures) == 1:
@@ -219,6 +252,58 @@ def _default_output(res: DataResults, exposures):
         return (f'metadata_{first.visit_id}'
                 f'_exp{first.exposure:02d}-{last.exposure:02d}.csv')
     return f'metadata_{first.visit_id}_plus{len(exposures) - 1}more.csv'
+
+
+def _default_output(res: DataResults, exposures):
+    """Auto-generate a CSV filename from the exposures being exported."""
+    return _default_output_for_exposures(exposures)
+
+
+def write_csv(rows: list, output: str, *, quiet: bool = False) -> str:
+    """Write pre-extracted rows to a CSV using the standard column ordering.
+
+    Column order matches `export_csv`: priority keys first, remainder
+    alphabetical. Returns the output path.
+    """
+    if not rows:
+        raise RuntimeError("No metadata rows — nothing to write.")
+
+    all_keys: set = set()
+    for r in rows:
+        all_keys.update(r.keys())
+    ordered_keys = _order_keys(all_keys)
+
+    _log(f"Writing CSV → {output}  "
+         f"({len(rows)} row(s), {len(ordered_keys)} column(s))")
+
+    with open(output, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=ordered_keys, restval='')
+        writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
+
+    if not quiet:
+        print(f"\n✓ Wrote {output}")
+        print(f"   {len(rows)} row(s), {len(ordered_keys)} column(s)")
+    return output
+
+
+def write_metadata_csv(
+    af_dict: dict,
+    exposure: Exposure,
+    *,
+    output: Optional[str] = None,
+    quiet: bool = False,
+) -> str:
+    """One-shot: extract rows from an already-streamed exposure and write CSV.
+
+    Companion to `roman_fits.to_fits_files` / `to_ds9`. Both take the same
+    `af_dict`, so a single stream can feed all three outputs.
+    """
+    if output is None:
+        output = _default_output_for_exposures([exposure])
+    rows = extract_rows(af_dict, exposure)
+    return write_csv(rows, output, quiet=quiet)
 
 
 def export_csv(
@@ -268,40 +353,14 @@ def export_csv(
     for exp in exposures:
         af_dict = res.stream(exp, scas=scas, show_progress=show_progress)
         try:
-            for sca_num in sorted(af_dict):
-                af = af_dict[sca_num]
-                if af is None:
-                    _log(f"  SCA {sca_num:02d}: no data — skipping")
-                    continue
-                try:
-                    rows.append(extract_row(af, sca_num, exp))
-                except Exception as e:
-                    _log(f"  SCA {sca_num:02d}: extract failed: {e}")
-                    rows.append({
-                        'visit_id': exp.visit_id,
-                        'exposure': exp.exposure,
-                        'sca': sca_num,
-                        'error': str(e),
-                    })
+            rows.extend(extract_rows(af_dict, exp))
         finally:
             close_streams(af_dict)
 
     if not rows:
         raise RuntimeError("No metadata extracted — nothing to write.")
 
-    all_keys: set = set()
-    for r in rows:
-        all_keys.update(r.keys())
-    ordered_keys = _order_keys(all_keys)
-
-    _log(f"Writing CSV → {output}  "
-         f"({len(rows)} row(s), {len(ordered_keys)} column(s))")
-
-    with open(output, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=ordered_keys, restval='')
-        writer.writeheader()
-        for r in rows:
-            writer.writerow(r)
+    write_csv(rows, output)
 
     # Consistency check — did we get every exposure the metadata says we should?
     meta_nexp = None
@@ -318,8 +377,6 @@ def export_csv(
         _log(f"WARNING: meta.visit.nexposures={meta_nexp} but only "
              f"{len(unique_exp_keys)} exposure(s) exported")
 
-    print(f"\n✓ Wrote {output}")
-    print(f"   {len(rows)} row(s), {len(ordered_keys)} column(s)")
     return output
 
 
