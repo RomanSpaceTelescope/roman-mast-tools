@@ -1,450 +1,418 @@
-"""Export all metadata mnemonics from Roman WFI exposures as a CSV table.
+"""Export Roman WFI metadata to a CSV spreadsheet.
 
-Creates a CSV where:
-- Each row is an SCA (or exposure/SCA combination)
-- Each column is a metadata mnemonic (field key)
-- Values are the metadata values
+Builds on the streaming primitives in `roman_mast` (same search + selection
+model as `roman_fits.py`): search MAST → pick exposures → stream every SCA
+into memory → flatten each datamodel's `meta` tree into dot-notation columns
+→ write one CSV row per (exposure, SCA).
+
+Public surface
+--------------
+    flatten_metadata(obj, prefix='')     → dict[str, scalar]  (dot-notation keys)
+    extract_row(af, sca, exposure)       → dict for one SCA (data stats + meta)
+    export_csv(res, indices, scas, out)  → path to written CSV
+
+CLI mirrors roman_fits.py — use the standard --program / --pass / --visit-id
+/ etc. filters to find exposures, then --exposures / --scas to pick which
+to export. See `python export_metadata_csv.py --help` for examples.
 """
 
-import keyring, keyring.backends.null
-keyring.set_keyring(keyring.backends.null.Keyring())
+from __future__ import annotations
 
-import warnings
-warnings.filterwarnings('ignore')
-
-import os
-import argparse
 import csv
-import io
-import json
-from collections import defaultdict
+import os
+import warnings
+from typing import Any, Optional
+
+import numpy as np
 import roman_datamodels as rdm
-from streaming_utils import (
-    read_mast_product,
-    close_buffer_streams,
+
+from roman_mast import (
+    Exposure, DataResults, _log, close_streams, parse_int_spec,
 )
-from query_utils import add_query_args, prompt_query_params, resolve_query
 
 
-def flatten_metadata(obj, prefix="", visited=None, max_depth=10, current_depth=0):
-    """Recursively flatten nested metadata into dot-notation keys.
+# ---------------------------------------------------------------------------
+# Metadata flattening
+# ---------------------------------------------------------------------------
 
-    Returns a dict of {key: value} where keys use dot notation.
-    Skips private attributes and deeply nested objects.
-    Handles DNode objects from roman_datamodels.
+def flatten_metadata(obj, prefix: str = "", visited=None,
+                     max_depth: int = 10, current_depth: int = 0) -> dict:
+    """Recursively flatten a Roman datamodel meta tree into dot-notation keys.
+
+    Returns a plain ``{"meta.exposure.type": "WFI_IMAGE", ...}`` mapping.
+    Handles DNode / dict / __dict__ objects, skips private attrs, and cycles
+    are broken via `id()` tracking. Astropy Time-like objects are stringified.
     """
     if visited is None:
         visited = set()
-
     if current_depth >= max_depth:
         return {}
 
-    result = {}
     obj_id = id(obj)
-
     if obj_id in visited:
         return {}
     visited.add(obj_id)
 
+    result: dict = {}
+
+    def _handle_value(key, v):
+        if v is None:
+            return
+        # Scalars — take as-is.
+        if isinstance(v, (str, int, float, bool)):
+            result[key] = v
+            return
+        # Lists / tuples: stringify short primitive lists, recurse into short
+        # mixed lists, skip large ones.
+        if isinstance(v, (list, tuple)):
+            if len(v) == 0:
+                return
+            if all(isinstance(x, (str, int, float, bool, type(None))) for x in v):
+                result[key] = str(v)[:200]
+            elif len(v) < 20:
+                result.update(flatten_metadata(
+                    v, key, visited, max_depth, current_depth + 1,
+                ))
+            return
+        # Astropy Time / datetime-like → string.
+        if hasattr(v, 'iso') or hasattr(v, 'datetime'):
+            result[key] = str(v)
+            return
+        # Nested dict / DNode / __dict__ carrier — recurse.
+        if hasattr(v, '__getitem__') or hasattr(v, '__dict__'):
+            result.update(flatten_metadata(
+                v, key, visited, max_depth, current_depth + 1,
+            ))
+
     try:
-        # Handle dict-like objects (including DNode which supports __getitem__)
-        if isinstance(obj, dict) or (hasattr(obj, '__getitem__') and hasattr(obj, 'keys')):
+        # dict-like / DNode
+        if isinstance(obj, dict) or (
+            hasattr(obj, '__getitem__') and hasattr(obj, 'keys')
+        ):
             try:
-                items = obj.items()
-            except:
+                items = list(obj.items())
+            except Exception:
                 try:
                     items = [(k, obj[k]) for k in obj.keys()]
-                except:
+                except Exception:
                     return {}
-
             for k, v in items:
-                key = f"{prefix}.{k}" if prefix else k
-
-                # Skip None values
-                if v is None:
-                    continue
-
-                # Skip array data but include metadata
-                if isinstance(v, (list, tuple)):
-                    # For lists of primitives, convert to string
-                    if len(v) == 0:
-                        pass
-                    elif all(isinstance(x, (str, int, float, bool, type(None))) for x in v):
-                        result[key] = str(v)[:200]  # Limit length
-                    elif len(v) < 20:
-                        # Recurse into smaller lists
-                        nested = flatten_metadata(v, key, visited, max_depth, current_depth + 1)
-                        result.update(nested)
-                    # Skip large lists
-                    continue
-
-                # Handle scalar types
-                if isinstance(v, (str, int, float, bool)):
-                    result[key] = v
-
-                # Handle Time objects and other special types
-                elif hasattr(v, 'iso') or hasattr(v, 'datetime'):
-                    # Likely an astropy Time object
-                    result[key] = str(v)
-
-                # Handle dict-like and nested objects
-                elif hasattr(v, '__getitem__') or hasattr(v, '__dict__'):
-                    nested = flatten_metadata(v, key, visited, max_depth, current_depth + 1)
-                    result.update(nested)
+                _handle_value(f"{prefix}.{k}" if prefix else str(k), v)
 
         elif hasattr(obj, '__dict__'):
             for k, v in obj.__dict__.items():
                 if k.startswith('_'):
                     continue
+                _handle_value(f"{prefix}.{k}" if prefix else str(k), v)
 
-                key = f"{prefix}.{k}" if prefix else k
-
-                if v is None:
-                    continue
-
-                if isinstance(v, (str, int, float, bool)):
-                    result[key] = v
-                elif isinstance(v, (list, tuple)):
-                    if len(v) == 0:
-                        pass
-                    elif all(isinstance(x, (str, int, float, bool, type(None))) for x in v):
-                        result[key] = str(v)[:200]
-                    elif len(v) < 20:
-                        nested = flatten_metadata(v, key, visited, max_depth, current_depth + 1)
-                        result.update(nested)
-                    continue
-
-                elif hasattr(v, 'iso') or hasattr(v, 'datetime'):
-                    result[key] = str(v)
-
-                elif hasattr(v, '__getitem__') or hasattr(v, '__dict__'):
-                    nested = flatten_metadata(v, key, visited, max_depth, current_depth + 1)
-                    result.update(nested)
-
-    except Exception as e:
+    except Exception:
         pass
 
     return result
 
 
-def extract_metadata_from_sca(asdf_file, sca_num):
-    """Open an ASDF file and extract all metadata as a flat dict."""
+# ---------------------------------------------------------------------------
+# Row extraction
+# ---------------------------------------------------------------------------
+
+# Priority column order — anything not listed here falls back to alphabetical.
+_PRIORITY_KEYS = [
+    'visit_id', 'exposure', 'sca',
+    'meta.pointing.target_ra',
+    'meta.pointing.target_dec',
+    'meta.exposure.type',
+    'meta.exposure.start_time',
+    'meta.exposure.end_time',
+    'meta.exposure.frame_time',
+    'meta.exposure.effective_exposure_time',
+    'meta.pointing.target_aperture',
+    'meta.exposure.ma_table_name',
+    'meta.statistics.good_pixel_fraction',
+    'meta.statistics.image_median',
+    'meta.statistics.image_rms',
+    'meta.statistics.zodiacal_light',
+    'meta.exposure.hga_move',
+    'meta.file_date',
+    'meta.rcs.active',
+    'meta.rcs.bank',
+    'meta.rcs.counts',
+    'meta.rcs.electronics',
+    'meta.rcs.led',
+    'meta.observation.execution_plan',
+    'meta.observation.exposure',
+    'meta.observation.observation',
+    'meta.observation.observation_id',
+    'meta.observation.pass',
+    'meta.observation.program',
+    'meta.observation.segment',
+    'meta.observation.visit',
+    'meta.observation.visit_file_activity',
+    'meta.observation.visit_file_group',
+    'meta.observation.visit_file_sequence',
+    'meta.visit.nexposures',
+    'data_shape', 'data_dtype',
+    'data_min', 'data_max', 'data_mean',
+    'data_nan_pixels', 'data_valid_pixels',
+    'meta.source_catalog.tweakreg_catalog_name',
+]
+
+
+def _open_dm(af):
+    """Convert an AsdfFile → roman datamodel. Passthrough if already one."""
+    if hasattr(af, 'meta') and hasattr(af, 'data'):
+        return af
+    return rdm.open(af)
+
+
+def extract_row(af, sca_num: int, exposure: Exposure) -> dict:
+    """Extract a single CSV row (data stats + flattened meta) from one SCA."""
+    dm = _open_dm(af)
+
+    row: dict = {
+        'visit_id': exposure.visit_id,
+        'exposure': exposure.exposure,
+        'sca': sca_num,
+    }
+
+    # Data stats — cheap enough, and handy in the spreadsheet.
     try:
-        import numpy as np
-
-        dm = rdm.open(asdf_file)
-
-        # Load data and compute stats (handle NaN values)
-        data_array = np.asarray(dm.data[...])
-
-        # Extract visit ID from filename if available
-        visit_id = None
-        if hasattr(dm, 'meta') and hasattr(dm.meta, 'filename'):
-            filename = dm.meta.filename
-            if filename:
-                # Roman filenames start with 'r' followed by visit ID
-                # Format: r<visit_id>_<exp>_<sca>_<filter>_<level>
-                try:
-                    visit_id = filename.split('_')[0].replace('r', '')
-                except:
-                    pass
-
-        # Get basic info
-        row = {
-            'visit': visit_id or '',
-            'sca': sca_num,
-            'data_shape': str(dm.data.shape),
-            'data_dtype': str(dm.data.dtype),
-            'data_min': float(np.nanmin(data_array)),
-            'data_max': float(np.nanmax(data_array)),
-            'data_mean': float(np.nanmean(data_array)),
-            'data_valid_pixels': int(np.isfinite(data_array).sum()),
-            'data_nan_pixels': int(np.isnan(data_array).sum()),
-        }
-
-        # Flatten all metadata
-        if hasattr(dm, 'meta'):
-            meta_flat = flatten_metadata(dm.meta, prefix='meta')
-            row.update(meta_flat)
-
-        return row
-
+        data = np.asarray(dm.data[...])
+        row.update({
+            'data_shape':        str(dm.data.shape),
+            'data_dtype':        str(dm.data.dtype),
+            'data_min':          float(np.nanmin(data)),
+            'data_max':          float(np.nanmax(data)),
+            'data_mean':         float(np.nanmean(data)),
+            'data_valid_pixels': int(np.isfinite(data).sum()),
+            'data_nan_pixels':   int(np.isnan(data).sum()),
+        })
     except Exception as e:
-        print(f"    ERROR reading SCA {sca_num}: {e}")
-        return {'sca': sca_num, 'error': str(e)}
+        row['data_error'] = str(e)
+
+    if hasattr(dm, 'meta'):
+        row.update(flatten_metadata(dm.meta, prefix='meta'))
+
+    return row
 
 
-def export_metadata_csv(visit_id, exp_num=None, exp_num_start=None, exp_num_end=None, data_level=2, output_file=None, scas=None):
-    """Export metadata from all SCAs to a CSV file.
+# ---------------------------------------------------------------------------
+# CSV writer
+# ---------------------------------------------------------------------------
 
-    Args:
-        visit_id (str): Visit ID to query. Supports wildcards (e.g., '001240100100100*').
-        exp_num (int, optional): Single exposure number to query. Mutually exclusive with exp_num_start/end.
-        exp_num_start (int, optional): Starting exposure number (inclusive)
-        exp_num_end (int, optional): Ending exposure number (inclusive)
-                                    If all exposure params are None, all available exposures are exported.
-        data_level (int): Data level (1=uncal, 2=cal)
-        output_file (str): Output CSV filename. If None, auto-generates.
-        scas (list): List of SCA numbers to export. If None, exports all available.
+def _order_keys(all_keys):
+    """Return the CSV column order — priority keys first, rest alphabetical."""
+    all_keys = set(all_keys)
+    ordered = [k for k in _PRIORITY_KEYS if k in all_keys]
+    remaining = sorted(all_keys - set(ordered))
+    return ordered + remaining
 
-    Returns:
-        str: Path to output CSV file
+
+def _default_output(res: DataResults, exposures):
+    """Auto-generate a CSV filename from the exposures being exported."""
+    if not exposures:
+        return 'metadata.csv'
+    if len(exposures) == 1:
+        exp = exposures[0]
+        return f'metadata_{exp.visit_id}_exp{exp.exposure:02d}.csv'
+    first, last = exposures[0], exposures[-1]
+    if first.visit_id == last.visit_id:
+        return (f'metadata_{first.visit_id}'
+                f'_exp{first.exposure:02d}-{last.exposure:02d}.csv')
+    return f'metadata_{first.visit_id}_plus{len(exposures) - 1}more.csv'
+
+
+def export_csv(
+    res: DataResults,
+    indices,
+    *,
+    scas=None,
+    output: Optional[str] = None,
+    show_progress: bool = True,
+) -> str:
+    """Stream the selected exposures and write one CSV row per (exp, SCA).
+
+    Parameters
+    ----------
+    res : DataResults
+        Result of `roman_mast.list_data(...)`.
+    indices : iterable of int
+        1-based indices into `res.exposures` to export.
+    scas : iterable of int, optional
+        Restrict to a subset of SCAs per exposure. Default: every SCA.
+    output : str, optional
+        Output CSV filename. If None, auto-generated from the visit_id +
+        exposure range.
+    show_progress : bool
+        Show tqdm progress while streaming.
+
+    Returns
+    -------
+    str
+        Path to the written CSV.
     """
+    exposures = [res.select(i) for i in indices]
+    if not exposures:
+        raise ValueError("No exposures selected — nothing to export.")
 
-    # Build exp_spec string for resolve_query
-    if exp_num is not None:
-        exp_spec = str(exp_num)
-    elif exp_num_start is not None and exp_num_end is not None:
-        exp_spec = f"{exp_num_start}-{exp_num_end}"
-    else:
-        exp_spec = None  # all available
+    if output is None:
+        output = _default_output(res, exposures)
 
-    sca_spec = ','.join(str(s) for s in scas) if scas else None
+    rows: list = []
+    total_files = sum(
+        len([s for s in exp.scas if scas is None or s in set(scas)])
+        for exp in exposures
+    )
+    _log(f"Exporting metadata: {len(exposures)} exposure(s), "
+         f"~{total_files} SCA file(s)")
 
-    q = resolve_query(visit_id, exp_spec=exp_spec, data_level=data_level, sca_spec=sca_spec)
-
-    urls = q.urls
-    exp_nums = q.exp_nums
-    scas = q.scas
-    missions = q.missions
-
-    if not scas:
-        raise ValueError("No valid SCAs to export")
-
-    # Stream and extract metadata from each SCA and exposure
-    all_rows = []
-    buffer_dict = {}
-    meta_visit_nexposures = None  # Will be set from first streamed file
-
-    total_to_stream = len(scas) * len(exp_nums)
-    print(f"\nStreaming {total_to_stream} file(s) ({len(scas)} SCAs × {len(exp_nums)} exposures)...")
-
-    stream_count = 0
-    for exp_num in exp_nums:
-        print(f"\n  Exposure {exp_num}:")
-
-        for sca_num in scas:
-            try:
-                filename = urls[sca_num].get(exp_num)
-                if filename is None:
-                    print(f"    SCA {sca_num:02d}: No data available")
+    for exp in exposures:
+        af_dict = res.stream(exp, scas=scas, show_progress=show_progress)
+        try:
+            for sca_num in sorted(af_dict):
+                af = af_dict[sca_num]
+                if af is None:
+                    _log(f"  SCA {sca_num:02d}: no data — skipping")
                     continue
+                try:
+                    rows.append(extract_row(af, sca_num, exp))
+                except Exception as e:
+                    _log(f"  SCA {sca_num:02d}: extract failed: {e}")
+                    rows.append({
+                        'visit_id': exp.visit_id,
+                        'exposure': exp.exposure,
+                        'sca': sca_num,
+                        'error': str(e),
+                    })
+        finally:
+            close_streams(af_dict)
 
-                stream_count += 1
-                print(f"    SCA {sca_num:02d}: Streaming...", end=" ", flush=True)
-                af = read_mast_product(missions, filename)
+    if not rows:
+        raise RuntimeError("No metadata extracted — nothing to write.")
 
-                print("Extracting metadata...", end=" ", flush=True)
-                row = extract_metadata_from_sca(af, sca_num)
-                # Add exposure number to each row
-                row['exposure'] = exp_num
-                all_rows.append(row)
-                buffer_dict[f"exp{exp_num}_sca{sca_num}"] = af
-                print("✓")
+    all_keys: set = set()
+    for r in rows:
+        all_keys.update(r.keys())
+    ordered_keys = _order_keys(all_keys)
 
-                # Check meta.visit.nexposures on first extraction
-                if meta_visit_nexposures is None and 'meta.visit.nexposures' in row:
-                    try:
-                        meta_visit_nexposures = int(row['meta.visit.nexposures'])
-                    except (ValueError, TypeError):
-                        pass
+    _log(f"Writing CSV → {output}  "
+         f"({len(rows)} row(s), {len(ordered_keys)} column(s))")
 
-            except Exception as e:
-                print(f"ERROR: {e}")
-
-    # Check if actual exposures is less than meta.visit.nexposures
-    if meta_visit_nexposures is not None and len(exp_nums) < meta_visit_nexposures:
-        print("\n" + "!"*80)
-        print("⚠️  WARNING: INCOMPLETE EXPOSURE SET")
-        print("!"*80)
-        print(f"  meta.visit.nexposures: {meta_visit_nexposures}")
-        print(f"  Actual exposures available: {len(exp_nums)}")
-        print(f"  Missing: {meta_visit_nexposures - len(exp_nums)} exposure(s)")
-        print("!"*80 + "\n")
-
-    # Combine all rows and collect all unique keys
-    all_keys = set()
-    for row in all_rows:
-        all_keys.update(row.keys())
-
-    all_keys = sorted(all_keys)
-
-    # Reorder keys with user-specified priority order
-    priority_keys = [
-        'visit', 'exposure', 'sca',
-        'meta.pointing.target_ra',
-        'meta.pointing.target_dec',
-        'meta.exposure.type',
-        'meta.exposure.start_time',
-        'meta.exposure.end_time',
-        'meta.exposure.frame_time',
-        'meta.exposure.effective_exposure_time',
-        'meta.pointing.target_aperture',
-        'meta.exposure.ma_table_name',
-        'meta.statistics.good_pixel_fraction',
-        'meta.statistics.image_median',
-        'meta.statistics.image_rms',
-        'meta.statistics.zodiacal_light',
-        'meta.exposure.hga_move',
-        'meta.file_date',
-        'meta.rcs.active',
-        'meta.rcs.bank',
-        'meta.rcs.counts',
-        'meta.rcs.electronics',
-        'meta.rcs.led',
-        'meta.observation.execution_plan',
-        'meta.observation.exposure',
-        'meta.observation.observation',
-        'meta.observation.observation_id',
-        'meta.observation.pass',
-        'meta.observation.program',
-        'meta.observation.segment',
-        'meta.observation.visit',
-        'meta.observation.visit_file_activity',
-        'meta.observation.visit_file_group',
-        'meta.observation.visit_file_sequence',
-        'meta.visit.nexposures',
-        'data_shape', 'data_dtype', 'data_min', 'data_max', 'data_mean', 'data_nan_pixels', 'data_valid_pixels',
-        'meta.source_catalog.tweakreg_catalog_name',
-
-    ]
-
-    ordered_keys = [k for k in priority_keys if k in all_keys]
-    remaining_keys = sorted([k for k in all_keys if k not in ordered_keys])
-    ordered_keys.extend(remaining_keys)
-
-    # Write CSV
-    if output_file is None:
-        if len(exp_nums) == 1:
-            output_file = f"metadata_{visit_id}_exp{exp_nums[0]:02d}_level{data_level}.csv"
-        else:
-            output_file = f"metadata_{visit_id}_exp{exp_nums[0]:02d}-{exp_nums[-1]:02d}_level{data_level}.csv"
-
-    print(f"\nWriting CSV: {output_file}")
-    print(f"  Rows (SCA/Exposure pairs): {len(all_rows)}")
-    print(f"  Columns (mnemonics): {len(ordered_keys)}")
-
-    with open(output_file, 'w', newline='', encoding='utf-8') as f:
+    with open(output, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=ordered_keys, restval='')
         writer.writeheader()
+        for r in rows:
+            writer.writerow(r)
 
-        for row in all_rows:
-            # Fill missing values
-            for key in ordered_keys:
-                if key not in row:
-                    row[key] = ''
-            writer.writerow(row)
+    # Consistency check — did we get every exposure the metadata says we should?
+    meta_nexp = None
+    for r in rows:
+        v = r.get('meta.visit.nexposures')
+        if v not in (None, ''):
+            try:
+                meta_nexp = int(v)
+                break
+            except (TypeError, ValueError):
+                pass
+    unique_exp_keys = {(r.get('visit_id'), r.get('exposure')) for r in rows}
+    if meta_nexp is not None and len(unique_exp_keys) < meta_nexp:
+        _log(f"WARNING: meta.visit.nexposures={meta_nexp} but only "
+             f"{len(unique_exp_keys)} exposure(s) exported")
 
-    print(f"\n✓ Exported to: {output_file}")
-
-    # Print summary
-    print(f"\nMetadata Summary:")
-    if len(all_rows) == 0:
-        print(f"  ERROR: No data rows extracted!")
-        return None
-
-    # Count unique visits and exposures in results
-    unique_visits = set()
-    unique_exps = set()
-    for row in all_rows:
-        # Extract visit from filename if available
-        if 'meta.filename' in row:
-            filename = row['meta.filename']
-            if filename:
-                # Roman filenames start with visit ID
-                visit_part = filename.split('_')[0].replace('r', '')
-                unique_visits.add(visit_part)
-        unique_exps.add(row.get('exposure', '?'))
-
-    print(f"  Total rows (exposure/SCA pairs): {len(all_rows)}")
-    print(f"  Unique visits: {len(unique_visits)} ({', '.join(sorted(unique_visits)[:3])}{'...' if len(unique_visits) > 3 else ''})")
-    print(f"  Total exposures processed: {len(exp_nums)}")
-    print(f"  SCAs per exposure: {len(scas)}")
-    print(f"  Total mnemonics: {len(ordered_keys)}")
-    print(f"\nFirst 20 mnemonics:")
-    for i, key in enumerate(ordered_keys[:20]):
-        print(f"  {i+1:2d}. {key}")
-
-    if len(ordered_keys) > 20:
-        print(f"  ... and {len(ordered_keys) - 20} more")
-
-    # Cleanup buffers
-    close_buffer_streams(buffer_dict)
-
-    return output_file
+    print(f"\n✓ Wrote {output}")
+    print(f"   {len(rows)} row(s), {len(ordered_keys)} column(s)")
+    return output
 
 
-def main():
-    """Interactive or command-line entry point."""
-    parser = argparse.ArgumentParser(
-        description='Export Roman WFI metadata to a CSV file.',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python export_metadata_csv.py 0012401001001002001
-  python export_metadata_csv.py 0012401001001002001 --exp-range 1-3 --data-level 2
-  python export_metadata_csv.py '001240100100100*' --scas 1,2,3 --output metadata.csv
-  python export_metadata_csv.py  (interactive mode)
-        """,
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _resolve_exposure_keys(res: DataResults, spec):
+    """Turn --exposures spec (int / 'a,b' / 'a-b' / 'all') into 1-based indices."""
+    if spec is None or str(spec).strip().lower() in ('', 'all', '*'):
+        return list(range(1, res.n_exposures + 1))
+    indices = parse_int_spec(spec)
+    for i in indices:
+        if i < 1 or i > res.n_exposures:
+            raise IndexError(
+                f"Exposure index {i} out of range 1..{res.n_exposures} "
+                f"(query returned {res.n_exposures} exposure(s))"
+            )
+    return indices
+
+
+def _cli():
+    import argparse
+    from roman_mast import (
+        add_list_data_args, list_data_from_args, print_summary,
     )
-    add_query_args(parser, visit_wildcard=False, exp_mode='flexible', sca_mode='all')
-    parser.add_argument('--output', default=None,
-                        help='Output CSV filename (default: auto-generated)')
-    args = parser.parse_args()
 
-    if args.visit_id is None:
-        print("Roman WFI Metadata CSV Exporter")
-        print("=" * 70)
-        params = prompt_query_params(
-            visit_wildcard=False,
-            exp_mode='flexible',
-            sca_mode='all',
-        )
-        visit_id = params['visit_id']
-        exp_spec = params['exp_spec']
-        data_level = params['data_level']
-        sca_spec = params['sca_spec']
-        output_file = input("Enter output filename (blank = auto-generated): ").strip() or None
-    else:
-        visit_id = args.visit_id
-        exp_spec = getattr(args, 'exp_range', None) or (str(args.exp_num) if getattr(args, 'exp_num', None) else None)
-        data_level = args.data_level if args.data_level is not None else 2
-        sca_spec = args.scas
-        output_file = args.output
+    p = argparse.ArgumentParser(
+        description="Export Roman WFI metadata to a CSV spreadsheet.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+Same search flags as roman_fits.py — find the exposures with the standard
+--program / --pass / --visit-id / etc., then use --exposures / --scas to
+pick which of those to include in the spreadsheet.
 
-    # Translate exp_spec into the legacy kwargs expected by export_metadata_csv()
-    from query_utils import parse_exp_spec
-    exp_list = parse_exp_spec(exp_spec)
-    if exp_list is None:
-        exp_num = exp_num_start = exp_num_end = None
-    elif len(exp_list) == 1:
-        exp_num = exp_list[0]
-        exp_num_start = exp_num_end = None
-    else:
-        exp_num = None
-        exp_num_start = exp_list[0]
-        exp_num_end = exp_list[-1]
+Examples:
+  # See what's available first (no export yet)
+  python export_metadata_csv.py --program 114 --pass 57 --sca-only --list
 
-    from query_utils import parse_sca_spec
-    scas = parse_sca_spec(sca_spec)
+  # Export every SCA of exposure 1 to a CSV
+  python export_metadata_csv.py --program 114 --pass 57 --sca-only \\
+      --exposures 1 --output exp1_meta.csv
 
-    try:
-        csv_file = export_metadata_csv(
-            visit_id=visit_id,
-            exp_num=exp_num,
-            exp_num_start=exp_num_start,
-            exp_num_end=exp_num_end,
-            data_level=data_level,
-            output_file=output_file,
-            scas=scas,
-        )
-        print(f"\nSuccess! File saved to: {csv_file}")
+  # Every exposure in a visit, all SCAs
+  python export_metadata_csv.py --visit-id 0011401057001001001 \\
+      --sca-only --exposures all
 
-    except Exception as e:
-        print(f"\nERROR: {e}")
-        import traceback
-        traceback.print_exc()
+  # Only some SCAs of a range of exposures
+  python export_metadata_csv.py --program 114 --pass 57 --sca-only \\
+      --exposures 1-3 --scas 1-6
+
+  # Level-1 (uncal) metadata for one visit
+  python export_metadata_csv.py --visit-id 0011401057001001001 \\
+      --data-level 1 --exposures all
+""",
+    )
+
+    add_list_data_args(p)
+
+    p.add_argument('--exposures', default='all',
+                   help="Which exposure(s) to export (1-based index into the "
+                        "listed exposures). '1', '1,3,5', '1-4', or 'all'. "
+                        "Default: 'all'.")
+    p.add_argument('--scas', default=None,
+                   help="Restrict to a subset of SCAs, e.g. '4' / '1-6' / "
+                        "'1,3,5'. Default: every SCA the exposure has.")
+    p.add_argument('--output', '-o', default=None,
+                   help="Output CSV path. Default: auto-generated from "
+                        "visit_id + exposure range.")
+    p.add_argument('--list', action='store_true',
+                   help='List matching exposures and exit without exporting.')
+    p.add_argument('--max-rows', type=int, default=50,
+                   help='Max exposures to show in the summary (default 50)')
+
+    args = p.parse_args()
+
+    res = list_data_from_args(args)
+
+    if res.n_exposures == 0:
+        print_summary(res, max_rows=args.max_rows)
+        print("\nNo exposures match — nothing to export.")
+        return
+
+    if args.list:
+        print_summary(res, max_rows=args.max_rows)
+        return
+
+    indices = _resolve_exposure_keys(res, args.exposures)
+    scas = parse_int_spec(args.scas) if args.scas is not None else None
+
+    export_csv(res, indices, scas=scas, output=args.output)
 
 
 if __name__ == '__main__':
-    main()
+    warnings.filterwarnings('ignore')
+    _cli()
