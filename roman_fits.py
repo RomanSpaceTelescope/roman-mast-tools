@@ -84,16 +84,43 @@ def _materialize_dm(dm) -> None:
             pass
 
 
-def stream_materialized(exposure: Exposure, missions, *, scas=None,
-                        show_progress=True) -> dict:
-    """Stream every SCA of `exposure` and pre-load its arrays inline.
+def _stream_one_sca(sca: int, filename: str, missions):
+    """Worker: open one SCA, wrap it, materialize its arrays. Thread-safe.
 
-    Like `roman_mast.stream_exposure`, but interleaves the S3 open with an
-    immediate array read per SCA, so no consumer downstream ever needs the
-    (60 s) pre-signed URL again. Use this whenever multiple sinks share the
-    stream (FITS + DS9 + metadata CSV, etc.) — the plain `stream_exposure`
-    variant is fine for a single-pass sink that finishes each SCA within
-    the URL's lifetime.
+    Returns (sca, dm) on success, (sca, None) on failure. Failures are
+    logged here so the pool doesn't swallow them silently.
+    """
+    try:
+        af = missions.read_product(filename)
+        dm = rdm.open(af)
+        _materialize_dm(dm)
+        return sca, dm
+    except Exception as e:
+        _log(f"ERROR streaming SCA {sca:02d} ({filename}): "
+             f"{type(e).__name__}: {e}")
+        return sca, None
+
+
+def stream_materialized(exposure: Exposure, missions, *, scas=None,
+                        show_progress=True, max_workers: int = 8) -> dict:
+    """Stream every SCA of `exposure` in parallel and pre-load arrays inline.
+
+    Like `roman_mast.stream_exposure`, but (a) interleaves the S3 open with
+    an immediate array read per SCA — so no consumer downstream ever needs
+    the (60 s) pre-signed URL again — and (b) fans the per-SCA reads out
+    over a thread pool. Threads are the right shape here: each `read_product`
+    call is a blocking-network-I/O read that releases the GIL, and MAST
+    mints an independent pre-signed URL per request so there's nothing
+    shared for the threads to contend on.
+
+    Parameters
+    ----------
+    max_workers : int
+        Concurrent SCA fetches. Default 8 — empirically saturates the
+        per-connection bandwidth on the /home/mrizzo node without tripping
+        S3 request throttling. Set to 1 to force sequential fetching if a
+        machine is bandwidth-shared or you want deterministic ordering in
+        logs.
 
     Returns
     -------
@@ -102,6 +129,8 @@ def stream_materialized(exposure: Exposure, missions, *, scas=None,
         big arrays already resident in memory. A None value marks an SCA
         we failed to stream.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     try:
         from tqdm.auto import tqdm
     except ImportError:  # pragma: no cover
@@ -118,24 +147,37 @@ def stream_materialized(exposure: Exposure, missions, *, scas=None,
     else:
         pairs = list(zip(exposure.scas, exposure.filenames))
 
+    workers = max(1, min(max_workers, len(pairs)))
     _log(f"Streaming exposure visit_id={exposure.visit_id} "
-         f"exp={exposure.exposure} ({len(pairs)} SCA files, materializing "
-         f"inline)")
+         f"exp={exposure.exposure} ({len(pairs)} SCA files, "
+         f"{workers} workers, materializing inline)")
 
     dm_dict: dict = {}
-    iterator = tqdm(pairs, desc="Streaming SCAs", disable=not show_progress)
-    for sca, filename in iterator:
-        try:
-            af = missions.read_product(filename)
-            dm = rdm.open(af)
-            _materialize_dm(dm)
-            dm_dict[sca] = dm
-        except Exception as e:
-            _log(f"ERROR streaming SCA {sca:02d} ({filename}): "
-                 f"{type(e).__name__}: {e}")
-            dm_dict[sca] = None
 
-    return dm_dict
+    if workers == 1:
+        # Preserve the sequential codepath verbatim — one less thing to
+        # debug when a machine misbehaves under threading.
+        iterator = tqdm(pairs, desc="Streaming SCAs", disable=not show_progress)
+        for sca, filename in iterator:
+            _, dm = _stream_one_sca(sca, filename, missions)
+            dm_dict[sca] = dm
+        return dm_dict
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(_stream_one_sca, sca, filename, missions)
+            for sca, filename in pairs
+        ]
+        iterator = tqdm(
+            as_completed(futures), total=len(futures),
+            desc="Streaming SCAs", disable=not show_progress,
+        )
+        for fut in iterator:
+            sca, dm = fut.result()
+            dm_dict[sca] = dm
+
+    # Return in SCA order so downstream logs/CSV rows come out ascending.
+    return {sca: dm_dict[sca] for sca in sorted(dm_dict)}
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +533,9 @@ Examples:
                    help='Skip the DQ (bad-pixel) mask overlay in ds9 mode')
     p.add_argument('--ds9-target', default=None,
                    help='DS9 XPA target name (ds9 mode). Default: first DS9 found.')
+    p.add_argument('--workers', type=int, default=8,
+                   help='Concurrent SCA streams (default 8). Set to 1 for '
+                        'the old sequential path.')
     p.add_argument('--no-metadata', action='store_true',
                    help='Skip the per-exposure metadata CSV (written by default '
                         'alongside FITS/DS9 output, since we already streamed '
@@ -568,7 +613,9 @@ Examples:
         # One stream feeds every sink. `stream_materialized` reads each SCA's
         # data arrays into memory as soon as it's opened, so sinks running
         # tens of seconds later never re-hit the 60 s pre-signed S3 URL.
-        dm_dict = stream_materialized(exp, res.missions, scas=scas)
+        dm_dict = stream_materialized(
+            exp, res.missions, scas=scas, max_workers=args.workers,
+        )
         try:
             if write_metadata:
                 try:
