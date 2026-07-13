@@ -40,6 +40,104 @@ import roman_datamodels as rdm
 from roman_mast import Exposure, _log, close_streams
 
 
+# Which array attributes we pre-fetch off the datamodel. Kept to the two
+# arrays the current sinks actually consume:
+#   - `data` → FITS ImageHDU pixels, DS9 science mosaic, CSV data stats
+#   - `dq`   → DS9 mask overlay
+# Add `err` / `var_poisson` / `var_rnoise` / `var_flat` here if a future
+# sink wants uncertainty maps — each one is another ~17-67 MB per SCA
+# (×18 SCAs), so we leave them out until something needs them.
+_MATERIALIZE_ATTRS = ('data', 'dq')
+
+
+def _materialize_dm(dm) -> None:
+    """Force-load a datamodel's big array attributes into in-memory ndarrays.
+
+    Roman AsdfFiles stream lazily via fsspec + a MAST-issued pre-signed S3
+    URL that expires after 60 s. If we return the dm and let a downstream
+    sink read `dm.data` (or worse, `dm.data` *then* `dm.dq`, which live at
+    different block offsets and re-fetch from S3) minutes later, that second
+    fetch hits HTTP 403. Reading every array we care about here — while the
+    URL is still fresh — makes the dm self-contained; sinks never re-hit S3.
+
+    Writes materialized ndarrays back onto the dm in place when the model
+    accepts it, so `dm.data` etc. keep working transparently.
+    """
+    for attr in _MATERIALIZE_ATTRS:
+        try:
+            arr = getattr(dm, attr, None)
+        except (AttributeError, KeyError):
+            continue
+        if arr is None:
+            continue
+        try:
+            materialized = np.asarray(arr[...])
+        except Exception:
+            continue  # Not an array-like attribute after all — skip.
+        try:
+            setattr(dm, attr, materialized)
+        except Exception:
+            # Datamodel refused the assignment (some fields are validated).
+            # The read still populated fsspec's block cache, so subsequent
+            # reads within the URL lifetime will hit the cache. This is
+            # a best-effort belt-and-suspenders — the main win is the read.
+            pass
+
+
+def stream_materialized(exposure: Exposure, missions, *, scas=None,
+                        show_progress=True) -> dict:
+    """Stream every SCA of `exposure` and pre-load its arrays inline.
+
+    Like `roman_mast.stream_exposure`, but interleaves the S3 open with an
+    immediate array read per SCA, so no consumer downstream ever needs the
+    (60 s) pre-signed URL again. Use this whenever multiple sinks share the
+    stream (FITS + DS9 + metadata CSV, etc.) — the plain `stream_exposure`
+    variant is fine for a single-pass sink that finishes each SCA within
+    the URL's lifetime.
+
+    Returns
+    -------
+    dict[int, DataModel]
+        Mapping SCA integer → open roman_datamodels DataModel with its
+        big arrays already resident in memory. A None value marks an SCA
+        we failed to stream.
+    """
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:  # pragma: no cover
+        def tqdm(iterable, **_):
+            return iterable
+
+    if scas is not None:
+        wanted = set(int(s) for s in scas)
+        pairs = [(s, f) for s, f in zip(exposure.scas, exposure.filenames)
+                 if s in wanted]
+        missing = wanted - {s for s, _ in pairs}
+        if missing:
+            _log(f"WARNING: exposure has no filenames for SCAs {sorted(missing)}")
+    else:
+        pairs = list(zip(exposure.scas, exposure.filenames))
+
+    _log(f"Streaming exposure visit_id={exposure.visit_id} "
+         f"exp={exposure.exposure} ({len(pairs)} SCA files, materializing "
+         f"inline)")
+
+    dm_dict: dict = {}
+    iterator = tqdm(pairs, desc="Streaming SCAs", disable=not show_progress)
+    for sca, filename in iterator:
+        try:
+            af = missions.read_product(filename)
+            dm = rdm.open(af)
+            _materialize_dm(dm)
+            dm_dict[sca] = dm
+        except Exception as e:
+            _log(f"ERROR streaming SCA {sca:02d} ({filename}): "
+                 f"{type(e).__name__}: {e}")
+            dm_dict[sca] = None
+
+    return dm_dict
+
+
 # ---------------------------------------------------------------------------
 # Optional pyds9 — only needed for to_ds9()
 # ---------------------------------------------------------------------------
@@ -393,6 +491,13 @@ Examples:
                    help='Skip the DQ (bad-pixel) mask overlay in ds9 mode')
     p.add_argument('--ds9-target', default=None,
                    help='DS9 XPA target name (ds9 mode). Default: first DS9 found.')
+    p.add_argument('--no-metadata', action='store_true',
+                   help='Skip the per-exposure metadata CSV (written by default '
+                        'alongside FITS/DS9 output, since we already streamed '
+                        'the data).')
+    p.add_argument('--metadata-dir', default=None,
+                   help='Where to drop the metadata CSVs. Default: same as '
+                        '--out-dir in fits mode, cwd in ds9 mode.')
     p.add_argument('--list', action='store_true',
                    help='Just list the matching exposures and exit without '
                         'streaming anything.')
@@ -419,11 +524,19 @@ Examples:
         scas = parse_int_spec(args.scas)
 
     multi = len(indices) > 1
-    _log(f"Dispatching {len(indices)} exposure(s) → {args.to}")
+    write_metadata = not args.no_metadata
+    _log(f"Dispatching {len(indices)} exposure(s) → {args.to}"
+         + (" (+ metadata CSV)" if write_metadata else ""))
+
+    if write_metadata:
+        # Import lazily so a missing export_metadata_csv (or its deps) doesn't
+        # kill FITS/DS9 output for users who don't want the CSV anyway.
+        from export_metadata_csv import write_metadata_csv
 
     for idx in indices:
         exp = res.select(idx)
 
+        # Resolve per-exposure output paths up front.
         if args.to == 'fits':
             if args.out_dir and multi:
                 # Multi-exposure: one sub-folder per exposure under --out-dir.
@@ -431,20 +544,55 @@ Examples:
                     args.out_dir,
                     f'v{exp.visit_id}_exp{exp.exposure:02d}',
                 )
+            elif args.out_dir:
+                out_dir = args.out_dir
             else:
-                out_dir = args.out_dir  # to_fits_files falls back to a default
-            res.to_fits(
-                exp, out_dir=out_dir, compress=args.compress,
-                sip_degree=args.sip_degree, scas=scas,
+                out_dir = f'wfi_fits_{exp.visit_id}_exp{exp.exposure:02d}'
+        else:
+            out_dir = None  # DS9 mode — nothing on disk unless metadata_dir set.
+
+        # Where to write the metadata CSV.
+        if write_metadata:
+            if args.metadata_dir is not None:
+                meta_dir = args.metadata_dir
+            elif out_dir is not None:
+                meta_dir = out_dir
+            else:
+                meta_dir = '.'
+            os.makedirs(meta_dir, exist_ok=True)
+            meta_path = os.path.join(
+                meta_dir,
+                f'metadata_{exp.visit_id}_exp{exp.exposure:02d}.csv',
             )
-        else:  # ds9
-            res.to_ds9(
-                exp,
-                sip_degree=args.sip_degree,
-                dq_overlay=not args.no_dq_overlay,
-                ds9_target=args.ds9_target,
-                scas=scas,
-            )
+
+        # One stream feeds every sink. `stream_materialized` reads each SCA's
+        # data arrays into memory as soon as it's opened, so sinks running
+        # tens of seconds later never re-hit the 60 s pre-signed S3 URL.
+        dm_dict = stream_materialized(exp, res.missions, scas=scas)
+        try:
+            if write_metadata:
+                try:
+                    write_metadata_csv(dm_dict, exp, output=meta_path)
+                except Exception as e:
+                    _log(f"WARNING: metadata CSV failed for exp "
+                         f"{exp.visit_id}/{exp.exposure:02d}: {e}")
+
+            if args.to == 'fits':
+                to_fits_files(
+                    dm_dict, exp,
+                    out_dir=out_dir,
+                    compress=args.compress,
+                    sip_degree=args.sip_degree,
+                )
+            else:  # ds9
+                to_ds9(
+                    dm_dict, exp,
+                    sip_degree=args.sip_degree,
+                    dq_overlay=not args.no_dq_overlay,
+                    ds9_target=args.ds9_target,
+                )
+        finally:
+            close_streams(dm_dict)
 
 
 if __name__ == '__main__':
