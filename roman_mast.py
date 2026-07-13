@@ -25,7 +25,11 @@ product MAST knows about (be prepared for it to be large / slow).
 Filter reference
 ----------------
     program         : int             — APT program ID (e.g. 114)
-    pass_           : int             — pass number (e.g. 57)
+    execution_plan  : int             — execution plan within the program
+    pass_           : int             — pass within the execution plan (e.g. 57)
+    segment         : int             — segment within the pass
+    observation     : int             — observation within the segment
+    visit           : int             — visit within the observation
     detector        : str | int       — 'WFI04' / 'wfi04' / 4  → 'WFI04'
     visit_id        : str             — full ID or wildcard, e.g. '0011401057*'
     exposure        : int             — matches last 4 digits of observation_id
@@ -107,26 +111,84 @@ DEFAULT_COLUMNS = [
     'exposure_time', 'exposure_start_time', 'exposure_end_time',
 ]
 
-# data_level → file_suffix passed to MastMissions.filter_products
-DATA_LEVEL_SUFFIX = {1: '_uncal', 2: '_cal', 'gw': '_gw'}
-
-# Every product kind we know Roman WFI writes per fileSetName. Used by the
-# fast path when data_level=None to synthesize filenames locally.
-ALL_PRODUCT_SUFFIXES = [
-    ('_uncal', '.asdf'),     # L1
-    ('_cal',   '.asdf'),     # L2
-    ('_wcs',   '.asdf'),
-    ('_segm',  '.asdf'),
-    ('_cat',   '.parquet'),
-    ('_gw',    '.asdf'),
-]
-
-# data_level → (suffix, extension) for the fast path.
-DATA_LEVEL_FILE = {
-    1:    ('_uncal', '.asdf'),
-    2:    ('_cal',   '.asdf'),
-    'gw': ('_gw',    '.asdf'),
+# Every Roman WFI product kind we know how to build a filename for. A "kind"
+# is one row in this registry; the key is the short name callers use.
+#
+#   suffix        — appended to fileSetName (e.g. '_cal' → 'r..._cal.asdf')
+#   ext           — file extension including the dot
+#   product_type  — which MAST `product_type` row family produces this file.
+#                   `l2` = per-SCA exposures; `p_visit_coadd` = mosaic tiles.
+#                   Kinds only get synthesized for rows of the matching family,
+#                   so we never invent a `_cal.asdf` for a coadd row.
+#   description   — one-line human summary for --list-kinds and help text.
+PRODUCT_KINDS = {
+    # --- per-SCA products (product_type='l2') ---
+    'uncal': {'suffix': '_uncal', 'ext': '.asdf',    'product_type': 'l2',
+              'description': 'L1 uncalibrated ramp'},
+    'cal':   {'suffix': '_cal',   'ext': '.asdf',    'product_type': 'l2',
+              'description': 'L2 calibrated rate image'},
+    'wcs':   {'suffix': '_wcs',   'ext': '.asdf',    'product_type': 'l2',
+              'description': 'L2 WCS solution'},
+    'gw':    {'suffix': '_gw',    'ext': '.asdf',    'product_type': 'l2',
+              'description': 'Guide-window data'},
+    # --- L4 per-SCA overlays (still produced by product_type='l2') ---
+    'segm_sca': {'suffix': '_segm', 'ext': '.asdf',    'product_type': 'l2',
+                 'description': 'L4 segmentation map (per-SCA)'},
+    'cat_sca':  {'suffix': '_cat',  'ext': '.parquet', 'product_type': 'l2',
+                 'description': 'L4 source catalog (per-SCA)'},
+    # --- Mosaic / coadd products (product_type='p_visit_coadd') ---
+    'coadd': {'suffix': '_coadd', 'ext': '.asdf',    'product_type': 'p_visit_coadd',
+              'description': 'L3 visit-coadd mosaic tile'},
+    'segm':  {'suffix': '_segm',  'ext': '.asdf',    'product_type': 'p_visit_coadd',
+              'description': 'L4 segmentation map (coadd)'},
+    'cat':   {'suffix': '_cat',   'ext': '.parquet', 'product_type': 'p_visit_coadd',
+              'description': 'L4 source catalog (coadd)'},
 }
+
+# Backward-compat shortcut: the old data_level=1/2/'gw' → one PRODUCT_KINDS key.
+DATA_LEVEL_KIND = {1: 'uncal', 2: 'cal', 'gw': 'gw'}
+
+# Legacy exports — a few callers still reference these; keep for compatibility.
+DATA_LEVEL_SUFFIX = {lvl: PRODUCT_KINDS[k]['suffix']
+                     for lvl, k in DATA_LEVEL_KIND.items()}
+DATA_LEVEL_FILE = {lvl: (PRODUCT_KINDS[k]['suffix'], PRODUCT_KINDS[k]['ext'])
+                   for lvl, k in DATA_LEVEL_KIND.items()}
+
+
+def _resolve_kinds(kinds, data_level):
+    """Normalize the (kinds, data_level) arguments into a list of kind names.
+
+    Precedence:
+      * kinds='all'  → every kind in PRODUCT_KINDS
+      * kinds set    → validated list of names from PRODUCT_KINDS
+      * data_level ∈ {1, 2, 'gw'}  → the single legacy kind
+      * data_level=None + kinds=None  → all kinds (i.e. every product)
+    """
+    if kinds is not None:
+        if isinstance(kinds, str):
+            if kinds.lower() in ('all', '*'):
+                return list(PRODUCT_KINDS)
+            kinds = [kinds]
+        kinds = list(kinds)
+        bad = [k for k in kinds if k not in PRODUCT_KINDS]
+        if bad:
+            raise ValueError(
+                f"Unknown product kind(s) {bad}. "
+                f"Valid kinds: {sorted(PRODUCT_KINDS)}"
+            )
+        return kinds
+
+    if data_level is None:
+        return list(PRODUCT_KINDS)
+
+    if data_level in DATA_LEVEL_KIND:
+        return [DATA_LEVEL_KIND[data_level]]
+
+    raise ValueError(
+        f"data_level must be one of {list(DATA_LEVEL_KIND)} or None "
+        f"(got {data_level!r}). Use the `kinds` argument for other products "
+        f"({sorted(PRODUCT_KINDS)})."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -181,9 +243,16 @@ def _norm_exposure(exp):
 
 
 # kwarg → (MAST field name, normalizer). None normalizer means passthrough.
+# The visit_id-component fields (execution_plan / pass / segment / observation /
+# visit) all narrow server-side — MAST decodes the visit_id itself. `pass_` and
+# `execution_plan` have trailing/embedded underscores because Python.
 _FILTER_MAP = {
     'program':         ('program',         None),
+    'execution_plan':  ('execution_plan',  None),
     'pass_':           ('pass',            None),
+    'segment':         ('segment',         None),
+    'observation':     ('observation',     None),
+    'visit':           ('visit',           None),
     'detector':        ('detector',        _norm_detector),
     'visit_id':        ('visit_id',        None),
     'exposure':        ('observation_id',  _norm_exposure),
@@ -215,6 +284,32 @@ _FILESET_RE = re.compile(
     r'r(?P<visit_id>\d{19})_(?P<exposure>\d{4})_wfi(?P<sca>\d{2})_(?P<filter>\w+)'
 )
 
+# Roman visit_id = PPPPPCCAAASSSOOOVVV (19 digits)
+#   PPPPP program (5)   CC execution plan (2)   AAA pass (3)
+#   SSS segment (3)     OOO observation (3)     VVV visit (3)
+_VISIT_ID_RE = re.compile(
+    r'^(?P<program>\d{5})(?P<execution_plan>\d{2})(?P<pass_>\d{3})'
+    r'(?P<segment>\d{3})(?P<observation>\d{3})(?P<visit>\d{3})$'
+)
+
+
+def parse_visit_id(visit_id):
+    """Split a 19-digit Roman visit_id into its six numeric components.
+
+    Returns a dict: program, execution_plan, pass, segment, observation, visit
+    (all ints). Raises ValueError on a malformed input.
+    """
+    m = _VISIT_ID_RE.match(str(visit_id))
+    if not m:
+        raise ValueError(
+            f"visit_id {visit_id!r} is not 19 digits (PPPPPCCAAASSSOOOVVV)"
+        )
+    d = m.groupdict()
+    # 'pass' is a Python keyword — normalize to 'pass' in the returned dict
+    # (callers can `d['pass']`), but the regex uses 'pass_'.
+    d['pass'] = d.pop('pass_')
+    return {k: int(v) for k, v in d.items()}
+
 
 @dataclass
 class Exposure:
@@ -222,6 +317,10 @@ class Exposure:
 
     An exposure has up to 18 SCAs (WFI01–WFI18). All SCAs of one exposure
     share visit_id + exposure_number + filter + start time.
+
+    The `visit_id` is decoded into its six numeric fields (program,
+    execution_plan, pass, segment, observation, visit) per the Roman
+    convention PPPPPCCAAASSSOOOVVV — populated in __post_init__.
     """
     visit_id: str
     exposure: int                       # 1-based exposure number in the visit
@@ -230,6 +329,26 @@ class Exposure:
     exposure_time: Any = None
     scas: list = field(default_factory=list)         # sorted list of SCA ints
     filenames: list = field(default_factory=list)    # filenames for this exposure
+
+    # visit_id components — decoded once from the 19-digit visit_id.
+    program: Optional[int]        = None
+    execution_plan: Optional[int] = None
+    pass_: Optional[int]          = None   # trailing underscore: `pass` is reserved
+    segment: Optional[int]        = None
+    observation: Optional[int]    = None
+    visit: Optional[int]          = None
+
+    def __post_init__(self):
+        try:
+            parts = parse_visit_id(self.visit_id)
+        except ValueError:
+            return   # non-standard visit_id → leave the fields as None
+        self.program        = parts['program']
+        self.execution_plan = parts['execution_plan']
+        self.pass_          = parts['pass']
+        self.segment        = parts['segment']
+        self.observation    = parts['observation']
+        self.visit          = parts['visit']
 
     @property
     def key(self):
@@ -512,7 +631,11 @@ def close_streams(asdf_files):
 def list_data(
     *,
     program=None,
+    execution_plan=None,
     pass_=None,
+    segment=None,
+    observation=None,
+    visit=None,
     detector=None,
     visit_id=None,
     exposure=None,
@@ -521,6 +644,7 @@ def list_data(
     product_type=None,
     sca_only=False,
     data_level=2,
+    kinds=None,
     columns=None,
     missions=None,
     token=None,
@@ -535,10 +659,21 @@ def list_data(
     ----------
     program, pass_, detector, visit_id, exposure, optical_element, exposure_type
         Filter criteria (see module docstring).
+    product_type : 'l2' | 'p_visit_coadd' | None
+        Server-side filter on which row family MAST returns. Left unset,
+        both per-SCA (`l2`) and mosaic-tile (`p_visit_coadd`) rows come back.
+    sca_only : bool
+        Shortcut for product_type='l2'.
     data_level : 1 | 2 | 'gw' | None
-        Which product kind to list. 1 → _uncal.asdf, 2 → _cal.asdf,
-        'gw' → _gw.asdf, None → every kind we know Roman writes per fileSetName
-        (uncal, cal, wcs, segm, cat, gw).
+        BACKWARDS-COMPAT shortcut for `kinds`. 1 → ['uncal'], 2 → ['cal'],
+        'gw' → ['gw'], None → all kinds. Ignored if `kinds` is set.
+    kinds : str | list of str | 'all', optional
+        Which product kinds (files per fileSetName row) to synthesize. See
+        `PRODUCT_KINDS` for the full menu — 'uncal', 'cal', 'wcs', 'gw',
+        'segm_sca', 'cat_sca' (per-SCA rows) plus 'coadd', 'segm', 'cat'
+        (mosaic rows). Kinds are family-aware: 'cal' only expands per-SCA
+        rows, 'coadd' only expands mosaic rows — so mixing them in one call
+        is safe. Overrides `data_level` if both are given.
     columns : list of str, optional
         Columns to request from MAST. Defaults to DEFAULT_COLUMNS.
     missions : MastMissions, optional
@@ -550,7 +685,8 @@ def list_data(
         filenames locally from the `fileSetName` column via Roman's naming
         convention. If True, use MAST's authoritative product-list endpoint
         (get_unique_product_list + filter_products) — this is a second server
-        round-trip that can take a very long time on wide searches.
+        round-trip that can take a very long time on wide searches. In this
+        mode the `kinds` list becomes an OR-filter of file_suffix values.
 
     Returns
     -------
@@ -568,8 +704,9 @@ def list_data(
         product_type = 'l2'
 
     search = _build_search(
-        program=program, pass_=pass_, detector=detector,
-        visit_id=visit_id, exposure=exposure,
+        program=program, execution_plan=execution_plan, pass_=pass_,
+        segment=segment, observation=observation, visit=visit,
+        detector=detector, visit_id=visit_id, exposure=exposure,
         optical_element=optical_element, exposure_type=exposure_type,
         product_type=product_type,
     )
@@ -578,11 +715,8 @@ def list_data(
         _log("WARNING: no filters set — this may return a huge result set "
              "and take a very long time.")
 
-    if data_level is not None and data_level not in DATA_LEVEL_SUFFIX:
-        raise ValueError(
-            f"data_level must be one of {list(DATA_LEVEL_SUFFIX)} or None, "
-            f"got {data_level!r}"
-        )
+    kind_names = _resolve_kinds(kinds, data_level)
+    _log(f"Product kinds requested: {kind_names}")
 
     with _timed("query_criteria (metadata search)"):
         results = missions.query_criteria(
@@ -606,14 +740,10 @@ def list_data(
             products = missions.get_unique_product_list(results)
         _log(f"get_unique_product_list returned {len(products)} unique products")
 
-        if data_level is None:
-            filtered = products
-        else:
-            with _timed(f"filter_products(file_suffix={DATA_LEVEL_SUFFIX[data_level]!r})"):
-                filtered = missions.filter_products(
-                    products, file_suffix=DATA_LEVEL_SUFFIX[data_level],
-                )
-            _log(f"filter_products kept {len(filtered)} of {len(products)} products")
+        suffixes = sorted({PRODUCT_KINDS[k]['suffix'] for k in kind_names})
+        with _timed(f"filter_products(file_suffix={suffixes})"):
+            filtered = missions.filter_products(products, file_suffix=suffixes)
+        _log(f"filter_products kept {len(filtered)} of {len(products)} products")
 
         return DataResults(
             search=search, data_level=data_level,
@@ -624,8 +754,9 @@ def list_data(
     # Fast path: derive filenames locally from fileSetName. No second MAST call.
     _log("Building filenames locally from fileSetName (fast path; "
          "pass enumerate_products=True to hit MAST's product list instead).")
-    filtered = _synthesize_products(results, data_level)
-    _log(f"Synthesized {len(filtered)} filenames from {len(results)} rows")
+    filtered = _synthesize_products(results, kind_names)
+    _log(f"Synthesized {len(filtered)} filenames from {len(results)} rows "
+         f"({len(kind_names)} kind(s))")
 
     return DataResults(
         search=search, data_level=data_level,
@@ -638,13 +769,18 @@ def list_data(
 # Fast-path filename synthesis
 # ---------------------------------------------------------------------------
 
-def _synthesize_products(results, data_level):
+def _synthesize_products(results, kind_names):
     """Build a fake products Table with one 'filename' column, locally.
 
     Roman WFI filenames follow the pattern ``{fileSetName}{suffix}{ext}``,
     e.g. ``r0011401057001001001_0001_wfi04_f062_cal.asdf``. `fileSetName` is
     already in the metadata result, so we don't need to ask MAST what
     products exist — we know.
+
+    Kinds are family-aware: a `cal` kind (product_type='l2') is only
+    synthesized for rows whose product_type is 'l2', and a `coadd` kind is
+    only synthesized for 'p_visit_coadd' rows. This keeps mixed-family
+    searches honest — no invented `_cal.asdf` for a mosaic row.
     """
     from astropy.table import Table
 
@@ -653,18 +789,22 @@ def _synthesize_products(results, data_level):
             "query_criteria result has no fileSetName column — cannot build "
             "filenames locally. Retry with enumerate_products=True."
         )
-
-    if data_level is None:
-        suffixes = ALL_PRODUCT_SUFFIXES
-    else:
-        suffixes = [DATA_LEVEL_FILE[data_level]]
+    has_pt = 'product_type' in results.colnames
 
     filenames = []
-    for fsn in results['fileSetName']:
+    for row in results:
+        fsn = row['fileSetName']
         if fsn is None or str(fsn) in ('', '--'):
             continue
-        for suffix, ext in suffixes:
-            filenames.append(f'{fsn}{suffix}{ext}')
+        row_pt = str(row['product_type']) if has_pt else None
+
+        for k in kind_names:
+            spec = PRODUCT_KINDS[k]
+            # Only emit this kind for rows of the matching family; if we
+            # didn't get product_type back for some reason, be permissive.
+            if has_pt and row_pt != spec['product_type']:
+                continue
+            filenames.append(f"{fsn}{spec['suffix']}{spec['ext']}")
 
     return Table({'filename': filenames})
 
@@ -673,12 +813,91 @@ def _synthesize_products(results, data_level):
 # Reporting
 # ---------------------------------------------------------------------------
 
+# Terminal color helpers. Auto-disabled when stdout is not a TTY (piping,
+# redirect, capturing output). Respects NO_COLOR (https://no-color.org) and
+# the module-level COLOR override set by --color / --no-color.
+COLOR = None   # None → auto; True → force on; False → force off
+
+# 256-color codes for the six visit_id chunks (used in header + visit_id string).
+# Softer than the base 8-color palette; readable on both light and dark terms.
+_CHUNK_COLORS = {
+    'program':        '38;5;33',    # blue
+    'execution_plan': '38;5;44',    # cyan
+    'pass':           '38;5;40',    # green
+    'segment':        '38;5;178',   # yellow / amber
+    'observation':    '38;5;170',   # magenta
+    'visit':          '38;5;203',   # red-orange
+}
+
+
+def _use_color():
+    if COLOR is True:
+        return True
+    if COLOR is False:
+        return False
+    if os.getenv('NO_COLOR') is not None:
+        return False
+    return sys.stdout.isatty()
+
+
+def _ansi(text, *codes):
+    """Wrap `text` with ANSI SGR codes, or return it unchanged if color is off."""
+    if not codes or not _use_color():
+        return text
+    return f"\x1b[{';'.join(codes)}m{text}\x1b[0m"
+
+
+def _colorize_visit_id(vid: str) -> str:
+    """Color a 19-digit visit_id by its P/EP/Pass/Seg/Obs/Vis chunks."""
+    if len(vid) != 19 or not vid.isdigit():
+        return vid
+    return (
+        _ansi(vid[0:5],   _CHUNK_COLORS['program'])
+        + _ansi(vid[5:7],   _CHUNK_COLORS['execution_plan'])
+        + _ansi(vid[7:10],  _CHUNK_COLORS['pass'])
+        + _ansi(vid[10:13], _CHUNK_COLORS['segment'])
+        + _ansi(vid[13:16], _CHUNK_COLORS['observation'])
+        + _ansi(vid[16:19], _CHUNK_COLORS['visit'])
+    )
+
+
+def _pad_visible(text: str, visible_text: str, width: int) -> str:
+    """Left-pad `text` so its VISIBLE width (ignoring ANSI) is `width`.
+
+    Needed because f-string `<20` counts ANSI escape bytes as characters.
+    """
+    padding = max(0, width - len(visible_text))
+    return text + (' ' * padding)
+
+
+def _fmt_int(v, w, changed):
+    """Right-aligned int column with bold-on-change / dim-when-repeated."""
+    if v is None:
+        return '-' * w
+    s = f"{v:>{w}}"
+    return _ansi(s, '1') if changed else _ansi(s, '2')
+
+
+def _fmt_scas(n_scas, expected=18):
+    """Green if SCA count is nominal, yellow if short, else plain."""
+    s = f"{n_scas:>5}"
+    if n_scas == expected:
+        return _ansi(s, '38;5;40')      # green
+    if n_scas < expected:
+        return _ansi(s, '38;5;220')     # yellow
+    return s
+
+
 def print_summary(res: DataResults, max_rows: int = 50, show_files: bool = False):
     """Print a compact, human-readable summary of a DataResults.
 
     Exposures (grouped per visit_id + exposure number) are always shown, since
     that's the natural display unit. Pass ``show_files=True`` to also dump the
     flat filename list at the end.
+
+    Terminal color is on when writing to a TTY and off when redirected. Force
+    it with ``--color always`` / ``--no-color`` on the CLI, or the ``COLOR``
+    module attribute in Python (True / False / None).
     """
     print("=" * 70)
     print("Roman MAST — list_data")
@@ -696,17 +915,102 @@ def print_summary(res: DataResults, max_rows: int = 50, show_files: bool = False
 
     if res.n_exposures:
         print()
-        print(f"  {'#':>3}  {'Visit ID':<20} {'Exp':>4} {'Filter':<7} "
-              f"{'SCAs':>5}  Start time")
-        print("  " + "-" * 66)
+        # Legend: each label is colored the same as its column of digits in the
+        # visit_id below. Learn once, then a glance at the visit_id shows the
+        # whole (program / execution / pass / …) breakdown.
+        legend = ' / '.join([
+            _ansi('Program',     _CHUNK_COLORS['program']),
+            _ansi('ExecPlan',    _CHUNK_COLORS['execution_plan']),
+            _ansi('Pass',        _CHUNK_COLORS['pass']),
+            _ansi('Segment',     _CHUNK_COLORS['segment']),
+            _ansi('Observation', _CHUNK_COLORS['observation']),
+            _ansi('Visit',       _CHUNK_COLORS['visit']),
+        ])
+        print(f"  visit_id decoded as PPPPPCCAAASSSOOOVVV → {legend}")
+        print()
+
+        # Header — chunk-colored labels above matching columns.
+        header_bits = [
+            _ansi(f"{'#':>3}", '1'),
+            _ansi(f"{'Visit ID':<20}", '1'),
+            _ansi(f"{'Prog':>5}", '1', _CHUNK_COLORS['program']),
+            _ansi(f"{'EP':>2}",   '1', _CHUNK_COLORS['execution_plan']),
+            _ansi(f"{'Pass':>4}", '1', _CHUNK_COLORS['pass']),
+            _ansi(f"{'Seg':>3}",  '1', _CHUNK_COLORS['segment']),
+            _ansi(f"{'Obs':>3}",  '1', _CHUNK_COLORS['observation']),
+            _ansi(f"{'Vis':>3}",  '1', _CHUNK_COLORS['visit']),
+            _ansi(f"{'Exp':>4}",   '1'),
+            _ansi(f"{'Filter':<7}",'1'),
+            _ansi(f"{'SCAs':>5}",  '1'),
+            _ansi("Start time",    '1'),
+        ]
+        print("  " + header_bits[0] + "  " + header_bits[1] + " "
+              + " ".join(header_bits[2:8]) + "  "
+              + header_bits[8] + " " + header_bits[9] + " " + header_bits[10]
+              + "  " + header_bits[11])
+        print(_ansi("  " + "-" * 100, '2'))
+
+        prev = None
         for i, exp in enumerate(res.exposures):
             if i >= max_rows:
-                print(f"  ... and {res.n_exposures - max_rows} more exposures")
+                print(_ansi(f"  ... and {res.n_exposures - max_rows} more exposures", '2'))
                 break
+
+            # Change-detection: bold if the field changed vs previous row,
+            # dim if it repeats.
+            changed = {
+                'program':        prev is None or exp.program        != prev.program,
+                'execution_plan': prev is None or exp.execution_plan != prev.execution_plan,
+                'pass':           prev is None or exp.pass_          != prev.pass_,
+                'segment':        prev is None or exp.segment        != prev.segment,
+                'observation':    prev is None or exp.observation    != prev.observation,
+                'visit':          prev is None or exp.visit          != prev.visit,
+                'exposure':       prev is None or exp.exposure       != prev.exposure,
+            }
+
             start = str(exp.exposure_start_time) if exp.exposure_start_time else ''
-            filt = str(exp.optical_element) if exp.optical_element else ''
-            print(f"  {i+1:>3}  {exp.visit_id:<20} {exp.exposure:>4} "
-                  f"{filt:<7} {exp.n_scas:>5}  {start}")
+            filt  = str(exp.optical_element) if exp.optical_element else ''
+            vid_colored = _colorize_visit_id(exp.visit_id)
+
+            row = "  " + _ansi(f"{i+1:>3}", '2') + "  "
+            row += _pad_visible(vid_colored, exp.visit_id, 20) + " "
+            row += _fmt_int(exp.program,        5, changed['program']) + " "
+            row += _fmt_int(exp.execution_plan, 2, changed['execution_plan']) + " "
+            row += _fmt_int(exp.pass_,          4, changed['pass']) + " "
+            row += _fmt_int(exp.segment,        3, changed['segment']) + " "
+            row += _fmt_int(exp.observation,    3, changed['observation']) + " "
+            row += _fmt_int(exp.visit,          3, changed['visit']) + "  "
+            row += _fmt_int(exp.exposure,       4, changed['exposure']) + " "
+            row += f"{filt:<7} "
+            row += _fmt_scas(exp.n_scas) + "  "
+            row += start
+            print(row)
+
+            prev = exp
+
+    # --- Products by kind ------------------------------------------------
+    # Group the flat filename list into the PRODUCT_KINDS families so a
+    # mixed-kind query (--kinds cal,coadd,cat) actually shows what's there.
+    if res.n_products:
+        by_kind = _classify_products(res.filenames)
+        print()
+        print(_ansi("  Products by kind:", '1'))
+        print(f"    {'kind':<10} {'suffix':<15} {'count':>6}  {'example':<60}")
+        print("    " + "-" * 92)
+        for kind_name, entries in by_kind.items():
+            if not entries:
+                continue
+            spec = PRODUCT_KINDS.get(kind_name)
+            if spec is not None:
+                label = _ansi(f"{kind_name:<10}", _CHUNK_COLORS['pass'])
+                suffix = f"{spec['suffix']}{spec['ext']}"
+            else:
+                label = _ansi(f"{kind_name:<10}", '38;5;244')  # unknown → grey
+                suffix = '(unrecognized)'
+            example = entries[0]
+            if len(example) > 60:
+                example = example[:57] + '...'
+            print(f"    {label} {suffix:<15} {len(entries):>6}  {example}")
 
     if show_files:
         print("\n  Files:")
@@ -715,6 +1019,48 @@ def print_summary(res: DataResults, max_rows: int = 50, show_files: bool = False
                 print(f"    ... and {res.n_products - max_rows} more")
                 break
             print(f"    {name}")
+
+
+# Coadd/mosaic filenames start with r{PROGRAM}_p_v..., per-SCA filenames with
+# r{19-digit visit_id}_. Used to disambiguate kinds with shared suffixes
+# (segm / segm_sca and cat / cat_sca both have '_segm' / '_cat').
+_COADD_FILENAME_RE = re.compile(r'^r\d{5}_p_v')
+
+
+def _filename_family(fname):
+    """Return 'p_visit_coadd' for a coadd-style filename, else 'l2'."""
+    return 'p_visit_coadd' if _COADD_FILENAME_RE.match(fname) else 'l2'
+
+
+def _classify_products(filenames):
+    """Group filenames by which PRODUCT_KINDS entry they match, preserving order.
+
+    Matching is family-aware — the coadd `_segm.asdf` classifies as 'segm'
+    (product_type='p_visit_coadd'), while the per-SCA `_segm.asdf` classifies
+    as 'segm_sca' (product_type='l2'), even though the suffixes are identical.
+    Files that don't match any kind land in an 'other' bucket so surprises
+    stay visible.
+    """
+    # Longest suffix first — e.g. hypothetical '_cal2' shouldn't be shadowed by '_cal'.
+    lookup = sorted(
+        ((spec['suffix'], spec['ext'], spec['product_type'], name)
+         for name, spec in PRODUCT_KINDS.items()),
+        key=lambda t: -len(t[0]),
+    )
+    buckets = {name: [] for name in PRODUCT_KINDS}
+    buckets['other'] = []
+
+    for fname in filenames:
+        family = _filename_family(fname)
+        matched = None
+        for suffix, ext, spec_family, name in lookup:
+            if spec_family != family:
+                continue
+            if fname.endswith(f'{suffix}{ext}'):
+                matched = name
+                break
+        buckets[matched if matched else 'other'].append(fname)
+    return buckets
 
 
 # ---------------------------------------------------------------------------
@@ -747,12 +1093,21 @@ def add_list_data_args(parser):
     """
     parser.add_argument('--program',         type=int, default=None,
                         help='APT program ID, e.g. 114')
+    parser.add_argument('--execution-plan',  dest='execution_plan',
+                        type=int, default=None,
+                        help='Execution plan number within the program')
     parser.add_argument('--pass',            dest='pass_', type=int, default=None,
-                        metavar='PASS', help='Pass number, e.g. 57')
+                        metavar='PASS', help='Pass number within the execution plan')
+    parser.add_argument('--segment',         type=int, default=None,
+                        help='Segment number within the pass')
+    parser.add_argument('--observation',     type=int, default=None,
+                        help='Observation number within the segment')
+    parser.add_argument('--visit',           type=int, default=None,
+                        help='Visit number within the observation')
     parser.add_argument('--detector',        default=None,
                         help="Detector — 'WFI04', 'wfi04', or 4")
     parser.add_argument('--visit-id',        default=None,
-                        help='Visit ID or wildcard, e.g. 0011401057*')
+                        help='Full 19-digit visit ID or wildcard, e.g. 0011401057*')
     parser.add_argument('--exposure',        type=int, default=None,
                         help='Exposure number (last 4 digits of observation_id)')
     parser.add_argument('--optical-element', default=None,
@@ -765,14 +1120,27 @@ def add_list_data_args(parser):
     parser.add_argument('--sca-only',        action='store_true',
                         help='Shortcut for --product-type l2 (raw per-SCA files only)')
     parser.add_argument('--data-level',      default='2',
-                        help="1=uncal, 2=cal, gw=guide-window, none=all products "
-                             "(default 2)")
+                        help="Shortcut: 1=uncal, 2=cal, gw=guide-window, "
+                             "none=all kinds (default 2). Use --kinds for "
+                             "finer control (mosaic coadds, catalogs, ...).")
+    parser.add_argument('--kinds',           default=None,
+                        help="Product kinds (comma-separated) — overrides "
+                             "--data-level if set. 'all' picks every kind. "
+                             "See --list-kinds for the menu.")
+    parser.add_argument('--list-kinds',      action='store_true',
+                        help='Print the PRODUCT_KINDS registry and exit')
     parser.add_argument('--enumerate-products', action='store_true',
                         help='Hit MAST for the authoritative product list instead '
                              'of synthesizing filenames from fileSetName. Slow on '
                              'wide searches; usually unnecessary.')
     parser.add_argument('--quiet',           action='store_true',
                         help='Suppress the [roman_mast] progress diagnostics')
+    parser.add_argument('--color',           choices=['auto', 'always', 'never'],
+                        default='auto',
+                        help='Terminal color: auto (default; on when stdout '
+                             'is a TTY), always, never')
+    parser.add_argument('--no-color',        dest='color', action='store_const',
+                        const='never', help='Alias for --color never')
 
 
 def list_data_from_args(args):
@@ -780,9 +1148,27 @@ def list_data_from_args(args):
     if getattr(args, 'quiet', False):
         globals()['VERBOSE'] = False
 
+    color = getattr(args, 'color', 'auto')
+    if color == 'always':
+        globals()['COLOR'] = True
+    elif color == 'never':
+        globals()['COLOR'] = False
+    # 'auto' leaves COLOR = None → _use_color() checks the TTY.
+
+    kinds = None
+    if getattr(args, 'kinds', None):
+        raw = str(args.kinds).strip()
+        kinds = raw if raw.lower() in ('all', '*') else [
+            k.strip() for k in raw.split(',') if k.strip()
+        ]
+
     return list_data(
         program=args.program,
+        execution_plan=args.execution_plan,
         pass_=args.pass_,
+        segment=args.segment,
+        observation=args.observation,
+        visit=args.visit,
         detector=args.detector,
         visit_id=args.visit_id,
         exposure=args.exposure,
@@ -791,8 +1177,27 @@ def list_data_from_args(args):
         product_type=args.product_type,
         sca_only=args.sca_only,
         data_level=_parse_data_level(args.data_level),
+        kinds=kinds,
         enumerate_products=args.enumerate_products,
     )
+
+
+def print_kinds():
+    """Dump the PRODUCT_KINDS registry — used by `--list-kinds`."""
+    print("Roman product kinds — pass one or more to --kinds (comma-separated):")
+    print()
+    print(f"  {'name':<10} {'product_type':<15} {'file suffix':<20} description")
+    print("  " + "-" * 76)
+    for name, spec in PRODUCT_KINDS.items():
+        suffix = f"{spec['suffix']}{spec['ext']}"
+        print(f"  {name:<10} {spec['product_type']:<15} {suffix:<20} "
+              f"{spec['description']}")
+    print()
+    print("  Notes:")
+    print("    * kinds are family-aware — 'cal' only lists per-SCA rows, "
+          "'coadd' only mosaic rows.")
+    print("    * combine with --product-type to also restrict which rows MAST "
+          "returns server-side.")
 
 
 def _parse_data_level(s):
@@ -841,6 +1246,10 @@ Examples:
                         'per-exposure summary')
 
     args = p.parse_args()
+
+    if args.list_kinds:
+        print_kinds()
+        return
 
     res = list_data_from_args(args)
     print_summary(res, max_rows=args.max_rows, show_files=args.show_files)
