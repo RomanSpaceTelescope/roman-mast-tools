@@ -11,9 +11,15 @@ Public surface
     to_fits_files(af_dict, exposure, out_dir=None, compress=False, ...)
         Write one FITS file per SCA, with SIP-approximated WCS headers.
 
-    to_ds9(af_dict, exposure, dq_overlay=True, ds9_target=None, ...)
+    to_ds9(af_dict, exposure, dq_overlay=True, catalog_paths=None, ...)
         Pipe every SCA into a single DS9 WCS mosaic frame via XPA, optionally
-        with a DQ mask overlay. No local files touched.
+        with a DQ mask overlay and/or L4 catalog source overlays. No local
+        files touched (except the temp parquet cache for catalogs).
+
+    download_catalogs(exposure, missions, out_dir=None, ...)
+        Fetch the per-SCA L4 catalog (`cat_sca`) parquet files for an
+        exposure. Returns {sca: local_path or None}. Silently returns None
+        for SCAs that don't have a catalog on MAST.
 
 Both are also exposed as convenience methods `DataResults.to_fits()` and
 `DataResults.to_ds9()` in `roman_mast`, which do the stream + output in
@@ -316,6 +322,240 @@ def to_fits_files(
 
 
 # ---------------------------------------------------------------------------
+# L4 catalog (cat_sca) download + DS9 region synthesis
+# ---------------------------------------------------------------------------
+
+# `read_product` only handles .fits / .asdf; parquet has to go through
+# `download_file`, which writes to disk. We cache into a per-run temp dir
+# and clean up after the DS9 handoff.
+def _catalog_filename(exposure: Exposure, scanum: int) -> str:
+    """Build the expected `_cat.parquet` filename for one SCA of an exposure.
+
+    Roman filenames follow the fixed pattern
+    ``r{visit_id}_{exp:04d}_wfi{sca:02d}_{filter}_cat.parquet``. `filter`
+    is the exposure's optical_element lowercased.
+    """
+    filt = (exposure.optical_element or 'unk').lower()
+    return (f"r{exposure.visit_id}_{exposure.exposure:04d}_"
+            f"wfi{scanum:02d}_{filt}_cat.parquet")
+
+
+def download_catalogs(
+    exposure: Exposure,
+    missions,
+    *,
+    scas=None,
+    out_dir: Optional[str] = None,
+    max_workers: int = 8,
+) -> dict:
+    """Download L4 per-SCA catalogs for `exposure`. Returns {sca: path or None}.
+
+    Not every SCA has a catalog on MAST — the L4 pipeline may skip an SCA
+    if the calibrated image failed or lacked detections. `download_file`
+    returns ``status='ERROR'`` with a 404 message in that case; we swallow
+    those and return None for that SCA so callers can attempt the whole
+    set unconditionally.
+
+    Parameters
+    ----------
+    out_dir : str, optional
+        Where to drop the parquet files. Default: a fresh tempdir (caller
+        can shutil.rmtree it — the paths returned point inside it).
+    max_workers : int
+        Concurrent downloads. Matches the streaming pool; each catalog
+        is a small (~50-200 kB) HTTP GET so parallelism helps latency
+        but hits diminishing returns fast.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import tempfile
+
+    if out_dir is None:
+        out_dir = tempfile.mkdtemp(prefix='roman_cat_')
+    os.makedirs(out_dir, exist_ok=True)
+
+    if scas is None:
+        wanted = list(exposure.scas)
+    else:
+        wanted = [s for s in exposure.scas if s in set(int(x) for x in scas)]
+
+    def _fetch(sca):
+        fname = _catalog_filename(exposure, sca)
+        # download_file writes {out_dir}/{fname}. It returns (status, msg, url);
+        # status is 'COMPLETE' on success, 'ERROR' on 404 / anything else.
+        try:
+            status, msg, _ = missions.download_file(
+                fname, local_path=out_dir, cache=True, verbose=False,
+            )
+        except Exception as e:
+            _log(f"  SCA {sca:02d}: catalog download crashed: "
+                 f"{type(e).__name__}: {e}")
+            return sca, None
+        if status != 'COMPLETE':
+            return sca, None
+        return sca, os.path.join(out_dir, fname)
+
+    workers = max(1, min(max_workers, len(wanted)))
+    paths: dict = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_fetch, s) for s in wanted]
+        for fut in as_completed(futures):
+            sca, path = fut.result()
+            paths[sca] = path
+
+    have = sum(1 for p in paths.values() if p is not None)
+    _log(f"L4 catalogs: {have}/{len(wanted)} SCAs have a cat_sca on MAST")
+    return {s: paths[s] for s in sorted(paths)}
+
+
+# Columns we pull off each catalog parquet to build the region file. Kept
+# tight — pyarrow reads only these, so parquets stay cheap to load. Adding
+# a column here also automatically makes it available for label formatting.
+_REGION_COLUMNS = (
+    'label',              # per-SCA integer source ID (unique inside one SCA)
+    'ra', 'dec',          # sky coords for the region circle
+    'warning_flags',      # 0 = clean; drop non-zero unless --catalog-include-flagged
+    'kron_abmag',         # total mag — the number a user usually wants to see
+    'kron_abmag_err',     # its uncertainty
+    'is_extended',        # star (False) vs. galaxy-like (True); drives color
+)
+
+
+def _format_label(mode: str, sca: int, label, mag, mag_err) -> str:
+    """Produce the DS9 `text={...}` payload for one source.
+
+    `mode` mirrors --catalog-label:
+        'none' → no text (returns '')
+        'id'   → 'SCA01.42'
+        'mag'  → '19.34'
+        'full' → 'SCA01.42  m=19.34±0.02'
+    Missing / NaN values render as '?' rather than 'nan' so a glance at DS9
+    tells you what was in the catalog vs. what was blanked.
+    """
+    if mode == 'none':
+        return ''
+    sid = f"SCA{sca:02d}.{int(label)}" if label is not None else f"SCA{sca:02d}"
+    if mode == 'id':
+        return sid
+    m = f"{mag:.2f}" if mag is not None and np.isfinite(mag) else '?'
+    if mode == 'mag':
+        return m
+    e = f"{mag_err:.2f}" if mag_err is not None and np.isfinite(mag_err) else '?'
+    return f"{sid}  m={m}±{e}"
+
+
+# One region file (fk5 coordinates) covers the whole mosaic — DS9 evaluates
+# each region against the currently displayed WCS, so we don't need per-SCA
+# region files.
+def _build_region_text(
+    catalog_paths: dict,
+    *,
+    radius_arcsec: float = 0.4,
+    color: str = 'green',
+    extended_color: Optional[str] = 'yellow',
+    width: int = 1,
+    max_per_sca: Optional[int] = None,
+    include_flagged: bool = False,
+    label_mode: str = 'full',
+) -> str:
+    """Assemble a DS9 region string from a set of per-SCA catalog parquets.
+
+    One `circle` per detected source, in fk5 sky coordinates. The mosaic
+    WCS handles the projection, so a single region block works across all
+    SCA tiles.
+
+    Each region carries per-source metadata as DS9 comment properties so
+    clicking a circle in DS9 shows the source ID / magnitude:
+        text={SCA01.42  m=19.34±0.02}   — label shown next to the circle
+        tag={SCA01} tag={extended}      — grouping tags (toggle per-SCA / per-class)
+
+    Parameters
+    ----------
+    color : str
+        Default region color; also used for stars (is_extended=False).
+    extended_color : str, optional
+        Color for `is_extended=True` sources. Set None to disable and use
+        `color` for everything.
+    max_per_sca : int, optional
+        Cap on regions per SCA — keeps DS9 responsive for very rich fields.
+        None (default) draws every source.
+    include_flagged : bool
+        By default we drop sources with a non-zero warning_flags value
+        (saturation, edge, contamination, ...). Flip to True to show
+        everything.
+    label_mode : {'none', 'id', 'mag', 'full'}
+        What to write into each region's DS9 label. 'none' = no text
+        (fastest to render), 'id' = 'SCA01.42', 'mag' = '19.34',
+        'full' = 'SCA01.42  m=19.34±0.02'. Default 'id'.
+    """
+    import pyarrow.parquet as pq
+
+    lines = ['# DS9 region file — roman-mast-tools L4 sources',
+             'global color=%s width=%d font="helvetica 10 normal"' % (color, width),
+             'fk5']
+
+    total = 0
+    for scanum in sorted(catalog_paths):
+        path = catalog_paths[scanum]
+        if path is None:
+            continue
+        try:
+            tbl = pq.read_table(path, columns=list(_REGION_COLUMNS))
+        except Exception as e:
+            _log(f"  SCA {scanum:02d}: could not read catalog {path}: "
+                 f"{type(e).__name__}: {e}")
+            continue
+
+        # to_numpy() on nullable columns returns object arrays; that's fine
+        # here — we only index element-wise, no vectorized arithmetic.
+        labels    = tbl.column('label').to_numpy()
+        ras       = tbl.column('ra').to_numpy()
+        decs      = tbl.column('dec').to_numpy()
+        flags     = tbl.column('warning_flags').to_numpy()
+        mags      = tbl.column('kron_abmag').to_numpy()
+        mag_errs  = tbl.column('kron_abmag_err').to_numpy()
+        extended  = tbl.column('is_extended').to_numpy()
+
+        # Drop rows with masked / non-finite sky coords — the L4 pipeline
+        # can emit sources whose centroid failed to converge.
+        good = np.isfinite(ras.astype(float)) & np.isfinite(decs.astype(float))
+        if not include_flagged:
+            good &= (flags == 0)
+
+        idx = np.where(good)[0]
+        if max_per_sca is not None and len(idx) > max_per_sca:
+            idx = idx[:max_per_sca]
+
+        for i in idx:
+            props = [f'tag={{SCA{scanum:02d}}}']
+
+            # extended → different color + a class tag so users can toggle
+            # 'show galaxies only' via DS9's region-group filter.
+            is_ext = bool(extended[i]) if extended[i] is not None else False
+            if is_ext:
+                props.append('tag={extended}')
+                if extended_color:
+                    props.append(f'color={extended_color}')
+            else:
+                props.append('tag={point}')
+
+            text = _format_label(label_mode, scanum, labels[i], mags[i], mag_errs[i])
+            if text:
+                # DS9 text is single-braced; escape any stray '}' just in case.
+                safe = text.replace('}', ')')
+                props.append(f'text={{{safe}}}')
+
+            lines.append(
+                f'circle({ras[i]:.7f},{decs[i]:.7f},{radius_arcsec:.2f}") # '
+                + ' '.join(props)
+            )
+        total += len(idx)
+
+    _log(f"L4 catalog overlay: built {total} source regions "
+         f"(label_mode={label_mode})")
+    return '\n'.join(lines) + '\n'
+
+
+# ---------------------------------------------------------------------------
 # to_ds9 — pipe an in-memory MEF via XPA
 # ---------------------------------------------------------------------------
 
@@ -325,6 +565,13 @@ def to_ds9(
     *,
     sip_degree: int = 4,
     dq_overlay: bool = True,
+    catalog_paths: Optional[dict] = None,
+    catalog_radius_arcsec: float = 0.4,
+    catalog_color: str = 'green',
+    catalog_extended_color: Optional[str] = 'yellow',
+    catalog_include_flagged: bool = False,
+    catalog_label_mode: str = 'full',
+    catalog_show_labels: bool = False,
     ds9_target: Optional[str] = None,
 ):
     """Stream every SCA into a single DS9 WCS mosaic frame via XPA.
@@ -343,6 +590,31 @@ def to_ds9(
     dq_overlay : bool
         If True (default), send DQ (dq != 0) as a mask overlay on top of the
         data frame. Silently skipped for products without a DQ array.
+    catalog_paths : dict, optional
+        ``{sca: path_to_cat_sca.parquet or None}`` — typically what
+        `download_catalogs()` returns. When provided, DS9 draws one circle
+        per source in fk5 coordinates on top of the mosaic. None values
+        (SCAs with no catalog on MAST) are silently skipped.
+    catalog_radius_arcsec : float
+        Circle radius for source overlays. Default 0.4" — big enough to
+        spot in a wide zoom, small enough not to obscure the source itself.
+    catalog_color : str
+        DS9 color name for point-like sources (default 'green').
+    catalog_extended_color : str, optional
+        Color for sources flagged is_extended=True. Default 'yellow' — gives
+        a stars vs. galaxies split at a glance. None disables the split and
+        uses `catalog_color` for everything.
+    catalog_include_flagged : bool
+        If False (default), sources with non-zero `warning_flags` are dropped.
+    catalog_label_mode : {'none', 'id', 'mag', 'full'}
+        DS9 label attached to each region. 'full' → 'SCA01.42  m=19.34±0.02'
+        (default), 'id' → 'SCA01.42', 'mag' → '19.34', 'none' → no label
+        (fastest for very rich fields).
+    catalog_show_labels : bool
+        If False (default), send `regions showtext no` to DS9 after loading —
+        labels stay in the region metadata (visible when you click a source,
+        and preserved in the saved .reg file) but don't paint on the image.
+        Flip to True for always-on labels.
     ds9_target : str, optional
         Name of an existing DS9 XPA target. If None, connects to the default
         DS9 instance (starting one if pyds9 does that on your setup).
@@ -432,10 +704,45 @@ def to_ds9(
         d.set('mask mark nonzero')
         d.set('fits mask mosaicimage wcs', dq_bytes)
 
+    # --- L4 catalog source overlay ---------------------------------------
+    # DS9 evaluates fk5 regions against the mosaic's WCS, so one region
+    # block spans every SCA. `regions` via XPA takes the region text on
+    # stdin — same as loading a .reg file.
+    n_cat = 0
+    if catalog_paths:
+        region_text = _build_region_text(
+            catalog_paths,
+            radius_arcsec=catalog_radius_arcsec,
+            color=catalog_color,
+            extended_color=catalog_extended_color,
+            include_flagged=catalog_include_flagged,
+            label_mode=catalog_label_mode,
+        )
+        # Count SCAs with any usable catalog — for the log line below.
+        n_cat = sum(1 for p in catalog_paths.values() if p is not None)
+        try:
+            # 'regions -format ds9' reads a full region file; we send it
+            # by pipe (the second positional arg to pyds9.DS9.set).
+            d.set('regions -format ds9', region_text)
+            # Hide the text=… labels by default so 900+ mag readouts don't
+            # obscure the image. The labels stay in the region metadata,
+            # so clicking a source pops them in DS9's region-info dialog.
+            if not catalog_show_labels:
+                d.set('regions showtext no')
+        except Exception as e:
+            _log(f"WARNING: could not load catalog regions into DS9: "
+                 f"{type(e).__name__}: {e}")
+            n_cat = 0
+
     d.set('zoom to fit')
 
-    extras = f" + DQ overlay ({n_dq} SCAs)" if n_dq else ""
-    _log(f"Loaded {n_data} SCAs into DS9{extras}  "
+    extras = []
+    if n_dq:
+        extras.append(f"DQ overlay ({n_dq} SCAs)")
+    if n_cat:
+        extras.append(f"L4 catalog ({n_cat} SCAs)")
+    extras_str = f" + {' + '.join(extras)}" if extras else ""
+    _log(f"Loaded {n_data} SCAs into DS9{extras_str}  "
          f"(visit {exposure.visit_id} / exposure {exposure.exposure})")
 
     return d
@@ -482,23 +789,33 @@ Selection works in two steps: the standard --program / --pass / --detector /
 --visit-id filters find the exposure(s), then --exposures picks which of
 those to output. --list first, then re-run without --list.
 
+Every run drops one folder per exposure under --out-dir (default cwd):
+
+    <out-dir>/v{visit_id}_exp{NN}/
+        metadata_{visit_id}_exp{NN}.csv    (unless --no-metadata)
+        catalog/                            (ds9 mode, unless --no-catalog)
+            r..._wfi{NN}_..._cat.parquet    (one per SCA that has a catalog)
+            catalog_{visit_id}_exp{NN}.reg  (DS9 regions from all catalogs)
+        sca_{NN}.fits                       (fits mode)
+
 Examples:
   # See what's available (no output yet)
   python roman_fits.py --program 114 --pass 57 --sca-only --list
 
-  # Write one exposure to disk as 18 FITS files
+  # Write one exposure to disk as 18 FITS files under /tmp/wfi/v..._exp01/
   python roman_fits.py --program 114 --pass 57 --sca-only \\
-      --exposures 1 --to fits --out-dir /tmp/wfi_exp1
+      --exposures 1 --to fits --out-dir /tmp/wfi
 
-  # Same, RICE compressed
+  # Same, RICE compressed (folder in cwd)
   python roman_fits.py --program 114 --pass 57 --sca-only \\
       --exposures 1 --to fits --compress
 
-  # Multiple exposures — each gets its own subdirectory under --out-dir
+  # Multiple exposures — one v..._expNN/ folder each under --out-dir
   python roman_fits.py --program 114 --pass 57 --sca-only \\
       --exposures 1-4 --to fits --out-dir /tmp/wfi
 
-  # Stream to DS9 (needs `ds9 &` running and pyds9 installed)
+  # Stream to DS9 (needs `ds9 &` running and pyds9 installed); catalog
+  # parquets + .reg land in <cwd>/v..._exp01/catalog/
   python roman_fits.py --program 114 --pass 57 --sca-only \\
       --exposures 1 --to ds9
 
@@ -522,15 +839,50 @@ Examples:
                         "'ds9' streams into a running DS9 as a WCS mosaic. "
                         "Default: fits.")
     p.add_argument('--out-dir', default=None,
-                   help="Base output directory (fits mode). Default: "
-                        "wfi_fits_{visit}_exp{NN}/ in cwd; for multi-exposure "
-                        "runs, one such folder per exposure under this base.")
+                   help="Root directory for all per-exposure exports. Each "
+                        "exposure gets a subfolder v{visit_id}_exp{NN}/ under "
+                        "this root, containing the metadata CSV, the catalog/ "
+                        "subfolder (ds9 mode), and — in fits mode — the per-SCA "
+                        "FITS files. Default: cwd.")
     p.add_argument('--compress', action='store_true',
                    help='RICE_1 tile-compressed .fits.fz (fits mode only)')
     p.add_argument('--sip-degree', type=int, default=4,
                    help='SIP polynomial degree for gwcs → FITS (default 4)')
     p.add_argument('--no-dq-overlay', action='store_true',
                    help='Skip the DQ (bad-pixel) mask overlay in ds9 mode')
+    p.add_argument('--no-catalog', action='store_true',
+                   help='Skip the L4 per-SCA catalog (cat_sca) source overlay '
+                        'in ds9 mode. By default, if a catalog exists on MAST '
+                        "for each SCA it's downloaded and drawn as regions.")
+    p.add_argument('--catalog-radius', type=float, default=0.4,
+                   help='DS9 region radius (arcsec) for catalog sources '
+                        '(default 0.4)')
+    p.add_argument('--catalog-color', default='green',
+                   help='DS9 color for point-like catalog sources '
+                        '(is_extended=False). Default green.')
+    p.add_argument('--catalog-extended-color', default='yellow',
+                   help='DS9 color for extended catalog sources '
+                        '(is_extended=True). Set to "same" to use '
+                        '--catalog-color for everything. Default yellow.')
+    p.add_argument('--catalog-label', choices=['none', 'id', 'mag', 'full'],
+                   default='full',
+                   help="What to store in each region's text= field. 'none' = "
+                        "empty, 'id' = SCA{NN}.{label}, 'mag' = Kron AB mag, "
+                        "'full' = 'SCA{NN}.{label}  m={mag}±{err}' (default). "
+                        "By default DS9 renders these only when a region is "
+                        "selected — use --catalog-show-labels for always-on.")
+    p.add_argument('--catalog-show-labels', action='store_true',
+                   help='Always render region labels in DS9. Default: labels '
+                        'stay in region metadata but hidden until a source '
+                        'is clicked (via "regions showtext no").')
+    p.add_argument('--catalog-include-flagged', action='store_true',
+                   help='Include sources with non-zero warning_flags. Default '
+                        'drops them (saturation / edge / contamination).')
+    p.add_argument('--catalog-dir', default=None,
+                   help='Override the per-exposure catalog folder location. '
+                        'Default: <exposure folder>/catalog/. One file per '
+                        'SCA (native MAST parquet), plus the combined .reg '
+                        'file DS9 loads.')
     p.add_argument('--ds9-target', default=None,
                    help='DS9 XPA target name (ds9 mode). Default: first DS9 found.')
     p.add_argument('--workers', type=int, default=8,
@@ -541,8 +893,9 @@ Examples:
                         'alongside FITS/DS9 output, since we already streamed '
                         'the data).')
     p.add_argument('--metadata-dir', default=None,
-                   help='Where to drop the metadata CSVs. Default: same as '
-                        '--out-dir in fits mode, cwd in ds9 mode.')
+                   help='Override the per-exposure metadata CSV location. '
+                        'Default: <exposure folder>/. CSVs are dropped into '
+                        'this directory directly (no per-exposure subfolder).')
     p.add_argument('--list', action='store_true',
                    help='Just list the matching exposures and exit without '
                         'streaming anything.')
@@ -568,7 +921,6 @@ Examples:
         from roman_mast import parse_int_spec
         scas = parse_int_spec(args.scas)
 
-    multi = len(indices) > 1
     write_metadata = not args.no_metadata
     _log(f"Dispatching {len(indices)} exposure(s) → {args.to}"
          + (" (+ metadata CSV)" if write_metadata else ""))
@@ -581,29 +933,31 @@ Examples:
     for idx in indices:
         exp = res.select(idx)
 
-        # Resolve per-exposure output paths up front.
-        if args.to == 'fits':
-            if args.out_dir and multi:
-                # Multi-exposure: one sub-folder per exposure under --out-dir.
-                out_dir = os.path.join(
-                    args.out_dir,
-                    f'v{exp.visit_id}_exp{exp.exposure:02d}',
-                )
-            elif args.out_dir:
-                out_dir = args.out_dir
-            else:
-                out_dir = f'wfi_fits_{exp.visit_id}_exp{exp.exposure:02d}'
-        else:
-            out_dir = None  # DS9 mode — nothing on disk unless metadata_dir set.
+        # One folder per exposure holds every export for that exposure. Layout:
+        #   <exp_dir>/
+        #       metadata_{visit}_exp{NN}.csv     (unless --no-metadata)
+        #       catalog/                          (ds9 mode, unless --no-catalog)
+        #           r..._wfi{NN}_..._cat.parquet
+        #           catalog_{visit}_exp{NN}.reg
+        #       sca_{NN}.fits                     (fits mode)
+        # --out-dir sets the root; each exposure gets its own v..._exp.. folder
+        # under it. --metadata-dir / --catalog-dir override the sink location
+        # if a user wants to route them elsewhere (they don't get the per-
+        # exposure subfolder in that case — the escape hatch is meant to be
+        # simple).
+        root = args.out_dir or '.'
+        exp_dir = os.path.join(
+            root, f'v{exp.visit_id}_exp{exp.exposure:02d}',
+        )
+        os.makedirs(exp_dir, exist_ok=True)
+
+        # `out_dir` is the argument to `to_fits_files` — for fits mode it's
+        # exp_dir directly (SCAs land at the top of the exposure folder).
+        out_dir = exp_dir if args.to == 'fits' else None
 
         # Where to write the metadata CSV.
         if write_metadata:
-            if args.metadata_dir is not None:
-                meta_dir = args.metadata_dir
-            elif out_dir is not None:
-                meta_dir = out_dir
-            else:
-                meta_dir = '.'
+            meta_dir = args.metadata_dir if args.metadata_dir is not None else exp_dir
             os.makedirs(meta_dir, exist_ok=True)
             meta_path = os.path.join(
                 meta_dir,
@@ -632,10 +986,57 @@ Examples:
                     sip_degree=args.sip_degree,
                 )
             else:  # ds9
+                # Download L4 catalogs (parquet — can't stream, has to hit
+                # disk). Skipped whole-cloth when --no-catalog is set so we
+                # don't pay for the HTTP GETs users don't want. Otherwise
+                # we save them into --catalog-dir (default cwd) — same
+                # spirit as the metadata CSV: we're already fetching, so
+                # keep the file for offline reuse.
+                catalog_paths = None
+                if not args.no_catalog:
+                    cat_dir = (args.catalog_dir if args.catalog_dir is not None
+                               else os.path.join(exp_dir, 'catalog'))
+                    os.makedirs(cat_dir, exist_ok=True)
+                    catalog_paths = download_catalogs(
+                        exp, res.missions, scas=scas,
+                        out_dir=cat_dir, max_workers=args.workers,
+                    )
+                    # Drop the assembled DS9 region file alongside so users
+                    # can reload it without re-running the whole pipeline.
+                # 'same' → single-color mode (opt out of the point/extended split).
+                ext_color = (None if args.catalog_extended_color == 'same'
+                             else args.catalog_extended_color)
+                if any(p is not None for p in catalog_paths.values()):
+                    reg_path = os.path.join(
+                        cat_dir,
+                        f'catalog_{exp.visit_id}_exp{exp.exposure:02d}.reg',
+                    )
+                    try:
+                        reg_text = _build_region_text(
+                            catalog_paths,
+                            radius_arcsec=args.catalog_radius,
+                            color=args.catalog_color,
+                            extended_color=ext_color,
+                            include_flagged=args.catalog_include_flagged,
+                            label_mode=args.catalog_label,
+                        )
+                        with open(reg_path, 'w') as fh:
+                            fh.write(reg_text)
+                        _log(f"Wrote DS9 region file → {reg_path}")
+                    except Exception as e:
+                        _log(f"WARNING: could not write region file "
+                             f"{reg_path}: {type(e).__name__}: {e}")
                 to_ds9(
                     dm_dict, exp,
                     sip_degree=args.sip_degree,
                     dq_overlay=not args.no_dq_overlay,
+                    catalog_paths=catalog_paths,
+                    catalog_radius_arcsec=args.catalog_radius,
+                    catalog_color=args.catalog_color,
+                    catalog_extended_color=ext_color,
+                    catalog_include_flagged=args.catalog_include_flagged,
+                    catalog_label_mode=args.catalog_label,
+                    catalog_show_labels=args.catalog_show_labels,
                     ds9_target=args.ds9_target,
                 )
         finally:

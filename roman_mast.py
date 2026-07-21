@@ -448,20 +448,42 @@ class DataResults:
         finally:
             close_streams(af_dict)
 
-    def to_ds9(self, key, *, sip_degree=4, dq_overlay=True, ds9_target=None,
-               scas=None, show_progress=True):
+    def to_ds9(self, key, *, sip_degree=4, dq_overlay=True,
+               with_catalog=True, catalog_radius_arcsec=0.4,
+               catalog_color='green', catalog_extended_color='yellow',
+               catalog_include_flagged=False, catalog_label_mode='full',
+               catalog_show_labels=False,
+               ds9_target=None, scas=None, show_progress=True):
         """Stream one exposure and pipe it into DS9 as a WCS mosaic.
+
+        If ``with_catalog=True`` (default), the L4 per-SCA source catalog
+        (``cat_sca``) is downloaded for each SCA that has one on MAST and
+        drawn as fk5 circle regions on top of the mosaic. Silently skipped
+        for SCAs without a catalog.
 
         Returns the pyds9.DS9 handle so callers can send further XPA commands.
         """
-        from roman_fits import to_ds9
+        from roman_fits import to_ds9, download_catalogs
 
         exp = self.select(key)
         af_dict = self.stream(exp, scas=scas, show_progress=show_progress)
         try:
+            catalog_paths = None
+            if with_catalog:
+                catalog_paths = download_catalogs(
+                    exp, self.missions, scas=scas,
+                )
             return to_ds9(
                 af_dict, exp, sip_degree=sip_degree,
-                dq_overlay=dq_overlay, ds9_target=ds9_target,
+                dq_overlay=dq_overlay,
+                catalog_paths=catalog_paths,
+                catalog_radius_arcsec=catalog_radius_arcsec,
+                catalog_color=catalog_color,
+                catalog_extended_color=catalog_extended_color,
+                catalog_include_flagged=catalog_include_flagged,
+                catalog_label_mode=catalog_label_mode,
+                catalog_show_labels=catalog_show_labels,
+                ds9_target=ds9_target,
             )
         finally:
             close_streams(af_dict)
