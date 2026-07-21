@@ -1,3 +1,7 @@
 .env
 *.pyc
 mast_api_token.txt
+*.asdf
+*.parquet
+*.reg
+metadata*
