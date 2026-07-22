@@ -2,7 +2,7 @@
 
 Builds on the streaming primitives in `roman_mast` (same search + selection
 model as `roman_fits.py`): search MAST → pick exposures → stream every SCA
-into memory → flatten each datamodel's `meta` tree into dot-notation columns
+in parallel → flatten each datamodel's `meta` tree into dot-notation columns
 → write one CSV row per (exposure, SCA).
 
 Public surface
@@ -12,11 +12,11 @@ Public surface
     extract_rows(af_dict, exposure, ...) → rows for an already-streamed af_dict
     write_csv(rows, output)              → path to written CSV
     write_metadata_csv(af_dict, exp, ...) → one-shot for a single exposure
-    export_csv(res, indices, scas, out)  → path to written CSV (streams + writes)
+    export_csv(res, indices, scas, out)  → path to written CSV (parallel streams + writes)
 
-CLI mirrors roman_fits.py — use the standard --program / --pass / --visit-id
-/ etc. filters to find exposures, then --exposures / --scas to pick which
-to export. See `python export_metadata_csv.py --help` for examples.
+CLI uses the standard --program / --pass / --visit-id / etc. filters to find
+exposures, then --exposures / --scas to pick which to include. See `python
+roman_metadata.py --help` for examples.
 """
 
 from __future__ import annotations
@@ -418,32 +418,32 @@ def _cli():
     )
 
     p = argparse.ArgumentParser(
-        description="Export Roman WFI metadata to a CSV spreadsheet.",
+        description="Stream Roman WFI SCAs and extract metadata to a CSV spreadsheet.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
-Same search flags as roman_fits.py — find the exposures with the standard
---program / --pass / --visit-id / etc., then use --exposures / --scas to
-pick which of those to include in the spreadsheet.
+Use the same search flags as roman_fits.py — find the exposures with the
+standard --program / --pass / --visit-id / etc., then use --exposures / --scas
+to pick which to include.
 
 Examples:
-  # See what's available first (no export yet)
-  python export_metadata_csv.py --program 114 --pass 57 --sca-only --list
+  # See what's available first (list only, no export)
+  python roman_metadata.py --program 114 --pass 57 --list
 
   # Export every SCA of exposure 1 to a CSV
-  python export_metadata_csv.py --program 114 --pass 57 --sca-only \\
-      --exposures 1 --output exp1_meta.csv
+  python roman_metadata.py --program 114 --pass 57 \\
+      --exposures 1 --no-list --output exp1_meta.csv
 
   # Every exposure in a visit, all SCAs
-  python export_metadata_csv.py --visit-id 0011401057001001001 \\
-      --sca-only --exposures all
+  python roman_metadata.py --visit-id 0011401057001001001 \\
+      --exposures all --no-list
 
   # Only some SCAs of a range of exposures
-  python export_metadata_csv.py --program 114 --pass 57 --sca-only \\
-      --exposures 1-3 --scas 1-6
+  python roman_metadata.py --program 114 --pass 57 \\
+      --exposures 1-3 --scas 1-6 --no-list
 
   # Level-1 (uncal) metadata for one visit
-  python export_metadata_csv.py --visit-id 0011401057001001001 \\
-      --data-level 1 --exposures all
+  python roman_metadata.py --visit-id 0011401057001001001 \\
+      --data-level 1 --exposures all --no-list
 """,
     )
 
@@ -457,21 +457,21 @@ Examples:
                         "listed exposures). '1', '1,3,5', '1-4', or 'all'. "
                         "Default: 'all'.")
     p.add_argument('--scas', default=None,
-                   help="Restrict to a subset of SCAs, e.g. '4' / '1-6' / "
+                   help="Restrict to a subset of SCAs, e.g. '4' or '1-6' or "
                         "'1,3,5'. Default: every SCA the exposure has.")
     p.add_argument('--output', '-o', default=None,
-                   help="Output CSV path. Default: auto-generated from "
-                        "visit_id + exposure range.")
+                   help="Output CSV filename (saved to cwd). "
+                        "Default: auto-generated from visit_id + exposure range.")
     p.add_argument('--list', action='store_true',
-                   help='List matching exposures and exit without exporting. '
-                        '(default: True)')
+                   help='Just list the matching exposures and exit without '
+                        'exporting.')
     p.add_argument('--no-list', action='store_false', dest='list',
                    help='Skip the list and proceed directly to export.')
     p.add_argument('--max-rows', type=int, default=50,
                    help='Max exposures to show in the summary (default 50)')
     p.add_argument('--workers', type=int, default=8,
-                   help='Parallel SCA fetches per exposure (default 8). Set to 1 '
-                        'for sequential streaming.')
+                   help='Concurrent SCA fetches per exposure (default 8). '
+                        'Set to 1 for sequential streaming.')
 
     args = p.parse_args()
 
