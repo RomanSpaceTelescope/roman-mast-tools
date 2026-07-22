@@ -32,6 +32,7 @@ import roman_datamodels as rdm
 from roman_mast import (
     Exposure, DataResults, _log, close_streams, parse_int_spec,
 )
+from roman_fits import stream_materialized
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +314,7 @@ def export_csv(
     scas=None,
     output: Optional[str] = None,
     show_progress: bool = True,
+    max_workers: int = 8,
 ) -> str:
     """Stream the selected exposures and write one CSV row per (exp, SCA).
 
@@ -329,6 +331,8 @@ def export_csv(
         exposure range.
     show_progress : bool
         Show tqdm progress while streaming.
+    max_workers : int
+        Concurrent SCA fetches per exposure. Default 8.
 
     Returns
     -------
@@ -351,14 +355,23 @@ def export_csv(
          f"~{total_files} SCA file(s)")
 
     for exp in exposures:
-        af_dict = res.stream(exp, scas=scas, show_progress=show_progress)
+        dm_dict = stream_materialized(exp, res.missions, scas=scas,
+                                      show_progress=show_progress,
+                                      max_workers=max_workers)
         try:
-            rows.extend(extract_rows(af_dict, exp))
+            rows.extend(extract_rows(dm_dict, exp))
         finally:
-            close_streams(af_dict)
+            close_streams(dm_dict)
 
     if not rows:
         raise RuntimeError("No metadata extracted — nothing to write.")
+
+    # Sort by start time for chronological ordering
+    def get_sort_key(row):
+        start_time = row.get('meta.exposure.start_time', '')
+        return (row.get('visit_id', ''), start_time, row.get('exposure', 0), row.get('sca', 0))
+
+    rows.sort(key=get_sort_key)
 
     write_csv(rows, output)
 
@@ -436,6 +449,9 @@ Examples:
 
     add_list_data_args(p)
 
+    # Set defaults: sca-only mode and list-only by default
+    p.set_defaults(product_type='l2')
+
     p.add_argument('--exposures', default='all',
                    help="Which exposure(s) to export (1-based index into the "
                         "listed exposures). '1', '1,3,5', '1-4', or 'all'. "
@@ -447,9 +463,15 @@ Examples:
                    help="Output CSV path. Default: auto-generated from "
                         "visit_id + exposure range.")
     p.add_argument('--list', action='store_true',
-                   help='List matching exposures and exit without exporting.')
+                   help='List matching exposures and exit without exporting. '
+                        '(default: True)')
+    p.add_argument('--no-list', action='store_false', dest='list',
+                   help='Skip the list and proceed directly to export.')
     p.add_argument('--max-rows', type=int, default=50,
                    help='Max exposures to show in the summary (default 50)')
+    p.add_argument('--workers', type=int, default=8,
+                   help='Parallel SCA fetches per exposure (default 8). Set to 1 '
+                        'for sequential streaming.')
 
     args = p.parse_args()
 
@@ -460,14 +482,16 @@ Examples:
         print("\nNo exposures match — nothing to export.")
         return
 
+    # Always show the summary before streaming
+    print_summary(res, max_rows=args.max_rows)
+
     if args.list:
-        print_summary(res, max_rows=args.max_rows)
         return
 
     indices = _resolve_exposure_keys(res, args.exposures)
     scas = parse_int_spec(args.scas) if args.scas is not None else None
 
-    export_csv(res, indices, scas=scas, output=args.output)
+    export_csv(res, indices, scas=scas, output=args.output, max_workers=args.workers)
 
 
 if __name__ == '__main__':

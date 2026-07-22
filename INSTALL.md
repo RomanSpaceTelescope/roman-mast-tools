@@ -15,7 +15,35 @@ on.
 - A C toolchain in case any dependency has to build from source (`gcc`,
   `make`; already present on the shared cluster)
 
-## Step-by-step (venv + pip)
+## Quick start (conda / mamba) — recommended
+
+The simplest approach. An `environment.yml` is included with all dependencies:
+
+```bash
+mamba env create -f environment.yml
+mamba activate roman-mast-tools
+
+# Optional, for the notebook:
+pip install jupyterlab ipykernel
+python -m ipykernel install --user \
+  --name roman-mast-tools \
+  --display-name "Python (roman-mast-tools)"
+```
+
+Then verify the install:
+
+```bash
+python -c "
+import roman_datamodels, romancal, astroquery, fsspec, matplotlib
+from astroquery.mast import MastMissions
+print('roman_datamodels', roman_datamodels.__version__)
+print('romancal        ', romancal.__version__)
+print('astroquery      ', astroquery.__version__)
+print('OK')
+"
+```
+
+## Alternative: Step-by-step (venv + pip)
 
 This is the recommended path. It uses the standard-library `venv` module
 and pip; no conda required.
@@ -114,24 +142,6 @@ active:
 ```bash
 source ~/roman-mast-tools-env/bin/activate
 python write_wfi_fits.py --help
-```
-
-## Alternative: conda / mamba
-
-An `environment.yml` is also included and installs the same packages as
-`requirements.txt` (the base scientific stack from conda-forge, and
-`romancal` / `roman_datamodels` / `rad` / the astroquery PR / `fsspec[s3]`
-via pip inside the same env):
-
-```bash
-mamba env create -f environment.yml
-mamba activate roman-mast-tools
-
-# Optional, for the notebook:
-pip install jupyterlab ipykernel
-python -m ipykernel install --user \
-  --name roman-mast-tools \
-  --display-name "Python (roman-mast-tools)"
 ```
 
 ## Updating
