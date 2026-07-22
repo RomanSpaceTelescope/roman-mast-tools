@@ -1,8 +1,0 @@
-romancal>=1.0.1
-roman_datamodels>=1.0.0
-rad>=1.0.0
-git+https://github.com/astropy/astroquery.git@refs/pull/3593/head
-fsspec[s3]
-matplotlib
-tqdm
-python-dotenv
