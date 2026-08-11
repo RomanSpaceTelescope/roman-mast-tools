@@ -1,16 +1,21 @@
 #!/usr/bin/env python
-"""Stream a single Roman WFI SCA from S3 into DS9 with H4RG channel grid overlay.
+"""Stream a single Roman WFI SCA from S3 into DS9 or matplotlib with channel grid overlay.
 
-DS9 must already be running before you call this script.
+Optionally runs aperture photometry and overlays detected sources with SNR-coloured apertures.
+
+DS9 must already be running before you call this script (for --display ds9).
 
 Usage
 -----
-    conda run -n roman-mast-tools python view_sca_ds9.py <uri> <filename>
+    conda run -n roman-mast-tools python roman_view_sca.py <uri> <filename>
 
     # public tutorial data (anonymous S3):
     python roman_view_sca.py \\
         s3://stpubdata/roman/nexus/soc_simulations/tutorial_data/roman-2026.2/ \\
         r0003201001001001004_0001_wfi11_f106_cal.asdf
+
+    # matplotlib display with aperture photometry:
+    python roman_view_sca.py --display mpl --phot --phot-out phot.csv <uri> <filename>
 
     # suppress channel dividers, keep section grid:
     python roman_view_sca.py --no-channels <uri> <filename>
@@ -28,6 +33,13 @@ import s3fs
 import roman_datamodels as rdm
 from astropy.io import fits
 from astropy.wcs import WCS
+
+try:
+    from roman_lolo.romanphot import SourcePhotometry
+    from photutils.background import Background2D, MedianBackground
+    _PHOT_AVAILABLE = True
+except ImportError:
+    _PHOT_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Focal-plane rotation table (from MPA_SCA_info).
@@ -162,11 +174,101 @@ def make_channel_regions(data, detector, *, show_channels=False, show_gridlines=
 
 
 # ---------------------------------------------------------------------------
+# Aperture photometry
+# ---------------------------------------------------------------------------
+
+def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=5.0,
+                             aperture_radius_fwhm=2.5, annulus_inner_fwhm=6.0,
+                             annulus_outer_fwhm=8.0, bkg_box_size=50):
+    """Background-subtract, detect sources, and run aperture photometry.
+
+    Bad pixels (dq != 0) are masked before analysis.
+
+    Returns
+    -------
+    sources : astropy.table.Table or None
+        Detected sources with xcentroid, ycentroid, flux, etc.
+    phot_table : astropy.table.Table or None
+        Photometry results with flux_bkgsub, flux_err, snr, etc.
+    sp : SourcePhotometry
+        Configured photometry object carrying aperture radii.
+    """
+    if not _PHOT_AVAILABLE:
+        raise ImportError('roman-lolo not installed; install with: pip install -e .')
+
+    mask = (dq != 0) if dq is not None else np.zeros_like(data, dtype=bool)
+    data_masked = np.ma.array(data, mask=mask)
+
+    bkg = Background2D(data_masked, (bkg_box_size, bkg_box_size),
+                       bkg_estimator=MedianBackground())
+    data_sub = data_masked - bkg.background
+    bkg_rms = bkg.background_rms
+
+    sp = SourcePhotometry(
+        fwhm_pix=fwhm_pix,
+        detection_sigma=detection_sigma,
+        aperture_radius_fwhm=aperture_radius_fwhm,
+        annulus_inner_fwhm=annulus_inner_fwhm,
+        annulus_outer_fwhm=annulus_outer_fwhm,
+    )
+
+    sources = sp.detect_sources(data_sub, bkg_rms)
+    if sources is None or len(sources) == 0:
+        print('[view_sca] No sources detected', file=sys.stderr)
+        return None, None, sp
+
+    phot_table = sp.aperture_photometry_on_frame(data_sub, sources, bkg_rms)
+    return sources, phot_table, sp
+
+
+def phot_to_region_str(sources, phot_table, sp):
+    """Generate a DS9 region string for aperture photometry results.
+
+    Returns a multi-line region string (image coords, 1-indexed) with
+    aperture circles SNR-colour-coded (no labels; see CSV for details).
+    """
+    rgns = ['# Region file format: DS9 version 4.1', 'image']
+
+    for i in range(len(sources)):
+        x = sources['xcentroid'][i] + 1.0   # 1-indexed
+        y = sources['ycentroid'][i] + 1.0
+
+        # SNR-based colour
+        color = 'red'
+        if phot_table is not None and i < len(phot_table) and 'snr' in phot_table.colnames:
+            snr_val = phot_table['snr'][i]
+            if snr_val >= 50:
+                color = 'green'
+            elif snr_val >= 20:
+                color = 'cyan'
+            elif snr_val >= 10:
+                color = 'yellow'
+            elif snr_val >= 5:
+                color = 'magenta'
+
+        # Aperture circle (no text label)
+        rgns.append(
+            f'circle({x:.3f},{y:.3f},{sp.aperture_radius:.2f}) '
+            f'# color={color} width=2'
+        )
+
+        # Background annulus (dashed)
+        rgns.append(
+            f'annulus({x:.3f},{y:.3f},'
+            f'{sp.annulus_inner:.2f},{sp.annulus_outer:.2f}) '
+            f'# color={color} width=1 dash=1'
+        )
+
+    return '\n'.join(rgns)
+
+
+# ---------------------------------------------------------------------------
 # DS9 display
 # ---------------------------------------------------------------------------
 
 def display_in_ds9(data, regions, *, title='Roman WFI', wcs_header=None,
-                   dq=None, ds9_target=None, scale='zscale', cmap='viridis'):
+                   dq=None, ds9_target=None, scale='zscale', cmap='viridis',
+                   sources=None, phot_table=None, sp=None):
     """Send a 2-D array to DS9 and apply the region overlay.
 
     Parameters
@@ -226,6 +328,10 @@ def display_in_ds9(data, regions, *, title='Roman WFI', wcs_header=None,
     d.set('regions delete all')
     d.set('regions', regions)
 
+    if sources is not None and len(sources) > 0 and sp is not None:
+        phot_regions = phot_to_region_str(sources, phot_table, sp)
+        d.set('regions', phot_regions)
+
     print('[view_sca_ds9] done — DS9 is open', file=sys.stderr)
     return d
 
@@ -236,7 +342,7 @@ def display_in_ds9(data, regions, *, title='Roman WFI', wcs_header=None,
 
 def display_in_mpl(data, detector, *, dq=None, title=None, wcs_header=None,
                    show_channels=False, show_gridlines=False,
-                   figsize=(9, 8), norm=None):
+                   figsize=(9, 8), norm=None, sources=None, phot_table=None, sp=None):
     """Display a single SCA in an interactive matplotlib window.
 
     When wcs_header is provided the axes use WCSAxes projection so ticks and
@@ -311,6 +417,38 @@ def display_in_mpl(data, detector, *, dq=None, title=None, wcs_header=None,
             ax.text(64 + i * 128 - ref_pix, ny + 100, str(chan_num),
                     ha='center', fontsize=6)
 
+    if sources is not None and len(sources) > 0 and sp is not None:
+        from matplotlib.patches import Circle
+        for i in range(len(sources)):
+            x = sources['xcentroid'][i]
+            y = sources['ycentroid'][i]
+
+            # SNR-based colour
+            color = 'red'
+            if phot_table is not None and i < len(phot_table) and 'snr' in phot_table.colnames:
+                snr_val = phot_table['snr'][i]
+                if snr_val >= 50:
+                    color = 'green'
+                elif snr_val >= 20:
+                    color = 'cyan'
+                elif snr_val >= 10:
+                    color = 'yellow'
+                elif snr_val >= 5:
+                    color = 'magenta'
+
+            # Aperture circle (no text)
+            aperture_circle = Circle((x, y), sp.aperture_radius,
+                                    fill=False, edgecolor=color, linewidth=1.5, alpha=0.8)
+            ax.add_patch(aperture_circle)
+
+            # Background annulus (dashed)
+            annulus_inner = Circle((x, y), sp.annulus_inner,
+                                  fill=False, edgecolor=color, linewidth=1, linestyle='--', alpha=0.4)
+            ax.add_patch(annulus_inner)
+            annulus_outer = Circle((x, y), sp.annulus_outer,
+                                  fill=False, edgecolor=color, linewidth=1, linestyle='--', alpha=0.4)
+            ax.add_patch(annulus_outer)
+
     _wcs_fmt = ax.format_coord   # WCSAxes provides RA/Dec; plain axes gives x/y
     def _fmt(x, y):
         col, row = int(round(x)), int(round(y))
@@ -358,6 +496,22 @@ def main():
                     help='DS9 colour map (default: viridis; ds9 only)')
     ap.add_argument('--ds9',     default=None, metavar='TARGET',
                     help='XPA target name of a running DS9 (default: any; ds9 only)')
+    ap.add_argument('--phot', action='store_true',
+                    help='Enable aperture photometry analysis')
+    ap.add_argument('--fwhm', type=float, default=1.5, metavar='N',
+                    help='Source FWHM in pixels (default: 1.5; photometry only)')
+    ap.add_argument('--det-sigma', type=float, default=5.0, metavar='N',
+                    help='DAOStarFinder detection threshold σ (default: 5.0; photometry only)')
+    ap.add_argument('--aper', type=float, default=2.5, metavar='N',
+                    help='Aperture radius as multiple of FWHM (default: 2.5; photometry only)')
+    ap.add_argument('--annulus-inner', type=float, default=6.0, metavar='N',
+                    help='Inner annulus radius as multiple of FWHM (default: 6.0; photometry only)')
+    ap.add_argument('--annulus-outer', type=float, default=8.0, metavar='N',
+                    help='Outer annulus radius as multiple of FWHM (default: 8.0; photometry only)')
+    ap.add_argument('--bkg-box', type=int, default=50, metavar='N',
+                    help='Background2D box size in pixels (default: 50; photometry only)')
+    ap.add_argument('--phot-out', default=None, metavar='PATH',
+                    help='Write photometry table to this CSV path (photometry only)')
     args = ap.parse_args()
 
     dq_wanted = not args.no_dq
@@ -369,6 +523,23 @@ def main():
              f'Exposure: {meta["exposure_num"]}  SCA: {meta["sca_num"]:02d}  '
              f'Filter: {meta["filter"]}')
 
+    # Run photometry if requested
+    sources, phot_table, sp = None, None, None
+    if args.phot:
+        sources, phot_table, sp = run_aperture_photometry(
+            data,
+            dq=dq,
+            fwhm_pix=args.fwhm,
+            detection_sigma=args.det_sigma,
+            aperture_radius_fwhm=args.aper,
+            annulus_inner_fwhm=args.annulus_inner,
+            annulus_outer_fwhm=args.annulus_outer,
+            bkg_box_size=args.bkg_box,
+        )
+        if phot_table is not None and args.phot_out:
+            phot_table.write(args.phot_out, format='ascii.csv', overwrite=True)
+            print(f'[view_sca] Photometry written to {args.phot_out}', file=sys.stderr)
+
     if args.display == 'mpl':
         display_in_mpl(
             data, detector,
@@ -377,6 +548,9 @@ def main():
             wcs_header=wcs_hdr,
             show_channels=args.channels,
             show_gridlines=args.grid,
+            sources=sources,
+            phot_table=phot_table,
+            sp=sp,
         )
     else:
         regions = make_channel_regions(
@@ -392,6 +566,9 @@ def main():
             ds9_target=args.ds9,
             scale=args.scale,
             cmap=args.cmap,
+            sources=sources,
+            phot_table=phot_table,
+            sp=sp,
         )
 
 

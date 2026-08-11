@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "roman-mast-tools"
+version = "0.1.0"
+description = "Tools for streaming Roman WFI data from MAST and analyzing with aperture photometry"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "astropy>=5.0",
+    "matplotlib>=3.3",
+    "tqdm",
+    "keyring",
+    "python-dotenv",
+    "requests",
+    "roman_datamodels>=1.0.0",
+    "romancal>=1.0.1",
+    "rad>=1.0.0",
+    "fsspec[s3]",
+    "s3fs",
+    "roman-lolo @ git+https://github.com/RomanSpaceTelescope/roman-lolo.git",
+]
+
+[project.optional-dependencies]
+dev = [
+    "jupyter>=1.0",
+    "pytest>=6.0",
+]
+
+[project.scripts]
+roman-mast     = "roman_mast:main"
+roman-fits     = "roman_fits:main"
+roman-metadata = "roman_metadata:main"
+roman-view-sca = "roman_view_sca:main"
+
+[tool.setuptools]
+py-modules = ["roman_mast", "roman_fits", "roman_metadata", "roman_view_sca"]

@@ -20,3 +20,4 @@ dependencies:
       - rad>=1.0.0
       - git+https://github.com/astropy/astroquery.git@refs/pull/3593/head
       - fsspec[s3]
+      - -e .
