@@ -177,39 +177,95 @@ If you add a third sink, follow the same shape: take a `dm_dict` (not an af_dict
 
 ## Single-SCA viewer (`roman_view_sca.py`)
 
-Standalone script -- no dependency on `roman_mast` or the multi-exposure stack. Streams one ASDF file from **anonymous S3** (`s3fs.S3FileSystem(anon=True)`) and displays it.
+Standalone script -- no dependency on `roman_mast` or the multi-exposure stack. Streams one ASDF file from **anonymous S3** (`s3fs.S3FileSystem(anon=True)`) and optionally runs aperture photometry.
+
+**Installation & dependencies:**
+
+`roman-mast-tools` is now pip-installable via `pyproject.toml`. The package declares `roman-lolo @ git+https://github.com/RomanSpaceTelescope/roman-lolo.git` as a dependency:
 
 ```bash
-# DS9 (default) -- DS9 must already be running:
-python roman_view_sca.py <s3_uri> <filename>
-
-# matplotlib -- no DS9 needed:
-python roman_view_sca.py --display mpl <s3_uri> <filename>
-
-# opt in to channel/grid overlay:
-python roman_view_sca.py --display mpl --channels --grid <s3_uri> <filename>
+pip install -e .  # installs roman-mast-tools + roman-lolo from GitHub
 ```
 
-**Three internal functions:**
+Or via conda+pip:
 
-- `stream_sca(uri, filename, *, sip_degree=4)` -- opens the file, materializes `data` (float32) and `dq` (int32, full 32-bit flags), computes SIP WCS via `dm.meta.wcs.to_fits_sip(bounding_box=gwcs.bounding_box, degree=sip_degree)`, all inside the `with fs.open(...)` block while the ASDF tree is live. Returns `(data, detector, wcs_hdr, dq)`.
-- `make_channel_regions(data, detector, *, show_channels=False, show_gridlines=False)` -- builds a DS9 region string (image coordinates, 1-indexed) for the 32 H4RG readout channel dividers and 8-section major grid. Uses `_SCA_ROTATION` to determine channel numbering direction.
-- `display_in_ds9(...)` / `display_in_mpl(...)` -- send to the respective backend.
+```bash
+conda env create -f environment.yml  # runs pip install -e . as part of env creation
+```
 
-**DS9 mode:** sends FITS with SIP WCS header via `d.set('fits', ...)`. DQ sent separately as `d.set('fits mask', ...)` with `mask mark nonzero`, red, 50% transparency. Channel grid as region string. DS9 must be running (`ds9 &`); connect to a named instance with `--ds9 TARGET`.
+Photometry remains optional: if `roman-lolo` is not installed, the script works for display-only use.
 
-**Matplotlib mode:** creates axes with `subplot_kw={'projection': WCS(wcs_hdr)}` so ticks and status bar show RA/Dec (WCSAxes). DQ overlaid as `np.where(dq != 0, 1.0, nan)` imshow in red at 50% alpha. `format_coord` wraps WCSAxes output and appends `x= y= val= dq=` so hover shows: RA/Dec + native detector pixel coords (accounting for stripped reference pixels) + data value + full 32-bit DQ integer.
+**Core functions:**
 
-**H4RG focal-plane rotation:** `_SCA_ROTATION = {n: (0 if n % 3 == 0 else 180) for n in range(1, 19)}` -- SCAs 3, 6, 9, 12, 15, 18 are r=0; all others r=180. For r=180 SCAs: x tick labels run low->high, y reversed, channel numbers 1->32 left-to-right. For r=0 SCAs: opposite. Detector string read from `dm.meta.instrument.detector` (always 'WFI01'..'WFI18').
+- `stream_sca(uri, filename, *, sip_degree=4)` -- opens the ASDF file, materializes `data` (float32) and `dq` (int32), computes SIP WCS, all while the ASDF tree is live. Returns `(data, detector, wcs_hdr, dq)`.
+- `make_channel_regions(data, detector, *, show_channels=False, show_gridlines=False)` -- builds a DS9 region string for the 32 H4RG readout channel dividers and 8-section major grid.
+- `run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=5.0, aperture_radius_fwhm=2.5, annulus_inner_fwhm=6.0, annulus_outer_fwhm=8.0, bkg_poly_degree=3)` -- background subtraction via 2D polynomial fit, source detection via DAOStarFinder, aperture photometry. Bad pixels (`dq != 0`) are masked during background fitting. Returns `(sources, phot_table, sp)`.
+- `phot_to_region_str(sources, phot_table, sp)` -- generates a DS9 region string with SNR-colour-coded apertures (green ≥50, cyan ≥20, yellow ≥10, magenta ≥5, red <5) and dashed background annuli. No text labels—details are in the CSV output.
+- `display_in_ds9(...)` / `display_in_mpl(...)` -- send to the respective backend, optionally overlaying photometry apertures.
 
-**Key CLI flags:**
+**Photometry background subtraction:**
+
+Uses 2D polynomial fitting to avoid redundant background estimation:
+
+1. Create mask from `dq` layer (`dq != 0`)
+2. Downsample by 4x4 for speed; extract unmasked pixels on the coarse grid
+3. Fit `Polynomial2D(degree=bkg_poly_degree)` (default 3) to those pixels using Levenberg-Marquardt
+4. Evaluate polynomial on full image grid
+5. Subtract to get residuals
+6. Estimate RMS as `np.std()` of residuals in unmasked regions
+7. Pass scalar RMS to DAOStarFinder (threshold = `detection_sigma * rms`)
+
+This avoids the old Background2D stack, which produced spurious detections from background-on-background estimation. Result: ~2,300 high-confidence sources per SCA instead of ~24,000 false positives.
+
+**Photometry output:**
+
+When `--phot-out PATH` is given, an ASCII CSV is written with columns:
+- `id`, `xcenter`, `ycenter` — source position
+- `aperture_sum_0`, `aperture_sum_1` — raw sums (aperture and annulus)
+- `local_bkg_per_pix`, `local_bkg_total` — background estimates from the annulus
+- `flux_bkgsub` — background-subtracted flux
+- `flux_err` — photon + background noise in quadrature
+- `snr` — signal-to-noise ratio
+
+**CLI usage:**
+
+```bash
+# Display with photometry overlay (matplotlib):
+python roman_view_sca.py --display mpl --phot --phot-out phot.csv <s3_uri> <filename>
+
+# DS9 with photometry:
+python roman_view_sca.py --display ds9 --phot --phot-out phot.csv <s3_uri> <filename>
+
+# Display without photometry:
+python roman_view_sca.py <s3_uri> <filename>
+```
+
+**Photometry CLI flags:**
+- `--phot` -- enable photometry (errors if roman-lolo not installed)
+- `--fwhm N` -- source FWHM in pixels (default 1.5)
+- `--det-sigma N` -- DAOStarFinder detection threshold σ (default 5.0)
+- `--aper N` -- aperture radius as multiple of FWHM (default 2.5)
+- `--annulus-inner N` -- inner annulus as multiple of FWHM (default 6.0)
+- `--annulus-outer N` -- outer annulus as multiple of FWHM (default 8.0)
+- `--bkg-poly-degree N` -- 2D polynomial degree (default 3; use 2 for faster fit)
+- `--phot-out PATH` -- write photometry table to CSV
+
+**Display modes:**
+
+DS9: sends FITS with SIP WCS header. DQ sent separately with `mask mark nonzero`, red, 50% transparency. Photometry apertures sent as a second region set (colour-coded by SNR, no text labels). DS9 must be running; connect to a named instance with `--ds9 TARGET`.
+
+Matplotlib: creates axes with WCS projection so ticks show RA/Dec. DQ overlaid as red at 50% alpha. Photometry apertures as circle patches (colour-coded by SNR, alpha=0.8) plus dashed background annuli.
+
+**H4RG focal-plane rotation:** `_SCA_ROTATION = {n: (0 if n % 3 == 0 else 180) for n in range(1, 19)}` -- SCAs 3, 6, 9, 12, 15, 18 are r=0; all others r=180. Detector string read from `dm.meta.instrument.detector` (always 'WFI01'..'WFI18').
+
+**Display-only CLI flags:**
 - `--display {ds9,mpl}` -- default `ds9`
 - `--channels` / `--grid` -- both off by default; opt-in
 - `--no-dq` -- skip DQ overlay
-- `--sip-degree N` -- default 4; lower (e.g. 2) for faster WCS at reduced accuracy
+- `--sip-degree N` -- default 4; lower for faster WCS
 - `--scale`, `--cmap`, `--ds9 TARGET` -- DS9 only
 
-**DQ is kept as full int32** throughout (not binarized). The DS9 `mask mark nonzero` and matplotlib `np.where(dq != 0, ...)` both handle any nonzero value. The hover readout shows the actual integer so users can inspect which flags are set.
+**DQ handling:** Kept as full int32 throughout (not binarized). Hover readout shows the actual integer so users can inspect which flags are set.
 
 ## What's deliberately deferred
 
@@ -233,11 +289,13 @@ python roman_view_sca.py --display mpl --channels --grid <s3_uri> <filename>
 
 ```
 roman-mast-tools/
+|-- pyproject.toml          <- pip-installable package metadata; declares roman-lolo dependency.
+|-- environment.yml         <- conda env definition; runs pip install -e . for editable install.
 |-- roman_mast.py           <- foundation. Auth, filters, list_data, exposures, sequential streaming.
 |-- roman_fits.py           <- output layer. stream_materialized, to_fits_files, to_ds9, CLI.
-|-- roman_metadata.py       <- metadata layer. flatten_metadata, extract_row(s), write_csv,
-|                              write_metadata_csv, export_csv. Full CLI for bulk CSV export.
-|-- roman_view_sca.py         <- single-SCA viewer. stream_sca, make_channel_regions,
+|-- roman_metadata.py       <- metadata layer. flatten_metadata, extract_row(s), write_csv.
+|-- roman_view_sca.py       <- single-SCA viewer. stream_sca, make_channel_regions,
+|                              run_aperture_photometry, phot_to_region_str,
 |                              display_in_ds9, display_in_mpl. DS9 + matplotlib backends.
 |-- .claude/skills/roman-mast-tools.md   <- this file (also mirrored to ~/.claude/skills/)
 |
