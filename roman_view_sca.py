@@ -353,7 +353,10 @@ def display_in_ds9(data, regions, *, title='Roman WFI', wcs_header=None,
 
     if sources is not None and len(sources) > 0 and sp is not None:
         phot_regions = phot_to_region_str(sources, phot_table, sp)
-        d.set('regions', phot_regions)
+        # Append photometry regions to existing channel/grid regions
+        combined_regions = regions + '\n' + phot_regions
+        d.set('regions delete all')
+        d.set('regions', combined_regions)
 
     print('[view_sca_ds9] done — DS9 is open', file=sys.stderr)
     return d
