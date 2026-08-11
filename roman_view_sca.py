@@ -8,15 +8,15 @@ Usage
     conda run -n roman-mast-tools python view_sca_ds9.py <uri> <filename>
 
     # public tutorial data (anonymous S3):
-    python view_sca_ds9.py \\
+    python roman_view_sca.py \\
         s3://stpubdata/roman/nexus/soc_simulations/tutorial_data/roman-2026.2/ \\
         r0003201001001001004_0001_wfi11_f106_cal.asdf
 
     # suppress channel dividers, keep section grid:
-    python view_sca_ds9.py --no-channels <uri> <filename>
+    python roman_view_sca.py --no-channels <uri> <filename>
 
     # connect to a named DS9 instance:
-    python view_sca_ds9.py --ds9 myds9 <uri> <filename>
+    python roman_view_sca.py --ds9 myds9 <uri> <filename>
 """
 
 import argparse
@@ -62,6 +62,33 @@ def stream_sca(uri, filename, *, sip_degree=4):
         wcs_hdr = gwcs.to_fits_sip(bounding_box=gwcs.bounding_box, degree=sip_degree)
     print(f'[view_sca_ds9] {detector}  shape={data.shape}', file=sys.stderr)
     return data, detector, wcs_hdr, dq
+
+
+# ---------------------------------------------------------------------------
+# Filename parsing
+# ---------------------------------------------------------------------------
+
+def parse_filename(filename):
+    """Extract visit ID, exposure number, SCA number, and filter from Roman filename.
+
+    E.g. r0003201001001001004_0001_wfi11_f106_cal.asdf
+    """
+    base = filename.replace('.asdf', '')
+    parts = base.split('_')
+
+    visit_id = parts[0]           # r0003201001001001004
+    exposure_num = parts[1]       # 0001
+    sca_str = parts[2]            # wfi11
+    filter_str = parts[3]         # f106
+
+    sca_num = int(sca_str.replace('wfi', ''))
+
+    return {
+        'visit_id': visit_id,
+        'exposure_num': exposure_num,
+        'sca_num': sca_num,
+        'filter': filter_str,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -337,7 +364,10 @@ def main():
     data, detector, wcs_hdr, dq = stream_sca(args.uri, args.filename,
                                                sip_degree=args.sip_degree)
 
-    title = f'Roman WFI {detector} - {args.filename}'
+    meta = parse_filename(args.filename)
+    title = (f'Roman WFI {detector}  Visit: {meta["visit_id"]}  '
+             f'Exposure: {meta["exposure_num"]}  SCA: {meta["sca_num"]:02d}  '
+             f'Filter: {meta["filter"]}')
 
     if args.display == 'mpl':
         display_in_mpl(
