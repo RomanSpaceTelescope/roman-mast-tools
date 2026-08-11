@@ -242,6 +242,8 @@ def display_in_mpl(data, detector, *, dq=None, title=None, wcs_header=None,
     )
     for spine in ax.spines.values():
         spine.set_visible(False)
+    if hasattr(ax, 'coords'):          # WCSAxes draws its own frame on top of spines
+        ax.coords.frame.set_linewidth(0)
 
     if show_channels:
         for j in range(1, 32):
