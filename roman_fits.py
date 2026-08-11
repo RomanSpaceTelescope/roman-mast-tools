@@ -926,9 +926,9 @@ Examples:
          + (" (+ metadata CSV)" if write_metadata else ""))
 
     if write_metadata:
-        # Import lazily so a missing export_metadata_csv (or its deps) doesn't
+        # Import lazily so a missing roman_metadata (or its deps) doesn't
         # kill FITS/DS9 output for users who don't want the CSV anyway.
-        from export_metadata_csv import write_metadata_csv
+        from roman_metadata import write_metadata_csv
 
     for idx in indices:
         exp = res.select(idx)

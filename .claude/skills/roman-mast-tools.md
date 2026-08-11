@@ -9,18 +9,15 @@ This skill orients a fresh Claude instance on `/home/mrizzo/roman_it_shared/roma
 
 ## Big picture
 
-The user rewrote the stack **from scratch** on top of two clean modules:
+The user rewrote the stack **from scratch** on top of three clean modules:
 
 - **`roman_mast.py`** — foundation. Search, filter, filename synthesis, exposure grouping, streaming. No dependency on `astropy.io.fits` or `pyds9`.
-- **`roman_fits.py`** — output layer. Streams into local FITS files or into a running DS9 as a WCS mosaic. Depends on `roman_mast`.
+- **`roman_fits.py`** — output layer. Streams into local FITS files or into a running DS9 as a WCS mosaic. Imports from `roman_mast` and lazily from `roman_metadata`.
+- **`roman_metadata.py`** — metadata layer. Flattens datamodel `meta` trees to CSV; own CLI for bulk export. Imports `stream_materialized` from `roman_fits`. Public surface: `flatten_metadata`, `extract_row`, `extract_rows`, `write_csv`, `write_metadata_csv`, `export_csv`.
 
-Everything else in the repo is **legacy**:
+If you extend metadata extraction, edit `roman_metadata.py`. Do NOT copy its helpers elsewhere.
 
-- `query_utils.py`, `streaming_utils.py`, `peek_mast_data.py`, `write_wfi_fits.py`, `view_metadata.py`, `test_mast_adaptation.py`
-
-**`export_metadata_csv.py` is a special case** — the CLI at the bottom is legacy, but its helpers (`flatten_metadata`, `extract_row`, `extract_rows`, `write_csv`, `write_metadata_csv`) are imported by `roman_fits.py` to drop a metadata CSV alongside every FITS/DS9 output. If you extend metadata extraction, edit the helpers at the top of that file — do NOT touch its CLI, do NOT copy the helpers elsewhere.
-
-**Do not extend the legacy files.** If the user asks for a new tool, build it on top of `roman_mast.py` (import `list_data`, `DataResults`, `Exposure`, `stream_exposure`, `PRODUCT_KINDS`, `add_list_data_args`, `list_data_from_args`).
+**If the user asks for a new tool**, build it on top of `roman_mast.py` (import `list_data`, `DataResults`, `Exposure`, `stream_exposure`, `PRODUCT_KINDS`, `add_list_data_args`, `list_data_from_args`).
 
 ## Conda env
 
@@ -39,7 +36,7 @@ The fix is an activation hook at `/home/mrizzo/.conda/envs/roman-mast-tools/etc/
 
 ## Reference notebook
 
-`/home/mrizzo/comm_streaming_example.ipynb` is the canonical example of how MAST streaming works. Anything you build here should reproduce its idiom cleanly:
+`notebooks/comm_streaming_example.ipynb` (inside the repo) is the canonical example of how MAST streaming works. Anything you build here should reproduce its idiom cleanly:
 
 ```python
 missions = MastMissions(mission='roman')
@@ -169,7 +166,7 @@ fsspec wraps any HTTP/SSL/etc. failure as a bare `FileNotFoundError(url)`. The e
 `python roman_fits.py --program ... --to {fits,ds9}` is the canonical example of streaming one exposure and dispatching to multiple sinks. The current flow per exposure is:
 
 1. `stream_materialized(exp, res.missions, scas=..., max_workers=args.workers)` — parallel fetch, arrays materialized inline. Returns `{sca: DataModel}`.
-2. `write_metadata_csv(dm_dict, exp, output=...)` — unless `--no-metadata`. Runs first because it's cheap and self-contained.
+2. `write_metadata_csv(dm_dict, exp, output=...)` from `roman_metadata` — unless `--no-metadata`. Runs first because it's cheap and self-contained.
 3. `to_fits_files(dm_dict, exp, ...)` OR `to_ds9(dm_dict, exp, ...)` — image sink.
 4. `close_streams(dm_dict)` in a `finally`.
 
@@ -201,16 +198,15 @@ If you add a third sink, follow the same shape: take a `dm_dict` (not an af_dict
 roman-mast-tools/
 ├── roman_mast.py           ← foundation. Auth, filters, list_data, exposures, sequential streaming.
 ├── roman_fits.py           ← output layer. stream_materialized, to_fits_files, to_ds9, CLI.
-├── export_metadata_csv.py  ← MIXED: helpers (flatten_metadata, extract_row(s),
-│                              write_csv, write_metadata_csv) are current and imported
-│                              by roman_fits.py. Its bottom-of-file CLI is legacy.
-├── .claude/skills/roman-mast-tools.md   ← this file
+├── roman_metadata.py       ← metadata layer. flatten_metadata, extract_row(s), write_csv,
+│                              write_metadata_csv, export_csv. Full CLI for bulk CSV export.
+├── .claude/skills/roman-mast-tools.md   ← this file (also mirrored to ~/.claude/skills/)
 │
-├── comm_streaming_example.ipynb   ← reference notebook (in /home/mrizzo/, not here)
+├── notebooks/
+│   ├── comm_streaming_example.ipynb   ← reference notebook
+│   └── mast_scratch.ipynb
 │
-└── (legacy — do not extend)
-    query_utils.py streaming_utils.py peek_mast_data.py
-    write_wfi_fits.py view_metadata.py test_mast_adaptation.py
+└── explore/                ← one-off exploration scripts; not part of the public API
 ```
 
 ## When something surprises you
