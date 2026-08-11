@@ -26,12 +26,14 @@ Usage
 
 import argparse
 import io
+import os
 import sys
 
 import numpy as np
 import s3fs
 import roman_datamodels as rdm
 from astropy.io import fits
+from astropy.stats import sigma_clipped_stats
 from astropy.wcs import WCS
 
 try:
@@ -52,26 +54,46 @@ _SCA_ROTATION = {n: (0 if n % 3 == 0 else 180) for n in range(1, 19)}
 # ---------------------------------------------------------------------------
 
 def stream_sca(uri, filename, *, sip_degree=4):
-    """Open an ASDF file from S3 (anonymous) and return (data_f32, detector, wcs_hdr).
+    """Open an ASDF file from S3 (anonymous) or local path and return (data_f32, detector, wcs_hdr, dq).
 
     Materialises ``dm.data`` and computes the SIP WCS approximation while the
     ASDF file handle is still open (gwcs needs the live tree for to_fits_sip).
+
+    If ``uri`` starts with 's3://', it's treated as an S3 URI (anonymous access).
+    Otherwise, treated as a local directory path.
     """
-    path = uri.rstrip('/') + '/' + filename
-    fs = s3fs.S3FileSystem(anon=True)
-    print(f'[view_sca_ds9] streaming {path}', file=sys.stderr)
-    with fs.open(path, 'rb') as f:
-        dm = rdm.open(f)
-        data     = np.asarray(dm.data[...], dtype=np.float32)
-        detector = str(dm.meta.instrument.detector).upper()
-        try:
-            dq = np.asarray(dm.dq[...], dtype=np.int32)
-        except AttributeError:
-            dq = None   # uncal products have no DQ layer
-        print(f'[view_sca_ds9] computing SIP WCS (degree={sip_degree}) ...', file=sys.stderr)
-        gwcs    = dm.meta.wcs
-        wcs_hdr = gwcs.to_fits_sip(bounding_box=gwcs.bounding_box, degree=sip_degree)
-    print(f'[view_sca_ds9] {detector}  shape={data.shape}', file=sys.stderr)
+    if uri.startswith('s3://'):
+        # S3 file path (anonymous access)
+        path = uri.rstrip('/') + '/' + filename
+        fs = s3fs.S3FileSystem(anon=True)
+        print(f'[view_sca] streaming from S3: {path}', file=sys.stderr)
+        with fs.open(path, 'rb') as f:
+            dm = rdm.open(f)
+            data     = np.asarray(dm.data[...], dtype=np.float32)
+            detector = str(dm.meta.instrument.detector).upper()
+            try:
+                dq = np.asarray(dm.dq[...], dtype=np.int32)
+            except AttributeError:
+                dq = None   # uncal products have no DQ layer
+            print(f'[view_sca] computing SIP WCS (degree={sip_degree}) ...', file=sys.stderr)
+            gwcs    = dm.meta.wcs
+            wcs_hdr = gwcs.to_fits_sip(bounding_box=gwcs.bounding_box, degree=sip_degree)
+    else:
+        # Local file path
+        path = os.path.join(uri.rstrip('/'), filename)
+        print(f'[view_sca] reading from local: {path}', file=sys.stderr)
+        with open(path, 'rb') as f:
+            dm = rdm.open(f)
+            data     = np.asarray(dm.data[...], dtype=np.float32)
+            detector = str(dm.meta.instrument.detector).upper()
+            try:
+                dq = np.asarray(dm.dq[...], dtype=np.int32)
+            except AttributeError:
+                dq = None   # uncal products have no DQ layer
+            print(f'[view_sca] computing SIP WCS (degree={sip_degree}) ...', file=sys.stderr)
+            gwcs    = dm.meta.wcs
+            wcs_hdr = gwcs.to_fits_sip(bounding_box=gwcs.bounding_box, degree=sip_degree)
+    print(f'[view_sca] {detector}  shape={data.shape}', file=sys.stderr)
     return data, detector, wcs_hdr, dq
 
 
@@ -176,9 +198,9 @@ def make_channel_regions(data, detector, *, show_channels=False, show_gridlines=
 # Aperture photometry
 # ---------------------------------------------------------------------------
 
-def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=5.0,
+def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=20.0,
                              aperture_radius_fwhm=2.5, annulus_inner_fwhm=6.0,
-                             annulus_outer_fwhm=8.0, bkg_poly_degree=3):
+                             annulus_outer_fwhm=8.0, bkg_poly_degree=3, snr_threshold=5.0):
     """Background-subtract, detect sources, and run aperture photometry.
 
     Fits a 2D polynomial background, then performs source detection and
@@ -192,12 +214,17 @@ def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=5.0,
         Photometry results with flux_bkgsub, flux_err, snr, etc.
     sp : SourcePhotometry
         Configured photometry object carrying aperture radii.
+    stats : dict
+        Background statistics: 'bkg_level', 'bkg_rms', 'threshold', 'n_sources'
     """
     if not _PHOT_AVAILABLE:
         raise ImportError('roman-lolo not installed; install with: pip install -e .')
 
     mask = (dq != 0) if dq is not None else np.zeros_like(data, dtype=bool)
     ny, nx = data.shape
+    n_masked = int(np.sum(mask))
+    print(f'[phot] image {ny}x{nx}  masked pixels: {n_masked} ({100*n_masked/mask.size:.1f}%)',
+          file=sys.stderr)
 
     # Fit 2D polynomial background to unmasked pixels (downsampled for speed)
     from astropy.modeling import models, fitting
@@ -211,6 +238,8 @@ def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=5.0,
     mask_ds = mask[::ds, ::ds]
 
     valid = ~mask_ds
+    print(f'[phot] fitting degree-{bkg_poly_degree} 2D polynomial background '
+          f'({int(np.sum(valid))} points at 1/{ds} resolution) ...', file=sys.stderr)
     if np.any(valid):
         poly = fitter(poly_init, x_ds[valid], y_ds[valid], data_ds[valid])
         y_full, x_full = np.mgrid[:ny, :nx]
@@ -220,12 +249,13 @@ def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=5.0,
 
     data_sub = data - bkg_fit
 
-    # Estimate RMS of residuals in unmasked regions
-    valid_full = ~mask
-    if np.any(valid_full):
-        residual_rms = np.std(data_sub[valid_full])
-    else:
-        residual_rms = np.std(data_sub)
+    # Sigma-clipped stats on residuals: rejects source pixels so RMS reflects
+    # true sky noise, not the (much larger) std dominated by bright sources.
+    residuals = data_sub[~mask] if np.any(~mask) else data_sub.ravel()
+    _, _, residual_rms = sigma_clipped_stats(residuals, sigma=5.0)
+    bkg_level = float(np.mean(bkg_fit[~mask]) if np.any(~mask) else np.mean(bkg_fit))
+    print(f'[phot] background level={bkg_level:.4g}  RMS={residual_rms:.4g}  '
+          f'threshold ({detection_sigma}σ)={detection_sigma * residual_rms:.4g}', file=sys.stderr)
 
     sp = SourcePhotometry(
         fwhm_pix=fwhm_pix,
@@ -235,26 +265,58 @@ def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=5.0,
         annulus_outer_fwhm=annulus_outer_fwhm,
     )
 
+    print(f'[phot] detecting sources (FWHM={fwhm_pix}px  aper={aperture_radius_fwhm}×FWHM  '
+          f'annulus={annulus_inner_fwhm}–{annulus_outer_fwhm}×FWHM) ...', file=sys.stderr)
     sources = sp.detect_sources(data_sub, residual_rms)
-    if sources is None or len(sources) == 0:
-        print('[view_sca] No sources detected', file=sys.stderr)
-        return None, None, sp
+    n_sources = len(sources) if sources is not None else 0
 
+    if sources is None or len(sources) == 0:
+        print('[phot] no sources detected', file=sys.stderr)
+        stats = {
+            'bkg_level': bkg_level,
+            'bkg_rms': residual_rms,
+            'threshold': detection_sigma * residual_rms,
+            'n_sources': 0,
+        }
+        return None, None, sp, stats
+
+    print(f'[phot] {n_sources} sources detected — running aperture photometry ...', file=sys.stderr)
     phot_table = sp.aperture_photometry_on_frame(data_sub, sources, residual_rms)
-    return sources, phot_table, sp
+    if phot_table is not None and 'snr' in phot_table.colnames:
+        snr = phot_table['snr']
+        print(f'[phot] SNR  min={float(snr.min()):.1f}  median={float(np.median(snr)):.1f}  '
+              f'max={float(snr.max()):.1f}', file=sys.stderr)
+        keep = snr >= snr_threshold
+        n_kept = int(np.sum(keep))
+        if n_kept < n_sources:
+            print(f'[phot] SNR >= {snr_threshold}: {n_kept}/{n_sources} sources kept', file=sys.stderr)
+            sources   = sources[keep]
+            phot_table = phot_table[keep]
+            n_sources = n_kept
+    stats = {
+        'bkg_level': bkg_level,
+        'bkg_rms': residual_rms,
+        'threshold': detection_sigma * residual_rms,
+        'n_sources': n_sources,
+    }
+    return sources, phot_table, sp, stats
 
 
 def phot_to_region_str(sources, phot_table, sp):
     """Generate a DS9 region string for aperture photometry results.
 
-    Returns a multi-line region string (image coords, 0-indexed as used by ds9 regions)
-    with aperture circles SNR-colour-coded (no labels; see CSV for details).
+    DAOStarFinder returns 0-based pixel coords (numpy convention, center of first
+    pixel = (0, 0)). DS9 'image' coordinates are FITS 1-based (center of first
+    pixel = (1, 1)), so we add 1.0 for correct alignment.
+
+    Returns a multi-line region string with aperture circles SNR-colour-coded
+    (no labels; see CSV for details).
     """
     rgns = ['# Region file format: DS9 version 4.1', 'image']
 
     for i in range(len(sources)):
-        x = sources['xcentroid'][i]
-        y = sources['ycentroid'][i]
+        x = sources['xcentroid'][i] + 1.0   # numpy 0-based -> DS9 image (FITS) 1-based
+        y = sources['ycentroid'][i] + 1.0
 
         # SNR-based colour
         color = 'red'
@@ -324,7 +386,7 @@ def display_in_ds9(data, regions, *, title='Roman WFI', wcs_header=None,
             'Make sure DS9 is running first:  ds9 &'
         )
 
-    # Build header: start from the SIP WCS if provided, then add OBJECT
+    # Build header: include SIP WCS for RA/Dec display, but also keep NAXIS/CRPIX for region alignment
     hdr = wcs_header.copy() if wcs_header is not None else fits.Header()
     hdr['OBJECT'] = title
     buf = io.BytesIO()
@@ -368,7 +430,7 @@ def display_in_ds9(data, regions, *, title='Roman WFI', wcs_header=None,
 
 def display_in_mpl(data, detector, *, dq=None, title=None, wcs_header=None,
                    show_channels=False, show_gridlines=False,
-                   figsize=(9, 8), norm=None, sources=None, phot_table=None, sp=None):
+                   figsize=(9, 8), norm=None, sources=None, phot_table=None, sp=None, stats=None):
     """Display a single SCA in an interactive matplotlib window.
 
     When wcs_header is provided the axes use WCSAxes projection so ticks and
@@ -475,15 +537,34 @@ def display_in_mpl(data, detector, *, dq=None, title=None, wcs_header=None,
                                   fill=False, edgecolor=color, linewidth=1, linestyle='--', alpha=0.4)
             ax.add_patch(annulus_outer)
 
+    if stats is not None:
+        # Display background statistics in a text panel (upper-left corner)
+        stats_text = (
+            f"Background Stats:\n"
+            f"Level: {stats['bkg_level']:.2f}\n"
+            f"RMS: {stats['bkg_rms']:.2f}\n"
+            f"Threshold: {stats['threshold']:.2f}\n"
+            f"Sources: {stats['n_sources']}"
+        )
+        ax.text(0.02, 0.98, stats_text,
+               transform=ax.transAxes,
+               verticalalignment='top', horizontalalignment='left',
+               fontsize=9, family='monospace',
+               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
+
     _wcs_fmt = ax.format_coord   # WCSAxes provides RA/Dec; plain axes gives x/y
     def _fmt(x, y):
         col, row = int(round(x)), int(round(y))
-        val_str = ''
+        # WCSAxes can raise when the WCS transform fails near image edges
+        try:
+            wcs_str = _wcs_fmt(x, y)
+        except Exception:
+            wcs_str = f'x={x:.1f}  y={y:.1f}'
         if 0 <= row < ny and 0 <= col < nx:
             val = data[row, col]
             dq_str = f'  dq={dq[row, col]}' if dq is not None else ''
-            val_str = f'  x={col + ref_pix}  y={row + ref_pix}  val={val:.4g}{dq_str}'
-        return _wcs_fmt(x, y) + val_str
+            return wcs_str + f'  x={col + ref_pix}  y={row + ref_pix}  val={val:.4g}{dq_str}'
+        return wcs_str
     ax.format_coord = _fmt
 
     plt.tight_layout()
@@ -504,7 +585,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    ap.add_argument('uri',      help='S3 base URI ending in /  (anonymous access)')
+    ap.add_argument('uri',      help='S3 base URI (e.g. s3://stpubdata/roman/...) or local directory path (e.g. ./cache)')
     ap.add_argument('filename', help='ASDF filename, e.g. r0003..._wfi11_f106_cal.asdf')
     ap.add_argument('--channels', action='store_true',
                     help='Draw 32-channel thin dividers and channel numbers')
@@ -526,8 +607,8 @@ def main():
                     help='Enable aperture photometry analysis')
     ap.add_argument('--fwhm', type=float, default=1.5, metavar='N',
                     help='Source FWHM in pixels (default: 1.5; photometry only)')
-    ap.add_argument('--det-sigma', type=float, default=5.0, metavar='N',
-                    help='DAOStarFinder detection threshold σ (default: 5.0; photometry only)')
+    ap.add_argument('--det-sigma', type=float, default=10.0, metavar='N',
+                    help='DAOStarFinder detection threshold σ (default: 10.0; photometry only)')
     ap.add_argument('--aper', type=float, default=2.5, metavar='N',
                     help='Aperture radius as multiple of FWHM (default: 2.5; photometry only)')
     ap.add_argument('--annulus-inner', type=float, default=6.0, metavar='N',
@@ -536,6 +617,8 @@ def main():
                     help='Outer annulus radius as multiple of FWHM (default: 8.0; photometry only)')
     ap.add_argument('--bkg-poly-degree', type=int, default=3, metavar='N',
                     help='2D polynomial background fitting degree (default: 3; photometry only)')
+    ap.add_argument('--snr-threshold', type=float, default=5.0, metavar='N',
+                    help='Minimum SNR to include a source in output (default: 5.0; photometry only)')
     ap.add_argument('--phot-out', default=None, metavar='PATH',
                     help='Write photometry table to this CSV path (photometry only)')
     args = ap.parse_args()
@@ -545,14 +628,14 @@ def main():
                                                sip_degree=args.sip_degree)
 
     meta = parse_filename(args.filename)
-    title = (f'Roman WFI {detector}  Visit: {meta["visit_id"]}  '
-             f'Exposure: {meta["exposure_num"]}  SCA: {meta["sca_num"]:02d}  '
-             f'Filter: {meta["filter"]}')
+    title = (f'{detector} {meta["visit_id"]}  '
+             f'Exp: {meta["exposure_num"]} '
+             f'{meta["filter"]}')
 
     # Run photometry if requested
-    sources, phot_table, sp = None, None, None
+    sources, phot_table, sp, stats = None, None, None, None
     if args.phot:
-        sources, phot_table, sp = run_aperture_photometry(
+        sources, phot_table, sp, stats = run_aperture_photometry(
             data,
             dq=dq,
             fwhm_pix=args.fwhm,
@@ -561,6 +644,7 @@ def main():
             annulus_inner_fwhm=args.annulus_inner,
             annulus_outer_fwhm=args.annulus_outer,
             bkg_poly_degree=args.bkg_poly_degree,
+            snr_threshold=args.snr_threshold,
         )
         if phot_table is not None and args.phot_out:
             phot_table.write(args.phot_out, format='ascii.csv', overwrite=True)
@@ -577,6 +661,7 @@ def main():
             sources=sources,
             phot_table=phot_table,
             sp=sp,
+            stats=stats,
         )
     else:
         regions = make_channel_regions(
