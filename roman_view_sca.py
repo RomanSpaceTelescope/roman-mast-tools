@@ -247,14 +247,14 @@ def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=5.0,
 def phot_to_region_str(sources, phot_table, sp):
     """Generate a DS9 region string for aperture photometry results.
 
-    Returns a multi-line region string (image coords, 1-indexed) with
-    aperture circles SNR-colour-coded (no labels; see CSV for details).
+    Returns a multi-line region string (image coords, 0-indexed as used by ds9 regions)
+    with aperture circles SNR-colour-coded (no labels; see CSV for details).
     """
     rgns = ['# Region file format: DS9 version 4.1', 'image']
 
     for i in range(len(sources)):
-        x = sources['xcentroid'][i] + 1.0   # 1-indexed
-        y = sources['ycentroid'][i] + 1.0
+        x = sources['xcentroid'][i]
+        y = sources['ycentroid'][i]
 
         # SNR-based colour
         color = 'red'
