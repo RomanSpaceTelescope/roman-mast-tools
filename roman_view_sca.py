@@ -36,7 +36,6 @@ from astropy.wcs import WCS
 
 try:
     from roman_lolo.romanphot import SourcePhotometry
-    from photutils.background import Background2D, MedianBackground
     _PHOT_AVAILABLE = True
 except ImportError:
     _PHOT_AVAILABLE = False
@@ -179,10 +178,11 @@ def make_channel_regions(data, detector, *, show_channels=False, show_gridlines=
 
 def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=5.0,
                              aperture_radius_fwhm=2.5, annulus_inner_fwhm=6.0,
-                             annulus_outer_fwhm=8.0, bkg_box_size=50):
+                             annulus_outer_fwhm=8.0, bkg_poly_degree=3):
     """Background-subtract, detect sources, and run aperture photometry.
 
-    Bad pixels (dq != 0) are masked before analysis.
+    Fits a 2D polynomial background, then performs source detection and
+    photometry on the residual. Bad pixels (dq != 0) are masked during fitting.
 
     Returns
     -------
@@ -197,12 +197,35 @@ def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=5.0,
         raise ImportError('roman-lolo not installed; install with: pip install -e .')
 
     mask = (dq != 0) if dq is not None else np.zeros_like(data, dtype=bool)
-    data_masked = np.ma.array(data, mask=mask)
+    ny, nx = data.shape
 
-    bkg = Background2D(data_masked, (bkg_box_size, bkg_box_size),
-                       bkg_estimator=MedianBackground())
-    data_sub = data_masked - bkg.background
-    bkg_rms = bkg.background_rms
+    # Fit 2D polynomial background to unmasked pixels (downsampled for speed)
+    from astropy.modeling import models, fitting
+    poly_init = models.Polynomial2D(degree=bkg_poly_degree)
+    fitter = fitting.LevMarLSQFitter()
+
+    # Downsample by factor of 4 for fitting
+    ds = 4
+    y_ds, x_ds = np.mgrid[0:ny:ds, 0:nx:ds]
+    data_ds = data[::ds, ::ds]
+    mask_ds = mask[::ds, ::ds]
+
+    valid = ~mask_ds
+    if np.any(valid):
+        poly = fitter(poly_init, x_ds[valid], y_ds[valid], data_ds[valid])
+        y_full, x_full = np.mgrid[:ny, :nx]
+        bkg_fit = poly(x_full, y_full)
+    else:
+        bkg_fit = np.zeros_like(data)
+
+    data_sub = data - bkg_fit
+
+    # Estimate RMS of residuals in unmasked regions
+    valid_full = ~mask
+    if np.any(valid_full):
+        residual_rms = np.std(data_sub[valid_full])
+    else:
+        residual_rms = np.std(data_sub)
 
     sp = SourcePhotometry(
         fwhm_pix=fwhm_pix,
@@ -212,12 +235,12 @@ def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=5.0,
         annulus_outer_fwhm=annulus_outer_fwhm,
     )
 
-    sources = sp.detect_sources(data_sub, bkg_rms)
+    sources = sp.detect_sources(data_sub, residual_rms)
     if sources is None or len(sources) == 0:
         print('[view_sca] No sources detected', file=sys.stderr)
         return None, None, sp
 
-    phot_table = sp.aperture_photometry_on_frame(data_sub, sources, bkg_rms)
+    phot_table = sp.aperture_photometry_on_frame(data_sub, sources, residual_rms)
     return sources, phot_table, sp
 
 
@@ -508,8 +531,8 @@ def main():
                     help='Inner annulus radius as multiple of FWHM (default: 6.0; photometry only)')
     ap.add_argument('--annulus-outer', type=float, default=8.0, metavar='N',
                     help='Outer annulus radius as multiple of FWHM (default: 8.0; photometry only)')
-    ap.add_argument('--bkg-box', type=int, default=50, metavar='N',
-                    help='Background2D box size in pixels (default: 50; photometry only)')
+    ap.add_argument('--bkg-poly-degree', type=int, default=3, metavar='N',
+                    help='2D polynomial background fitting degree (default: 3; photometry only)')
     ap.add_argument('--phot-out', default=None, metavar='PATH',
                     help='Write photometry table to this CSV path (photometry only)')
     args = ap.parse_args()
@@ -534,7 +557,7 @@ def main():
             aperture_radius_fwhm=args.aper,
             annulus_inner_fwhm=args.annulus_inner,
             annulus_outer_fwhm=args.annulus_outer,
-            bkg_box_size=args.bkg_box,
+            bkg_poly_degree=args.bkg_poly_degree,
         )
         if phot_table is not None and args.phot_out:
             phot_table.write(args.phot_out, format='ascii.csv', overwrite=True)
