@@ -69,7 +69,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from astroquery.mast import MastMissions
+from astroquery.mast import MastMissions, Conf
+from requests.adapters import HTTPAdapter as _HTTPAdapter
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +79,11 @@ from astroquery.mast import MastMissions
 
 # Toggle at runtime with roman_mast.VERBOSE = False (or --quiet on the CLI).
 VERBOSE = True
+
+# Temporary: MAST OPS is cleared before launch; point to the I&T instance instead.
+# Set this to 'https://mastint.stsci.edu' (or pass --server on the CLI) while
+# the production archive is unavailable.  Reset to None when OPS is live again.
+MAST_SERVER = None
 
 
 def _log(msg):
@@ -207,8 +213,16 @@ def get_token(token_file='mast_api_token.txt'):
         return None
 
 
-def connect(token=None):
-    """Return an authenticated MastMissions session for mission='roman'."""
+def connect(token=None, server=None):
+    """Return an authenticated MastMissions session for mission='roman'.
+
+    Parameters
+    ----------
+    server : str, optional
+        Override the MAST server URL, e.g. ``'https://mastint.stsci.edu'`` for
+        the I&T instance.  Falls back to the module-level ``MAST_SERVER`` variable,
+        then to the astroquery default (production).
+    """
     if token is None:
         token = get_token()
     if not token:
@@ -216,9 +230,30 @@ def connect(token=None):
             "MAST token not found. Set MAST_API_TOKEN or place your token in "
             "mast_api_token.txt (see https://auth.mast.stsci.edu/info)."
         )
+    srv = server or MAST_SERVER
+    if srv:
+        Conf.server = srv
+        _log(f"Using MAST server: {srv}")
     missions = MastMissions(mission='roman')
+    if srv:
+        missions._service_api_connection.MISSIONS_URL = srv + '/search/'
+        # TEMPORARY (remove when MAST OPS is live): the I&T auth server redirects
+        # whoami → http://auth.mastint.stsci.edu (port 80), which is unreachable
+        # from outside STScI.  Mount an adapter that silently upgrades those
+        # redirects to HTTPS.  To undo: delete this entire `if srv:` block and
+        # the _HttpsUpgradeAdapter class below.
+        missions._auth_obj.session.mount(
+            'http://auth.mastint.stsci.edu', _HttpsUpgradeAdapter()
+        )
     missions.login(token=token)
     return missions
+
+
+class _HttpsUpgradeAdapter(_HTTPAdapter):
+    # TEMPORARY — see comment in connect() above.
+    def send(self, request, **kwargs):
+        request.url = request.url.replace('http://', 'https://', 1)
+        return super().send(request, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -670,6 +705,7 @@ def list_data(
     columns=None,
     missions=None,
     token=None,
+    server=None,
     enumerate_products=False,
 ):
     """Query MAST for Roman WFI data matching the given filters.
@@ -702,6 +738,10 @@ def list_data(
         Pre-authenticated session to reuse. If None, connect() is called.
     token : str, optional
         Explicit MAST token override; only consulted when missions is None.
+    server : str, optional
+        Override the MAST server URL (e.g. ``'https://mastint.stsci.edu'``).
+        Only consulted when missions is None; also accepts the module-level
+        ``MAST_SERVER`` default.  Temporary until MAST OPS is repopulated.
     enumerate_products : bool
         If False (default, FAST), skip the second MAST round-trip and derive
         filenames locally from the `fileSetName` column via Roman's naming
@@ -716,7 +756,7 @@ def list_data(
     """
     if missions is None:
         with _timed("Authenticating with MAST"):
-            missions = connect(token=token)
+            missions = connect(token=token, server=server)
 
     if sca_only:
         if product_type not in (None, 'l2'):
@@ -1163,6 +1203,10 @@ def add_list_data_args(parser):
                              'is a TTY), always, never')
     parser.add_argument('--no-color',        dest='color', action='store_const',
                         const='never', help='Alias for --color never')
+    parser.add_argument('--server',          default=None,
+                        help="MAST server URL override, e.g. "
+                             "'https://mastint.stsci.edu' for the I&T instance. "
+                             "Temporary; also settable via roman_mast.MAST_SERVER.")
 
 
 def list_data_from_args(args):
@@ -1200,6 +1244,7 @@ def list_data_from_args(args):
         sca_only=args.sca_only,
         data_level=_parse_data_level(args.data_level),
         kinds=kinds,
+        server=getattr(args, 'server', None),
         enumerate_products=args.enumerate_products,
     )
 
