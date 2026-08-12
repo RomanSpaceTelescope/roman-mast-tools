@@ -34,6 +34,7 @@ roman-mast     = "roman_mast:main"
 roman-fits     = "roman_fits:main"
 roman-metadata = "roman_metadata:main"
 roman-view-sca = "roman_view_sca:main"
+roman-phot     = "roman_phot:main"
 
 [tool.setuptools]
-py-modules = ["roman_mast", "roman_fits", "roman_metadata", "roman_view_sca"]
+py-modules = ["roman_mast", "roman_fits", "roman_metadata", "roman_view_sca", "roman_phot"]
