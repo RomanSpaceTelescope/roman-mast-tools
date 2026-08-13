@@ -322,7 +322,7 @@ def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=20.0
     """
     if _SourcePhotometry is None:
         try:
-            from roman_lolo.romanphot import SourcePhotometry
+            from photometry import SourcePhotometry
             _SourcePhotometry = SourcePhotometry
         except ImportError:
             raise ImportError('roman-lolo not installed; install with: pip install -e .')

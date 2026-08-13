@@ -20,7 +20,7 @@ dependencies = [
     "rad>=1.0.0",
     "fsspec[s3]",
     "s3fs",
-    "roman-lolo @ git+https://github.com/RomanSpaceTelescope/roman-lolo.git@v0.3.0",
+    "photutils",
 ]
 
 [project.optional-dependencies]
@@ -37,4 +37,4 @@ roman-view-sca = "roman_view_sca:main"
 roman-phot     = "roman_phot:main"
 
 [tool.setuptools]
-py-modules = ["roman_mast", "roman_fits", "roman_metadata", "roman_view_sca", "roman_phot"]
+py-modules = ["roman_mast", "roman_fits", "roman_metadata", "roman_view_sca", "roman_phot", "photometry"]

@@ -358,9 +358,9 @@ def phot_exposure(uri_filename_pairs, *, phot_kwargs=None, bkg_kwargs=None, max_
     Returns a list of result dicts (sorted by SCA number), with None entries
     removed.
     """
-    # Load roman_lolo once at the start, shared across all SCAs
+    # Load photometry module once at the start, shared across all SCAs
     try:
-        from roman_lolo.romanphot import SourcePhotometry
+        from photometry import SourcePhotometry
     except ImportError:
         raise ImportError('roman-lolo not installed; install with: pip install -e .')
 
