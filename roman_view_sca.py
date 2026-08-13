@@ -47,11 +47,13 @@ from astropy.io import fits
 from astropy.stats import sigma_clipped_stats
 from astropy.wcs import WCS
 
-try:
-    from roman_lolo.romanphot import SourcePhotometry
-    _PHOT_AVAILABLE = True
-except ImportError:
-    _PHOT_AVAILABLE = False
+# Temporarily disabled — roman_lolo.romanphot hangs on import
+# try:
+#     from roman_lolo.romanphot import SourcePhotometry
+#     _PHOT_AVAILABLE = True
+# except ImportError:
+#     _PHOT_AVAILABLE = False
+_PHOT_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Focal-plane rotation table (from MPA_SCA_info).

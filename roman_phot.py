@@ -286,8 +286,12 @@ def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
         cx_px = (cx_am - x_min) * scale
         cy_px = (y_max - cy_am) * scale
 
-        col0 = int(round(cx_px - tile_w / 2))
-        row0 = int(round(cy_px - tile_h / 2))
+        # Position tile so its center is at (cx_px, cy_px). Keep float precision
+        # until placement to avoid accumulating rounding errors.
+        col0_float = cx_px - tile_w / 2
+        row0_float = cy_px - tile_h / 2
+        col0 = int(np.floor(col0_float))
+        row0 = int(np.floor(row0_float))
         col1 = col0 + tile_w
         row1 = row0 + tile_h
 
