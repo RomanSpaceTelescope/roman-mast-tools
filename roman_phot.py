@@ -20,6 +20,9 @@ Usage
 
     # Per-SCA CSVs as well:
     python roman_phot.py --uri-file my_exposure.txt --per-sca
+
+    # Background mosaic (source-masked superpixel map in WFI focal-plane layout):
+    python roman_phot.py --uri-file my_exposure.txt --bkg-mosaic
 """
 
 import argparse
@@ -32,15 +35,48 @@ from astropy.table import vstack, Table
 
 from roman_view_sca import stream_sca, run_aperture_photometry, parse_filename
 
+# ---------------------------------------------------------------------------
+# WFI focal-plane constants
+# ---------------------------------------------------------------------------
+
+# Roman WFI detector constants
+_ROMAN_PIXEL_SCALE_MM = 0.01      # mm per pixel (focal-plane scale)
+_ROMAN_SCA_FULL_SIZE  = 4096      # full detector size before reference-pixel removal
+_ROMAN_REF_PIX        = 4         # reference pixels removed from each edge
+
+# Focal-plane layout: SCA number → (x_center_arcmin, y_center_arcmin, rotation_deg)
+# Rotation 180° means the SCA is flipped relative to the focal-plane axes.
+_WFI_SCA_LAYOUT = {
+     1: ( -22.14,  12.15, 180.0),
+     2: ( -22.29, -37.03, 180.0),
+     3: ( -22.44, -82.06,   0.0),
+     4: ( -66.42,  20.90, 180.0),
+     5: ( -66.92, -28.28, 180.0),
+     6: ( -67.42, -73.06,   0.0),
+     7: (-110.70,  42.20, 180.0),
+     8: (-111.48,  -6.98, 180.0),
+     9: (-112.64, -51.06,   0.0),
+    10: (  22.14,  12.15, 180.0),
+    11: (  22.29, -37.03, 180.0),
+    12: (  22.44, -82.06,   0.0),
+    13: (  66.42,  20.90, 180.0),
+    14: (  66.92, -28.28, 180.0),
+    15: (  67.42, -73.06,   0.0),
+    16: ( 110.70,  42.20, 180.0),
+    17: ( 111.48,  -6.98, 180.0),
+    18: ( 112.64, -51.06,   0.0),
+}
+
 
 # ---------------------------------------------------------------------------
 # Per-SCA photometry
 # ---------------------------------------------------------------------------
 
-def phot_one_sca(uri, filename, *, phot_kwargs):
+def phot_one_sca(uri, filename, *, phot_kwargs, bkg_kwargs=None):
     """Stream one SCA and run aperture photometry.
 
-    Returns a dict with keys: sca, detector, table, stats, sp.
+    Returns a dict with keys: sca, detector, table, stats, sp, bkg_map.
+    bkg_map is None when bkg_kwargs is None (background mosaic not requested).
     Returns None on failure (logs a warning).
     """
     try:
@@ -81,20 +117,228 @@ def phot_one_sca(uri, filename, *, phot_kwargs):
         file=sys.stderr,
     )
 
+    bkg_map = None
+    if bkg_kwargs is not None:
+        try:
+            bkg_map = background_map_one_sca(data, dq, **bkg_kwargs)
+        except Exception as exc:
+            print(f'[roman_phot] WARNING: background map failed for SCA {sca_num}: {exc}',
+                  file=sys.stderr)
+
     return {
         'sca': sca_num,
         'detector': detector,
         'table': phot_table,
         'stats': stats,
         'sp': sp,
+        'bkg_map': bkg_map,
     }
+
+
+# ---------------------------------------------------------------------------
+# Background mapping
+# ---------------------------------------------------------------------------
+
+def background_map_one_sca(data, dq, *, superpixel=512, mask_sigma=1.5,
+                            dilate_radius=20, bkg_poly_degree=3):
+    """Compute a superpixel background map for one SCA.
+
+    Steps:
+      1. Fit and subtract a 2D polynomial background.
+      2. Mask all sources (point and extended) via a segmentation map with
+         binary dilation so halos are fully covered.
+      3. Replace masked pixels with NaN.
+      4. Bin into superpixels using nanmedian.
+
+    Returns a 2D float array of shape (ny//superpixel, nx//superpixel), or
+    None if the image is too small.
+    """
+    from astropy.modeling import models, fitting
+    from astropy.stats import sigma_clipped_stats
+
+    ny, nx = data.shape
+    mask = (dq != 0) if dq is not None else np.zeros_like(data, dtype=bool)
+
+    # Polynomial background fit (same logic as run_aperture_photometry)
+    poly_init = models.Polynomial2D(degree=bkg_poly_degree)
+    fitter = fitting.LevMarLSQFitter()
+    ds = 4
+    y_ds, x_ds = np.mgrid[0:ny:ds, 0:nx:ds]
+    valid = ~mask[::ds, ::ds]
+    if np.any(valid):
+        data_ds = data[::ds, ::ds]
+        poly = fitter(poly_init, x_ds[valid], y_ds[valid], data_ds[valid])
+        y_full, x_full = np.mgrid[:ny, :nx]
+        bkg_fit = poly(x_full, y_full)
+    else:
+        bkg_fit = np.zeros_like(data, dtype=float)
+
+    data_sub = data - bkg_fit
+
+    # RMS of background residual (sigma-clipped, excluding bad pixels)
+    residuals = data_sub[~mask] if np.any(~mask) else data_sub.ravel()
+    _, _, rms = sigma_clipped_stats(residuals, sigma=5.0)
+
+    # Build source mask via segmentation
+    src_mask = np.zeros_like(mask)
+    try:
+        from photutils.segmentation import detect_sources
+        from astropy.convolution import Gaussian2DKernel, convolve
+        from scipy.ndimage import binary_dilation
+
+        kernel = Gaussian2DKernel(x_stddev=2.0)
+        conv = convolve(data_sub, kernel, mask=mask)
+        segmap = detect_sources(conv, mask_sigma * rms, npixels=5)
+        if segmap is not None:
+            src_mask = binary_dilation(segmap.data > 0, iterations=dilate_radius)
+    except Exception as exc:
+        print(f'[roman_phot] WARNING: source masking skipped: {exc}', file=sys.stderr)
+
+    # Apply combined mask as NaN
+    residual = data_sub.astype(float)
+    residual[mask | src_mask] = np.nan
+
+    # Bin into superpixels aligned to the original 4096×4096 detector grid.
+    # Reference pixels shift all data coordinates by -_ROMAN_REF_PIX; edge
+    # superpixels end up with _ROMAN_REF_PIX fewer rows/columns, which is fine.
+    n_chunks = _ROMAN_SCA_FULL_SIZE // superpixel  # 8 for superpixel=512
+
+    orig_bounds = [i * superpixel for i in range(n_chunks + 1)]
+    row_bounds = [max(0, min(ny, b - _ROMAN_REF_PIX)) for b in orig_bounds]
+    col_bounds = [max(0, min(nx, b - _ROMAN_REF_PIX)) for b in orig_bounds]
+
+    binned = np.full((n_chunks, n_chunks), np.nan)
+    for i in range(n_chunks):
+        r0, r1 = row_bounds[i], row_bounds[i + 1]
+        if r1 <= r0:
+            continue
+        for j in range(n_chunks):
+            c0, c1 = col_bounds[j], col_bounds[j + 1]
+            if c1 <= c0:
+                continue
+            chunk = residual[r0:r1, c0:c1]
+            binned[i, j] = np.nanmedian(chunk)
+
+    n_src = int(np.sum(src_mask))
+    n_tot = src_mask.size
+    print(
+        f'[roman_phot] bkg map: {n_chunks}×{n_chunks} superpixels  '
+        f'source mask={100*n_src/n_tot:.1f}%  rms={rms:.4g}',
+        file=sys.stderr,
+    )
+    return binned
+
+
+def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
+                        pct_lo=2, pct_hi=98):
+    """Render a WFI focal-plane background mosaic and save to a PNG.
+
+    Parameters
+    ----------
+    sca_maps : dict
+        Mapping of SCA number (int) to 2D binned background array (or None).
+    out_path : str
+        Destination PNG path.
+    superpixel : int
+        Superpixel size used when creating the maps (for scale conversion).
+    title : str or None
+        Figure title.
+    pct_lo, pct_hi : float
+        Percentile bounds for the symmetric colour stretch.
+    """
+    import matplotlib.pyplot as plt
+
+    # Scale: focal-plane mm → canvas superpixels
+    # 1 superpixel = superpixel * _ROMAN_PIXEL_SCALE_MM mm
+    sp_mm = superpixel * _ROMAN_PIXEL_SCALE_MM   # mm per superpixel (5.12 mm for 512 px)
+    scale = 1.0 / sp_mm                          # superpixels per mm
+
+    # Infer tile shape from available maps
+    tile_shapes = [v.shape for v in sca_maps.values() if v is not None]
+    if not tile_shapes:
+        print(f'[roman_phot] WARNING: no background maps to render; skipping PNG', file=sys.stderr)
+        return
+    tile_h, tile_w = tile_shapes[0]
+
+    # Canvas bounds in arcminutes (with half-tile padding)
+    coords = list(_WFI_SCA_LAYOUT.values())
+    all_cx, all_cy = zip(*[(cx, cy) for cx, cy, _ in coords])
+    half_w = (tile_w / scale) / 2
+    half_h = (tile_h / scale) / 2
+    x_min = min(all_cx) - half_w
+    x_max = max(all_cx) + half_w
+    y_min = min(all_cy) - half_h
+    y_max = max(all_cy) + half_h
+
+    canvas_w = int(np.ceil((x_max - x_min) * scale)) + 2
+    canvas_h = int(np.ceil((y_max - y_min) * scale)) + 2
+    canvas = np.full((canvas_h, canvas_w), np.nan)
+
+    for sca_num, (cx_am, cy_am, rot) in _WFI_SCA_LAYOUT.items():
+        tile = sca_maps.get(sca_num)
+        if tile is None:
+            continue
+
+        if rot == 180.0:
+            tile = np.rot90(tile, 2)
+
+        # Convert centre from arcmin to canvas pixel (y flipped: sky up → image down)
+        cx_px = (cx_am - x_min) * scale
+        cy_px = (y_max - cy_am) * scale
+
+        col0 = int(round(cx_px - tile_w / 2))
+        row0 = int(round(cy_px - tile_h / 2))
+        col1 = col0 + tile_w
+        row1 = row0 + tile_h
+
+        # Clip to canvas
+        r0 = max(row0, 0); r1 = min(row1, canvas_h)
+        c0 = max(col0, 0); c1 = min(col1, canvas_w)
+        tr0 = r0 - row0; tc0 = c0 - col0
+        canvas[r0:r1, c0:c1] = tile[tr0:tr0 + (r1 - r0), tc0:tc0 + (c1 - c0)]
+
+    # Colour stretch: symmetric around zero (diverging)
+    finite = canvas[np.isfinite(canvas)]
+    if len(finite) == 0:
+        print(f'[roman_phot] WARNING: background mosaic is entirely NaN; skipping PNG', file=sys.stderr)
+        return
+    abs_lim = max(abs(np.percentile(finite, pct_lo)), abs(np.percentile(finite, pct_hi)))
+    vmin, vmax = -abs_lim, abs_lim
+
+    fig, ax = plt.subplots(figsize=(14, 8), facecolor='#1a1a1a')
+    ax.set_facecolor('#1a1a1a')
+
+    im = ax.imshow(
+        canvas, origin='upper', cmap='RdBu_r',
+        vmin=vmin, vmax=vmax, interpolation='nearest',
+    )
+    cbar = fig.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
+    cbar.set_label('Background residual (DN/s)', color='white', fontsize=10)
+    cbar.ax.yaxis.set_tick_params(color='white')
+    plt.setp(cbar.ax.yaxis.get_ticklabels(), color='white')
+
+    # Label each SCA
+    for sca_num, (cx_am, cy_am, _) in _WFI_SCA_LAYOUT.items():
+        cx_px = (cx_am - x_min) * scale
+        cy_px = (y_max - cy_am) * scale
+        ax.text(cx_px, cy_px, f'{sca_num:02d}',
+                ha='center', va='center', fontsize=7,
+                color='white', alpha=0.6, fontweight='bold')
+
+    ax.set_title(title or 'Roman WFI — source-masked background mosaic',
+                 color='white', fontsize=12, pad=10)
+    ax.axis('off')
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f'[roman_phot] background mosaic -> {out_path}', file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
 # Parallel fan-out
 # ---------------------------------------------------------------------------
 
-def phot_exposure(uri_filename_pairs, *, phot_kwargs=None, max_workers=8):
+def phot_exposure(uri_filename_pairs, *, phot_kwargs=None, bkg_kwargs=None, max_workers=8):
     """Run photometry on a list of (uri, filename) pairs in parallel.
 
     Returns a list of result dicts (sorted by SCA number), with None entries
@@ -106,7 +350,8 @@ def phot_exposure(uri_filename_pairs, *, phot_kwargs=None, max_workers=8):
     results = {}
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
-            pool.submit(phot_one_sca, uri, fn, phot_kwargs=phot_kwargs): fn
+            pool.submit(phot_one_sca, uri, fn,
+                        phot_kwargs=phot_kwargs, bkg_kwargs=bkg_kwargs): fn
             for uri, fn in uri_filename_pairs
         }
         for fut in as_completed(futures):
@@ -141,6 +386,47 @@ def load_uri_file(path):
 
 # ---------------------------------------------------------------------------
 # Summary table builder
+# ---------------------------------------------------------------------------
+
+def build_summary(results):
+    """Build an astropy Table with one row per SCA."""
+    from astropy.table import Table
+
+    rows = []
+    for r in results:
+        sca = r['sca']
+        det = r['detector']
+        stats = r['stats']
+        sp = r['sp']
+        tbl = r['table']
+
+        snr_min = snr_max = snr_median = float('nan')
+        if tbl is not None and len(tbl) > 0 and 'snr' in tbl.colnames:
+            snr = tbl['snr']
+            snr_min    = float(snr.min())
+            snr_max    = float(snr.max())
+            snr_median = float(np.median(snr))
+
+        rows.append({
+            'sca':               sca,
+            'detector':          det,
+            'bkg_level':         stats['bkg_level'],
+            'bkg_rms':           stats['bkg_rms'],
+            'detection_threshold': stats['threshold'],
+            'n_sources':         stats['n_sources'],
+            'snr_min':           snr_min,
+            'snr_median':        snr_median,
+            'snr_max':           snr_max,
+            'aperture_radius_pix': sp.aperture_radius if sp else float('nan'),
+            'annulus_inner_pix': sp.annulus_inner    if sp else float('nan'),
+            'annulus_outer_pix': sp.annulus_outer    if sp else float('nan'),
+        })
+
+    return Table(rows=rows) if rows else Table()
+
+
+# ---------------------------------------------------------------------------
+# Histogram generation
 # ---------------------------------------------------------------------------
 
 def reject_outliers(data, method='iqr', iqr_mult=1.5):
@@ -259,41 +545,6 @@ def make_histograms_from_csv(csv_path, output_path, columns=None, bins=30, outli
         plt.close(fig)
 
 
-def build_summary(results):
-    """Build an astropy Table with one row per SCA."""
-    rows = []
-    for r in results:
-        sca = r['sca']
-        det = r['detector']
-        stats = r['stats']
-        sp = r['sp']
-        tbl = r['table']
-
-        snr_min = snr_max = snr_median = float('nan')
-        if tbl is not None and len(tbl) > 0 and 'snr' in tbl.colnames:
-            snr = tbl['snr']
-            snr_min    = float(snr.min())
-            snr_max    = float(snr.max())
-            snr_median = float(np.median(snr))
-
-        rows.append({
-            'sca':               sca,
-            'detector':          det,
-            'bkg_level':         stats['bkg_level'],
-            'bkg_rms':           stats['bkg_rms'],
-            'detection_threshold': stats['threshold'],
-            'n_sources':         stats['n_sources'],
-            'snr_min':           snr_min,
-            'snr_median':        snr_median,
-            'snr_max':           snr_max,
-            'aperture_radius_pix': sp.aperture_radius if sp else float('nan'),
-            'annulus_inner_pix': sp.annulus_inner    if sp else float('nan'),
-            'annulus_outer_pix': sp.annulus_outer    if sp else float('nan'),
-        })
-
-    return Table(rows=rows) if rows else Table()
-
-
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -340,6 +591,20 @@ def main():
                     help='2D polynomial background degree (default: 3)')
     ap.add_argument('--snr-threshold', type=float, default=5.0,  metavar='N',
                     help='Minimum SNR to keep a source (default: 5.0)')
+
+    # Background mosaic options
+    ap.add_argument('--bkg-mosaic', action='store_true',
+                    help='Produce a source-masked superpixel background mosaic PNG')
+    ap.add_argument('--bkg-mosaic-out', default='roman_phot_bkg_mosaic.png', metavar='PATH',
+                    help='Background mosaic PNG output (default: roman_phot_bkg_mosaic.png)')
+    ap.add_argument('--bkg-superpixel', type=int, default=512, metavar='N',
+                    help='Superpixel bin size in pixels (default: 512)')
+    ap.add_argument('--bkg-mask-sigma', type=float, default=1.5, metavar='N',
+                    help='Source detection threshold for masking, in σ (default: 1.5)')
+    ap.add_argument('--bkg-dilate', type=int, default=20, metavar='N',
+                    help='Source mask dilation radius in pixels (default: 20)')
+
+    # Histogram generation
     ap.add_argument('--no-hist', action='store_true',
                     help='Skip histogram generation at the end')
     ap.add_argument('--hist-output', metavar='PATH',
@@ -362,7 +627,17 @@ def main():
         snr_threshold=args.snr_threshold,
     )
 
-    results = phot_exposure(pairs, phot_kwargs=phot_kwargs, max_workers=args.workers)
+    bkg_kwargs = None
+    if args.bkg_mosaic:
+        bkg_kwargs = dict(
+            superpixel=args.bkg_superpixel,
+            mask_sigma=args.bkg_mask_sigma,
+            dilate_radius=args.bkg_dilate,
+            bkg_poly_degree=args.bkg_poly,
+        )
+
+    results = phot_exposure(pairs, phot_kwargs=phot_kwargs,
+                            bkg_kwargs=bkg_kwargs, max_workers=args.workers)
 
     if not results:
         sys.exit('[roman_phot] ERROR: no SCAs completed successfully')
@@ -391,6 +666,17 @@ def main():
     if len(summary) > 0:
         summary.write(args.summary_out, format='ascii.csv', overwrite=True)
         print(f'[roman_phot] summary ({len(summary)} SCAs) -> {args.summary_out}', file=sys.stderr)
+
+    # Background mosaic PNG
+    if args.bkg_mosaic:
+        sca_maps = {r['sca']: r['bkg_map'] for r in results}
+        import os
+        exp_label = os.path.splitext(os.path.basename(args.uri_file))[0]
+        make_bkg_mosaic_png(
+            sca_maps, args.bkg_mosaic_out,
+            superpixel=args.bkg_superpixel,
+            title=f'Roman WFI background mosaic — {exp_label}',
+        )
 
     # Generate histograms
     if not args.no_hist and tables:
