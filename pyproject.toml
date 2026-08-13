@@ -20,7 +20,7 @@ dependencies = [
     "rad>=1.0.0",
     "fsspec[s3]",
     "s3fs",
-    "roman-lolo @ git+https://github.com/RomanSpaceTelescope/roman-lolo.git",
+    "roman-lolo @ git+https://github.com/RomanSpaceTelescope/roman-lolo.git@v0.3.0",
 ]
 
 [project.optional-dependencies]
