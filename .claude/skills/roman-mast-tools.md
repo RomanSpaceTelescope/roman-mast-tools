@@ -177,7 +177,7 @@ If you add a third sink, follow the same shape: take a `dm_dict` (not an af_dict
 
 ## Single-SCA viewer (`roman_view_sca.py`)
 
-Standalone script -- no dependency on `roman_mast` or the multi-exposure stack. Streams one ASDF file from **anonymous S3** (`s3fs.S3FileSystem(anon=True)`) and optionally runs aperture photometry.
+Dual-mode viewer: query MAST via `roman_mast` filters for authenticated L2 SCA viewing, or stream directly from anonymous S3/local paths. Optionally runs aperture photometry.
 
 **Installation & dependencies:**
 
@@ -195,9 +195,23 @@ conda env create -f environment.yml  # runs pip install -e . as part of env crea
 
 Photometry remains optional: if `roman-lolo` is not installed, the script works for display-only use.
 
+**Two input modes:**
+
+1. **MAST query mode** (new): `--program 114 --pass 57 --sca 1 [--exposure N] [--list]`
+   - Query via `roman_mast.list_data()` with any combination of filters: `--program`, `--pass`, `--execution-plan`, `--segment`, `--observation`, `--visit`, `--detector`, `--optical-element`, `--data-level`
+   - `--list` prints matching exposures (via `print_summary()`) and exits—no display
+   - `--exposure N` selects which exposure (1-based, matching `--list` order; default 1)
+   - `--sca N` (required) specifies which SCA (1-18) to view from the selected exposure
+   - Uses authenticated `MastMissions` session for streaming (avoids anonymous S3 limits)
+
+2. **Direct S3/local mode** (backward compatible): `<uri> <filename>`
+   - `uri` is either `s3://...` (anonymous) or a local directory path
+   - `filename` is the ASDF filename (e.g. `r0003...wfi11_f106_cal.asdf`)
+   - Example: `python roman_view_sca.py s3://stpubdata/roman/... r0003201001001001004_0001_wfi11_f106_cal.asdf`
+
 **Core functions:**
 
-- `stream_sca(uri, filename, *, sip_degree=4)` -- opens the ASDF file, materializes `data` (float32) and `dq` (int32), computes SIP WCS, all while the ASDF tree is live. Returns `(data, detector, wcs_hdr, dq)`.
+- `stream_sca(uri, filename=None, *, asdf_file=None, sip_degree=4)` -- opens an ASDF file from either an open AsdfFile (from MAST), S3 URI, or local path. Materializes `data` (float32) and `dq` (int32), computes SIP WCS while the ASDF tree is live. Returns `(data, detector, wcs_hdr, dq)`.
 - `make_channel_regions(data, detector, *, show_channels=False, show_gridlines=False)` -- builds a DS9 region string for the 32 H4RG readout channel dividers and 8-section major grid.
 - `run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=5.0, aperture_radius_fwhm=2.5, annulus_inner_fwhm=6.0, annulus_outer_fwhm=8.0, bkg_poly_degree=3)` -- background subtraction via 2D polynomial fit, source detection via DAOStarFinder, aperture photometry. Bad pixels (`dq != 0`) are masked during background fitting. Returns `(sources, phot_table, sp)`.
 - `phot_to_region_str(sources, phot_table, sp)` -- generates a DS9 region string with SNR-colour-coded apertures (green ≥50, cyan ≥20, yellow ≥10, magenta ≥5, red <5) and dashed background annuli. No text labels—details are in the CSV output.
@@ -229,6 +243,24 @@ When `--phot-out PATH` is given, an ASCII CSV is written with columns:
 
 **CLI usage:**
 
+MAST query mode (with exposure discovery):
+```bash
+# List matching exposures:
+python roman_view_sca.py --program 114 --pass 57 --list
+
+# View SCA 1 from 1st exposure in DS9:
+python roman_view_sca.py --program 114 --pass 57 --sca 1
+
+# View SCA 11 from 2nd exposure with matplotlib + photometry:
+python roman_view_sca.py --program 114 --pass 57 --exposure 2 --sca 11 \
+  --display mpl --phot --phot-out phot.csv
+
+# View with any roman_mast filter (e.g. detector, optical_element):
+python roman_view_sca.py --program 114 --pass 57 --detector WFI04 \
+  --optical-element F106 --sca 4 --display ds9
+```
+
+Direct S3/local mode (backward compatible):
 ```bash
 # Display with photometry overlay (matplotlib):
 python roman_view_sca.py --display mpl --phot --phot-out phot.csv <s3_uri> <filename>
@@ -236,19 +268,43 @@ python roman_view_sca.py --display mpl --phot --phot-out phot.csv <s3_uri> <file
 # DS9 with photometry:
 python roman_view_sca.py --display ds9 --phot --phot-out phot.csv <s3_uri> <filename>
 
-# Display without photometry:
-python roman_view_sca.py <s3_uri> <filename>
+# Display without photometry (local path):
+python roman_view_sca.py /cache/path/ r0003...asdf
 ```
+
+**Query + exposure selection CLI flags** (MAST mode only):
+- `--list` -- print matching exposures (via `print_summary()`) and exit; useful for discovery before selecting `--exposure N`
+- `--exposure N` -- select which exposure to view (1-based index, matching `--list` order; default 1)
+
+**Roman MAST filter flags** (MAST mode only; any combination):
+- `--program N` -- APT program ID
+- `--pass N` -- pass within program
+- `--execution-plan N` -- execution plan within program
+- `--segment N`, `--observation N`, `--visit N` -- further decomposition
+- `--detector NAME` -- e.g. WFI04
+- `--optical-element ELEM` -- e.g. F106, F129
+- `--data-level {1,2}` -- 1=uncal, 2=cal (default 2)
+- `--sca N` -- SCA number (1-18); **required** for MAST mode
 
 **Photometry CLI flags:**
 - `--phot` -- enable photometry (errors if roman-lolo not installed)
 - `--fwhm N` -- source FWHM in pixels (default 1.5)
-- `--det-sigma N` -- DAOStarFinder detection threshold σ (default 5.0)
+- `--det-sigma N` -- DAOStarFinder detection threshold σ (default 10.0)
 - `--aper N` -- aperture radius as multiple of FWHM (default 2.5)
 - `--annulus-inner N` -- inner annulus as multiple of FWHM (default 6.0)
 - `--annulus-outer N` -- outer annulus as multiple of FWHM (default 8.0)
 - `--bkg-poly-degree N` -- 2D polynomial degree (default 3; use 2 for faster fit)
+- `--snr-threshold N` -- minimum SNR to report (default 5.0)
 - `--phot-out PATH` -- write photometry table to CSV
+
+**Display options** (both modes):
+- `--display {ds9,mpl}` -- default `ds9`
+- `--channels` / `--grid` -- both off by default; opt-in
+- `--no-dq` -- skip DQ overlay
+- `--sip-degree N` -- SIP polynomial degree (default 4; lower for faster WCS)
+- `--scale SCALE` -- DS9 scale algorithm (default zscale; DS9 only)
+- `--cmap CMAP` -- DS9 colourmap (default viridis; DS9 only)
+- `--ds9 TARGET` -- XPA target name of a running DS9 instance (DS9 only)
 
 **Display modes:**
 
@@ -258,14 +314,9 @@ Matplotlib: creates axes with WCS projection so ticks show RA/Dec. DQ overlaid a
 
 **H4RG focal-plane rotation:** `_SCA_ROTATION = {n: (0 if n % 3 == 0 else 180) for n in range(1, 19)}` -- SCAs 3, 6, 9, 12, 15, 18 are r=0; all others r=180. Detector string read from `dm.meta.instrument.detector` (always 'WFI01'..'WFI18').
 
-**Display-only CLI flags:**
-- `--display {ds9,mpl}` -- default `ds9`
-- `--channels` / `--grid` -- both off by default; opt-in
-- `--no-dq` -- skip DQ overlay
-- `--sip-degree N` -- default 4; lower for faster WCS
-- `--scale`, `--cmap`, `--ds9 TARGET` -- DS9 only
-
 **DQ handling:** Kept as full int32 throughout (not binarized). Hover readout shows the actual integer so users can inspect which flags are set.
+
+**MAST mode streaming notes:** Uses the authenticated `MastMissions` session from `roman_mast.list_data()` and closes the AsdfFile immediately after materializing arrays, avoiding the 60-second pre-signed URL expiry trap. Backward compatible with direct S3/local URIs—omit all `--program`/`--pass`/etc. filters to use S3 mode.
 
 ## What's deliberately deferred
 
