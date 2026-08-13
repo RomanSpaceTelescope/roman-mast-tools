@@ -47,13 +47,8 @@ from astropy.io import fits
 from astropy.stats import sigma_clipped_stats
 from astropy.wcs import WCS
 
-# Temporarily disabled — roman_lolo.romanphot hangs on import
-# try:
-#     from roman_lolo.romanphot import SourcePhotometry
-#     _PHOT_AVAILABLE = True
-# except ImportError:
-#     _PHOT_AVAILABLE = False
-_PHOT_AVAILABLE = False
+# Lazy import — roman_lolo.romanphot hangs if imported at module level
+_PHOT_AVAILABLE = True
 
 # ---------------------------------------------------------------------------
 # Focal-plane rotation table (from MPA_SCA_info).
@@ -252,7 +247,9 @@ def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=20.0
     stats : dict
         Background statistics: 'bkg_level', 'bkg_rms', 'threshold', 'n_sources'
     """
-    if not _PHOT_AVAILABLE:
+    try:
+        from roman_lolo.romanphot import SourcePhotometry
+    except ImportError:
         raise ImportError('roman-lolo not installed; install with: pip install -e .')
 
     mask = (dq != 0) if dq is not None else np.zeros_like(data, dtype=bool)
