@@ -27,7 +27,8 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
-from astropy.table import vstack
+import matplotlib.pyplot as plt
+from astropy.table import vstack, Table
 
 from roman_view_sca import stream_sca, run_aperture_photometry, parse_filename
 
@@ -142,10 +143,124 @@ def load_uri_file(path):
 # Summary table builder
 # ---------------------------------------------------------------------------
 
+def reject_outliers(data, method='iqr', iqr_mult=1.5):
+    """Reject outliers using IQR or sigma clipping."""
+    if method == 'iqr':
+        q1 = np.percentile(data, 25)
+        q3 = np.percentile(data, 75)
+        iqr = q3 - q1
+        lower = q1 - iqr_mult * iqr
+        upper = q3 + iqr_mult * iqr
+        mask = (data >= lower) & (data <= upper)
+    else:
+        raise ValueError(f'Unknown outlier method: {method}')
+
+    n_rejected = len(data) - np.sum(mask)
+    return data[mask], n_rejected
+
+
+def make_histograms_from_csv(csv_path, output_path, columns=None, bins=30, outlier_method='iqr'):
+    """Generate histograms from a photometry CSV file.
+
+    Parameters
+    ----------
+    csv_path : str
+        Path to input CSV
+    output_path : str
+        Path to save output image
+    columns : list of str, optional
+        Columns to histogram (default: aperture_sum_0, snr)
+    bins : int
+        Number of bins
+    outlier_method : str
+        Outlier rejection method ('iqr' or 'none')
+    """
+    if columns is None:
+        columns = ['aperture_sum_0', 'snr']
+
+    try:
+        table = Table.read(csv_path, format='ascii.csv')
+    except Exception as exc:
+        print(f'[roman_phot] WARNING: failed to read {csv_path} for histograms: {exc}',
+              file=sys.stderr)
+        return
+
+    # Validate columns exist
+    missing = [c for c in columns if c not in table.colnames]
+    if missing:
+        print(f'[roman_phot] WARNING: histogram columns not found: {missing}',
+              file=sys.stderr)
+        return
+
+    n_cols = len(columns)
+    n_rows = (n_cols + 1) // 2
+    fig, axes = plt.subplots(n_rows, 2, figsize=(12, 4 * n_rows))
+    if n_cols == 1:
+        axes = np.array([[axes, axes]])
+    elif n_rows == 1:
+        axes = axes.reshape(1, -1)
+
+    axes_flat = axes.flatten()
+
+    for idx, colname in enumerate(columns):
+        ax = axes_flat[idx]
+        data = table[colname]
+
+        # Filter non-finite
+        valid_data = data[np.isfinite(data)]
+        if len(valid_data) == 0:
+            ax.text(0.5, 0.5, f'No valid data in {colname}',
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(colname)
+            continue
+
+        # Reject outliers
+        plot_data = valid_data
+        n_rejected = 0
+        if outlier_method == 'iqr':
+            plot_data, n_rejected = reject_outliers(valid_data, method='iqr')
+
+        if len(plot_data) == 0:
+            ax.text(0.5, 0.5, f'No data left after outlier rejection',
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(colname)
+            continue
+
+        ax.hist(plot_data, bins=bins, edgecolor='black', alpha=0.7)
+        ax.set_xlabel(colname)
+        ax.set_ylabel('Count')
+        title_str = f'{colname} (n={len(plot_data)}'
+        if n_rejected > 0:
+            title_str += f', {n_rejected} outliers)'
+        else:
+            title_str += ')'
+        ax.set_title(title_str)
+        ax.grid(True, alpha=0.3)
+
+        # Stats overlay
+        stats_text = f'μ={np.mean(plot_data):.3g}\nσ={np.std(plot_data):.3g}\nmed={np.median(plot_data):.3g}'
+        ax.text(0.98, 0.97, stats_text, transform=ax.transAxes,
+               fontsize=9, verticalalignment='top', horizontalalignment='right',
+               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    # Hide extra
+    for idx in range(len(columns), len(axes_flat)):
+        axes_flat[idx].axis('off')
+
+    fig.suptitle(f'Histograms: {", ".join(columns)}', fontsize=14, fontweight='bold')
+    fig.tight_layout()
+
+    try:
+        fig.savefig(output_path, dpi=150, bbox_inches='tight')
+        print(f'[roman_phot] histograms -> {output_path}', file=sys.stderr)
+    except Exception as exc:
+        print(f'[roman_phot] WARNING: failed to save histograms: {exc}', file=sys.stderr)
+    finally:
+        plt.close(fig)
+
+
 def build_summary(results):
     """Build an astropy Table with one row per SCA."""
-    from astropy.table import Table
-
     rows = []
     for r in results:
         sca = r['sca']
@@ -225,6 +340,10 @@ def main():
                     help='2D polynomial background degree (default: 3)')
     ap.add_argument('--snr-threshold', type=float, default=5.0,  metavar='N',
                     help='Minimum SNR to keep a source (default: 5.0)')
+    ap.add_argument('--no-hist', action='store_true',
+                    help='Skip histogram generation at the end')
+    ap.add_argument('--hist-output', metavar='PATH',
+                    help='Histogram output path (default: roman_phot_histograms.png)')
 
     args = ap.parse_args()
 
@@ -272,6 +391,11 @@ def main():
     if len(summary) > 0:
         summary.write(args.summary_out, format='ascii.csv', overwrite=True)
         print(f'[roman_phot] summary ({len(summary)} SCAs) -> {args.summary_out}', file=sys.stderr)
+
+    # Generate histograms
+    if not args.no_hist and tables:
+        hist_output = args.hist_output or 'roman_phot_histograms.png'
+        make_histograms_from_csv(args.out, hist_output, columns=['aperture_sum_0', 'snr'])
 
 
 if __name__ == '__main__':
