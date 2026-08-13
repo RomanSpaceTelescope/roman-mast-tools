@@ -1,0 +1,3 @@
+# Roman WFI tutorial exposure r0003201001001001004 exp 0001 F106 cal — all 18 SCAs
+# s3://stpubdata (anonymous public)
+/Users/mrizzo/Library/CloudStorage/Box-Box/WFI/Data_Analysis/roman-mast-tools/cache/r0003201001001001004_0001_wfi11_f106_cal.asdf

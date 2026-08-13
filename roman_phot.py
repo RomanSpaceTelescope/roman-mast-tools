@@ -44,27 +44,28 @@ _ROMAN_PIXEL_SCALE_MM = 0.01      # mm per pixel (focal-plane scale)
 _ROMAN_SCA_FULL_SIZE  = 4096      # full detector size before reference-pixel removal
 _ROMAN_REF_PIX        = 4         # reference pixels removed from each edge
 
-# Focal-plane layout: SCA number → (x_center_arcmin, y_center_arcmin, rotation_deg)
-# Rotation 180° means the SCA is flipped relative to the focal-plane axes.
+# Focal-plane layout: SCA number → (x_center_mm, y_center_mm, rotation_deg)
+# Coordinates are focal-plane mm; rotation 180° means the SCA is flipped
+# relative to the focal-plane axes.  Source: MPA_SCA_info ECSV (width=40.88 mm).
 _WFI_SCA_LAYOUT = {
-     1: ( -22.14,  12.15, 180.0),
-     2: ( -22.29, -37.03, 180.0),
-     3: ( -22.44, -82.06,   0.0),
-     4: ( -68.30,  21.84, 180.0),  # left 1.88 total, up 0.94
-     5: ( -67.86, -28.28, 180.0),  # left 0.94
-     6: ( -68.36, -73.06,   0.0),  # left 0.94
-     7: (-112.58,  43.14, 180.0),  # left 1.88 total, up 0.94
-     8: (-113.36,  -6.04, 180.0),  # left 1.88 total, up 0.94
-     9: (-114.52, -50.12,   0.0),  # left 1.88 total
-    10: (  22.14,  12.15, 180.0),
-    11: (  22.29, -37.03, 180.0),
-    12: (  22.44, -82.06,   0.0),
-    13: (  66.42,  21.84, 180.0),  # right 0.94, up 0.94
-    14: (  66.92, -28.28, 180.0),
-    15: (  67.42, -73.06,   0.0),
-    16: ( 110.70,  43.14, 180.0),  # right 0.94, up 0.94
-    17: ( 111.48,  -6.98, 180.0),
-    18: ( 112.64, -51.06,   0.0),
+     1: (  -22.14,   12.15, 180.0),
+     2: (  -22.29,  -37.03, 180.0),
+     3: (  -22.44,  -82.06,   0.0),
+     4: (  -66.42,   20.90, 180.0),
+     5: (  -66.92,  -28.28, 180.0),
+     6: (  -67.42,  -73.06,   0.0),
+     7: ( -110.70,   42.20, 180.0),
+     8: ( -111.48,   -6.98, 180.0),
+     9: ( -112.64,  -51.06,   0.0),
+    10: (   22.14,   12.15, 180.0),
+    11: (   22.29,  -37.03, 180.0),
+    12: (   22.44,  -82.06,   0.0),
+    13: (   66.42,   20.90, 180.0),
+    14: (   66.92,  -28.28, 180.0),
+    15: (   67.42,  -73.06,   0.0),
+    16: (  110.70,   42.20, 180.0),
+    17: (  111.48,   -6.98, 180.0),
+    18: (  112.64,  -51.06,   0.0),
 }
 
 
@@ -251,11 +252,12 @@ def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
         Percentile bounds for the symmetric colour stretch.
     """
     import matplotlib.pyplot as plt
+    import matplotlib.cm as cm
+    import matplotlib.colors as mcolors
+    from matplotlib.patches import Rectangle
 
-    # Scale: focal-plane mm → canvas superpixels
-    # 1 superpixel = superpixel * _ROMAN_PIXEL_SCALE_MM mm
-    sp_mm = superpixel * _ROMAN_PIXEL_SCALE_MM   # mm per superpixel (5.12 mm for 512 px)
-    scale = 1.0 / sp_mm                          # superpixels per mm
+    # Physical size of one superpixel in focal-plane mm
+    sp_mm = superpixel * _ROMAN_PIXEL_SCALE_MM   # e.g. 512 × 0.01 = 5.12 mm
 
     # Infer tile shape from available maps
     tile_shapes = [v.shape for v in sca_maps.values() if v is not None]
@@ -264,74 +266,78 @@ def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
         return
     tile_h, tile_w = tile_shapes[0]
 
-    # Canvas bounds in arcminutes (with half-tile padding)
-    coords = list(_WFI_SCA_LAYOUT.values())
-    all_cx, all_cy = zip(*[(cx, cy) for cx, cy, _ in coords])
-    half_w = (tile_w / scale) / 2
-    half_h = (tile_h / scale) / 2
-    x_min = min(all_cx) - half_w
-    x_max = max(all_cx) + half_w
-    y_min = min(all_cy) - half_h
-    y_max = max(all_cy) + half_h
+    # Physical half-size of one SCA tile in mm
+    half_w_mm = tile_w * sp_mm / 2
+    half_h_mm = tile_h * sp_mm / 2
 
-    canvas_w = int(np.ceil((x_max - x_min) * scale)) + 2
-    canvas_h = int(np.ceil((y_max - y_min) * scale)) + 2
-    canvas = np.full((canvas_h, canvas_w), np.nan)
+    # Axes limits in focal-plane mm (y+ = up, matching sky orientation)
+    all_cx = [cx for cx, _, _ in _WFI_SCA_LAYOUT.values()]
+    all_cy = [cy for _, cy, _ in _WFI_SCA_LAYOUT.values()]
+    pad = 5.0   # mm padding around outermost SCAs
+    x_lo = min(all_cx) - half_w_mm - pad
+    x_hi = max(all_cx) + half_w_mm + pad
+    y_lo = min(all_cy) - half_h_mm - pad
+    y_hi = max(all_cy) + half_h_mm + pad
 
-    for sca_num, (cx_am, cy_am, rot) in _WFI_SCA_LAYOUT.items():
-        tile = sca_maps.get(sca_num)
-        if tile is None:
-            continue
-
-        if rot == 180.0:
-            tile = np.rot90(tile, 2)
-
-        # Convert centre from arcmin to canvas pixel (y flipped: sky up → image down)
-        cx_px = (cx_am - x_min) * scale
-        cy_px = (y_max - cy_am) * scale
-
-        # Position tile so its center is at (cx_px, cy_px). Keep float precision
-        # until placement to avoid accumulating rounding errors.
-        col0_float = cx_px - tile_w / 2
-        row0_float = cy_px - tile_h / 2
-        col0 = int(np.floor(col0_float))
-        row0 = int(np.floor(row0_float))
-        col1 = col0 + tile_w
-        row1 = row0 + tile_h
-
-        # Clip to canvas
-        r0 = max(row0, 0); r1 = min(row1, canvas_h)
-        c0 = max(col0, 0); c1 = min(col1, canvas_w)
-        tr0 = r0 - row0; tc0 = c0 - col0
-        canvas[r0:r1, c0:c1] = tile[tr0:tr0 + (r1 - r0), tc0:tc0 + (c1 - c0)]
-
-    # Colour stretch: symmetric around zero (diverging)
-    finite = canvas[np.isfinite(canvas)]
-    if len(finite) == 0:
+    # Colour stretch: symmetric around zero (diverging), from all available tiles
+    all_vals = np.concatenate([v.ravel() for v in sca_maps.values()
+                                if v is not None and np.any(np.isfinite(v))])
+    all_vals = all_vals[np.isfinite(all_vals)]
+    if len(all_vals) == 0:
         print(f'[roman_phot] WARNING: background mosaic is entirely NaN; skipping PNG', file=sys.stderr)
         return
-    abs_lim = max(abs(np.percentile(finite, pct_lo)), abs(np.percentile(finite, pct_hi)))
-    vmin, vmax = -abs_lim, abs_lim
+    abs_lim = max(abs(np.percentile(all_vals, pct_lo)), abs(np.percentile(all_vals, pct_hi)))
+    norm = mcolors.Normalize(vmin=-abs_lim, vmax=abs_lim)
 
-    fig, ax = plt.subplots(figsize=(14, 8), facecolor='#1a1a1a')
+    aspect = (x_hi - x_lo) / (y_hi - y_lo)
+    fig_w = 12.0
+    fig_h = fig_w / aspect
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor='#1a1a1a')
     ax.set_facecolor('#1a1a1a')
+    ax.set_xlim(x_lo, x_hi)
+    ax.set_ylim(y_lo, y_hi)
+    ax.set_aspect('equal')
 
-    im = ax.imshow(
-        canvas, origin='upper', cmap='RdBu_r',
-        vmin=vmin, vmax=vmax, interpolation='nearest',
-    )
-    cbar = fig.colorbar(im, ax=ax, fraction=0.02, pad=0.02)
+    # Draw each SCA tile as its own imshow in mm coordinates — no integer
+    # rounding, so physical spacing between SCAs is preserved exactly.
+    for sca_num, (cx_mm, cy_mm, rot) in _WFI_SCA_LAYOUT.items():
+        tile = sca_maps.get(sca_num)
+        has_data = tile is not None
+
+        x0 = cx_mm - half_w_mm
+        x1 = cx_mm + half_w_mm
+        y0 = cy_mm - half_h_mm
+        y1 = cy_mm + half_h_mm
+
+        if has_data:
+            if rot == 180.0:
+                tile = np.rot90(tile, 2)
+            # extent=[left, right, bottom, top]; origin='upper' maps row 0 to top
+            ax.imshow(
+                tile, extent=[x0, x1, y0, y1],
+                origin='upper', cmap='RdBu_r', norm=norm,
+                interpolation='nearest', aspect='auto',
+            )
+
+        rect = Rectangle(
+            (x0, y0), x1 - x0, y1 - y0,
+            linewidth=0.6,
+            edgecolor='white' if has_data else '#555555',
+            facecolor='none',
+            alpha=0.8 if has_data else 0.4,
+        )
+        ax.add_patch(rect)
+        ax.text(cx_mm, cy_mm, f'{sca_num:02d}',
+                ha='center', va='center', fontsize=7,
+                color='white' if has_data else '#777777',
+                alpha=0.8 if has_data else 0.4,
+                fontweight='bold')
+
+    sm = cm.ScalarMappable(norm=norm, cmap='RdBu_r')
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.02, pad=0.02)
     cbar.set_label('Background residual (DN/s)', color='white', fontsize=10)
     cbar.ax.yaxis.set_tick_params(color='white')
     plt.setp(cbar.ax.yaxis.get_ticklabels(), color='white')
-
-    # Label each SCA
-    for sca_num, (cx_am, cy_am, _) in _WFI_SCA_LAYOUT.items():
-        cx_px = (cx_am - x_min) * scale
-        cy_px = (y_max - cy_am) * scale
-        ax.text(cx_px, cy_px, f'{sca_num:02d}',
-                ha='center', va='center', fontsize=7,
-                color='white', alpha=0.6, fontweight='bold')
 
     ax.set_title(title or 'Roman WFI — source-masked background mosaic',
                  color='white', fontsize=12, pad=10)

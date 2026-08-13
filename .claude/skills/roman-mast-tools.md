@@ -14,7 +14,8 @@ The user rewrote the stack **from scratch** on top of three clean modules plus o
 - **`roman_mast.py`** — foundation. Search, filter, filename synthesis, exposure grouping, streaming. No dependency on `astropy.io.fits` or `pyds9`.
 - **`roman_fits.py`** — output layer. Streams into local FITS files or into a running DS9 as a WCS mosaic. Imports from `roman_mast` and lazily from `roman_metadata`.
 - **`roman_metadata.py`** — metadata layer. Flattens datamodel `meta` trees to CSV; own CLI for bulk export. Imports `stream_materialized` from `roman_fits`. Public surface: `flatten_metadata`, `extract_row`, `extract_rows`, `write_csv`, `write_metadata_csv`, `export_csv`.
-- **`roman_view_sca.py`** — single-SCA viewer CLI. Streams one ASDF file from anonymous S3, displays in DS9 or matplotlib with H4RG channel grid and DQ overlay. See dedicated section below.
+- **`roman_view_sca.py`** — single-SCA viewer CLI. Streams one ASDF file from anonymous S3, displays in DS9 or matplotlib with H4RG channel grid and DQ overlay. Optionally fits + subtracts a 2D polynomial background and plots full-scale residuals. See dedicated section below.
+- **`roman_phot.py`** — exposure-level aperture photometry. Fans out over all 18 SCAs in parallel via `ThreadPoolExecutor`. Writes per-SCA and combined source CSV, per-SCA summary CSV, optional background mosaic PNG. Imports `stream_sca`, `run_aperture_photometry`, `parse_filename` from `roman_view_sca`. See dedicated section below.
 
 If you extend metadata extraction, edit `roman_metadata.py`. Do NOT copy its helpers elsewhere.
 
@@ -213,23 +214,26 @@ Photometry remains optional: if `roman-lolo` is not installed, the script works 
 
 - `stream_sca(uri, filename=None, *, asdf_file=None, sip_degree=4)` -- opens an ASDF file from either an open AsdfFile (from MAST), S3 URI, or local path. Materializes `data` (float32) and `dq` (int32), computes SIP WCS while the ASDF tree is live. Returns `(data, detector, wcs_hdr, dq)`.
 - `make_channel_regions(data, detector, *, show_channels=False, show_gridlines=False)` -- builds a DS9 region string for the 32 H4RG readout channel dividers and 8-section major grid.
-- `run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=5.0, aperture_radius_fwhm=2.5, annulus_inner_fwhm=6.0, annulus_outer_fwhm=8.0, bkg_poly_degree=3)` -- background subtraction via 2D polynomial fit, source detection via DAOStarFinder, aperture photometry. Bad pixels (`dq != 0`) are masked during background fitting. Returns `(sources, phot_table, sp)`.
+- `fit_background(data, dq=None, poly_degree=3)` -- fits a 2D polynomial background. Bad pixels masked via `dq`. Downsamples 4× for speed. Returns `(bkg_fit, data_sub, mask, bkg_level, residual_rms)`. This is the canonical background-fitting primitive; both `run_aperture_photometry` and the standalone `--bkg` CLI path call it.
+- `run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=20.0, aperture_radius_fwhm=2.5, annulus_inner_fwhm=6.0, annulus_outer_fwhm=8.0, bkg_poly_degree=3, snr_threshold=5.0)` -- calls `fit_background`, then source detection via DAOStarFinder, aperture photometry, SNR filtering. Returns `(sources, phot_table, sp, stats)`. The `stats` dict contains: `bkg_level`, `bkg_rms`, `threshold`, `n_sources`, `bkg_fit` (the model surface), `data_sub` (residuals array), `poly_degree`.
 - `phot_to_region_str(sources, phot_table, sp)` -- generates a DS9 region string with SNR-colour-coded apertures (green ≥50, cyan ≥20, yellow ≥10, magenta ≥5, red <5) and dashed background annuli. No text labels—details are in the CSV output.
-- `display_in_ds9(...)` / `display_in_mpl(...)` -- send to the respective backend, optionally overlaying photometry apertures.
+- `display_in_ds9(..., data_sub=None)` -- sends science image to DS9 frame 1. When `data_sub` is provided (via `--bkg`), pushes the residuals to frame 2 (bb colourmap, zscale) for blinking.
+- `display_in_mpl(...)` -- matplotlib backend with WCSAxes projection, DQ overlay, photometry apertures, background stats text box.
+- `display_residuals_mpl(data_sub, detector, *, bkg_fit=None, bkg_level, residual_rms, poly_degree, dq=None, n_sigma=5.0)` -- two-panel diagnostic figure. Left: polynomial background model (viridis, full range). Right: `data_sub` with RdBu_r diverging colormap at ±`n_sigma`×RMS. DQ overlay optional. Called automatically when `--bkg` is active and display is `mpl`.
 
 **Photometry background subtraction:**
 
-Uses 2D polynomial fitting to avoid redundant background estimation:
+The `fit_background` function is the shared primitive (called by both `run_aperture_photometry` and the standalone `--bkg` path):
 
-1. Create mask from `dq` layer (`dq != 0`)
-2. Downsample by 4x4 for speed; extract unmasked pixels on the coarse grid
-3. Fit `Polynomial2D(degree=bkg_poly_degree)` (default 3) to those pixels using Levenberg-Marquardt
-4. Evaluate polynomial on full image grid
-5. Subtract to get residuals
-6. Estimate RMS as `np.std()` of residuals in unmasked regions
-7. Pass scalar RMS to DAOStarFinder (threshold = `detection_sigma * rms`)
+1. Create bad-pixel mask from `dq` layer (`dq != 0`)
+2. Downsample by 4× for speed; extract unmasked pixels on the coarse grid
+3. Fit `Polynomial2D(degree=bkg_poly_degree)` (default 3) using `LinearLSQFitter`
+4. Evaluate polynomial on full image grid → `bkg_fit`
+5. Subtract → `data_sub = data - bkg_fit`
+6. Sigma-clipped RMS (sigma=5.0) of `data_sub` over unmasked finite pixels → `residual_rms`
+7. `run_aperture_photometry` passes `residual_rms` as the DAOStarFinder threshold scale (`detection_sigma × rms`)
 
-This avoids the old Background2D stack, which produced spurious detections from background-on-background estimation. Result: ~2,300 high-confidence sources per SCA instead of ~24,000 false positives.
+This avoids the old Background2D stack, which produced spurious detections. Result: ~2,300 high-confidence sources per SCA instead of ~24,000 false positives.
 
 **Photometry output:**
 
@@ -286,14 +290,18 @@ python roman_view_sca.py /cache/path/ r0003...asdf
 - `--data-level {1,2}` -- 1=uncal, 2=cal (default 2)
 - `--sca N` -- SCA number (1-18); **required** for MAST mode
 
+**Background subtraction CLI flags:**
+- `--bkg` -- fit and subtract 2D polynomial background; show two-panel residuals figure (model + residuals). Works standalone or combined with `--phot` (shares the same polynomial fit — no double-fitting).
+- `--bkg-scale N` -- residuals plot colour stretch in units of sigma-clipped RMS (default 5.0). Symmetric around zero; most sky pixels fall within ±5σ, sources are clipped.
+- `--bkg-poly-degree N` -- 2D polynomial degree (default 3; applies to both `--bkg` and `--phot`)
+
 **Photometry CLI flags:**
-- `--phot` -- enable photometry (errors if roman-lolo not installed)
+- `--phot` -- enable aperture photometry (errors if roman-lolo not installed)
 - `--fwhm N` -- source FWHM in pixels (default 1.5)
 - `--det-sigma N` -- DAOStarFinder detection threshold σ (default 10.0)
 - `--aper N` -- aperture radius as multiple of FWHM (default 2.5)
 - `--annulus-inner N` -- inner annulus as multiple of FWHM (default 6.0)
 - `--annulus-outer N` -- outer annulus as multiple of FWHM (default 8.0)
-- `--bkg-poly-degree N` -- 2D polynomial degree (default 3; use 2 for faster fit)
 - `--snr-threshold N` -- minimum SNR to report (default 5.0)
 - `--phot-out PATH` -- write photometry table to CSV
 
@@ -317,6 +325,29 @@ Matplotlib: creates axes with WCS projection so ticks show RA/Dec. DQ overlaid a
 **DQ handling:** Kept as full int32 throughout (not binarized). Hover readout shows the actual integer so users can inspect which flags are set.
 
 **MAST mode streaming notes:** Uses the authenticated `MastMissions` session from `roman_mast.list_data()` and closes the AsdfFile immediately after materializing arrays, avoiding the 60-second pre-signed URL expiry trap. Backward compatible with direct S3/local URIs—omit all `--program`/`--pass`/etc. filters to use S3 mode.
+
+## `roman_phot.py` — exposure-wide aperture photometry
+
+Fans out `run_aperture_photometry` over all SCAs of an exposure in parallel. Input is a plain-text file of S3 URIs (one full path per line, blank/`#` lines ignored).
+
+**Key functions:**
+
+- `phot_one_sca(uri, filename, *, phot_kwargs, bkg_kwargs=None, _SourcePhotometry=None)` -- stream one SCA, run photometry, optionally compute background map. Returns a dict: `{sca, detector, table, stats, sp, bkg_map}`.
+- `background_map_one_sca(data, dq, *, superpixel=512, mask_sigma=1.5, dilate_radius=20, bkg_poly_degree=3, data_sub=None)` -- source-masked superpixel background map. If `data_sub` is supplied (from `stats['data_sub']`), skips the polynomial refit. Source mask built via `photutils.segmentation.detect_sources` + `scipy.ndimage.binary_dilation`.
+- `phot_exposure(uri_filename_pairs, *, phot_kwargs, bkg_kwargs, max_workers=8)` -- parallel fan-out. Loads `roman_lolo.SourcePhotometry` once and shares it across workers. Returns sorted-by-SCA list of result dicts.
+- `build_summary(results)` -- per-SCA summary Table (bkg stats + SNR range + aperture params).
+- `make_bkg_mosaic_png(sca_maps, out_path, ...)` -- renders the 18-SCA background residual map in focal-plane mm coordinates (from `_WFI_SCA_LAYOUT`). Diverging RdBu_r colormap, dark background, SCA labels.
+
+**CLI usage:**
+```bash
+python roman_phot.py --uri-file my_exposure.txt
+python roman_phot.py --uri-file my_exposure.txt \
+    --out sources.csv --summary-out summary.csv \
+    --fwhm 1.5 --det-sigma 10 --snr-threshold 5
+python roman_phot.py --uri-file my_exposure.txt --bkg-mosaic
+```
+
+**Focal-plane layout:** `_WFI_SCA_LAYOUT = {sca: (x_mm, y_mm, rot_deg)}` — 18-SCA focal-plane positions in mm. `rot_deg=180` means the SCA is flipped relative to focal-plane axes (same convention as `_SCA_ROTATION` in `roman_view_sca`). Used for the background mosaic PNG.
 
 ## What's deliberately deferred
 
@@ -345,9 +376,11 @@ roman-mast-tools/
 |-- roman_mast.py           <- foundation. Auth, filters, list_data, exposures, sequential streaming.
 |-- roman_fits.py           <- output layer. stream_materialized, to_fits_files, to_ds9, CLI.
 |-- roman_metadata.py       <- metadata layer. flatten_metadata, extract_row(s), write_csv.
-|-- roman_view_sca.py       <- single-SCA viewer. stream_sca, make_channel_regions,
-|                              run_aperture_photometry, phot_to_region_str,
-|                              display_in_ds9, display_in_mpl. DS9 + matplotlib backends.
+|-- roman_view_sca.py       <- single-SCA viewer. fit_background, run_aperture_photometry,
+|                              stream_sca, make_channel_regions, phot_to_region_str,
+|                              display_in_ds9, display_in_mpl, display_residuals_mpl.
+|-- roman_phot.py           <- exposure-wide photometry. phot_one_sca, phot_exposure,
+|                              background_map_one_sca, make_bkg_mosaic_png, build_summary.
 |-- .claude/skills/roman-mast-tools.md   <- this file (also mirrored to ~/.claude/skills/)
 |
 |-- notebooks/

@@ -33,6 +33,16 @@ Usage
 
     # Connect to a named DS9 instance:
     python roman_view_sca.py --program 114 --pass 57 --sca 1 --ds9 myds9
+
+    # Background subtraction only (no photometry) — shows model + residuals figure:
+    python roman_view_sca.py --display mpl --bkg \\
+        s3://stpubdata/roman/nexus/soc_simulations/tutorial_data/roman-2026.2/ \\
+        r0003201001001001004_0001_wfi11_f106_cal.asdf
+
+    # Background + photometry together (shares the same polynomial fit):
+    python roman_view_sca.py --display mpl --bkg --phot \\
+        s3://stpubdata/roman/nexus/soc_simulations/tutorial_data/roman-2026.2/ \\
+        r0003201001001001004_0001_wfi11_f106_cal.asdf
 """
 
 import argparse
@@ -225,6 +235,68 @@ def make_channel_regions(data, detector, *, show_channels=False, show_gridlines=
 
 
 # ---------------------------------------------------------------------------
+# Background fitting
+# ---------------------------------------------------------------------------
+
+def fit_background(data, dq=None, poly_degree=3):
+    """Fit a 2D polynomial background to *data*, ignoring bad pixels.
+
+    Parameters
+    ----------
+    data : ndarray (ny, nx), float32
+    dq : ndarray of int, optional
+        Bad-pixel mask; pixels where dq != 0 are excluded from the fit.
+    poly_degree : int
+        Degree of the 2D polynomial (default 3).
+
+    Returns
+    -------
+    bkg_fit : ndarray, same shape as data
+        Evaluated polynomial surface.
+    data_sub : ndarray, same shape as data
+        data − bkg_fit.
+    mask : ndarray of bool
+        True where dq != 0 (pixels excluded from the fit).
+    bkg_level : float
+        Mean of bkg_fit over unmasked pixels.
+    residual_rms : float
+        Sigma-clipped RMS of data_sub over unmasked pixels.
+    """
+    from astropy.modeling import models, fitting
+
+    ny, nx = data.shape
+    mask = (dq != 0) if dq is not None else np.zeros(data.shape, dtype=bool)
+
+    poly_init = models.Polynomial2D(degree=poly_degree)
+    fitter = fitting.LinearLSQFitter()
+
+    ds = 4
+    y_ds, x_ds = np.mgrid[0:ny:ds, 0:nx:ds]
+    data_ds = data[::ds, ::ds]
+    mask_ds = mask[::ds, ::ds]
+    valid = ~mask_ds
+
+    print(f'[view_sca] fitting degree-{poly_degree} 2D polynomial background '
+          f'({int(np.sum(valid))} points at 1/{ds} resolution) ...', file=sys.stderr)
+    if np.any(valid):
+        poly = fitter(poly_init, x_ds[valid], y_ds[valid], data_ds[valid])
+        y_full, x_full = np.mgrid[:ny, :nx]
+        bkg_fit = poly(x_full, y_full).astype(np.float32)
+    else:
+        bkg_fit = np.zeros(data.shape, dtype=np.float32)
+
+    data_sub = data - bkg_fit
+
+    sky_mask = np.isfinite(data_sub) & ~mask
+    flat = data_sub[sky_mask] if sky_mask.any() else data_sub[np.isfinite(data_sub)]
+    _, _, residual_rms = sigma_clipped_stats(flat, sigma=5.0)
+    bkg_level = float(np.mean(bkg_fit[~mask]) if np.any(~mask) else np.mean(bkg_fit))
+
+    print(f'[view_sca] background level={bkg_level:.4g}  RMS={residual_rms:.4g}', file=sys.stderr)
+    return bkg_fit, data_sub, mask, bkg_level, residual_rms
+
+
+# ---------------------------------------------------------------------------
 # Aperture photometry
 # ---------------------------------------------------------------------------
 
@@ -255,41 +327,13 @@ def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=20.0
         except ImportError:
             raise ImportError('roman-lolo not installed; install with: pip install -e .')
 
-    mask = (dq != 0) if dq is not None else np.zeros_like(data, dtype=bool)
     ny, nx = data.shape
+    bkg_fit, data_sub, mask, bkg_level, residual_rms = fit_background(
+        data, dq=dq, poly_degree=bkg_poly_degree,
+    )
     n_masked = int(np.sum(mask))
     print(f'[phot] image {ny}x{nx}  masked pixels: {n_masked} ({100*n_masked/mask.size:.1f}%)',
           file=sys.stderr)
-
-    # Fit 2D polynomial background to unmasked pixels (downsampled for speed)
-    from astropy.modeling import models, fitting
-    poly_init = models.Polynomial2D(degree=bkg_poly_degree)
-    fitter = fitting.LinearLSQFitter()
-
-    # Downsample by factor of 4 for fitting
-    ds = 4
-    y_ds, x_ds = np.mgrid[0:ny:ds, 0:nx:ds]
-    data_ds = data[::ds, ::ds]
-    mask_ds = mask[::ds, ::ds]
-
-    valid = ~mask_ds
-    print(f'[phot] fitting degree-{bkg_poly_degree} 2D polynomial background '
-          f'({int(np.sum(valid))} points at 1/{ds} resolution) ...', file=sys.stderr)
-    if np.any(valid):
-        poly = fitter(poly_init, x_ds[valid], y_ds[valid], data_ds[valid])
-        y_full, x_full = np.mgrid[:ny, :nx]
-        bkg_fit = poly(x_full, y_full)
-    else:
-        bkg_fit = np.zeros_like(data)
-
-    data_sub = data - bkg_fit
-
-    # Sigma-clipped stats on residuals: rejects source pixels so RMS reflects
-    # true sky noise, not the (much larger) std dominated by bright sources.
-    residuals = data_sub[~mask] if np.any(~mask) else data_sub.ravel()
-    residuals = residuals[np.isfinite(residuals)]
-    _, _, residual_rms = sigma_clipped_stats(residuals, sigma=5.0)
-    bkg_level = float(np.mean(bkg_fit[~mask]) if np.any(~mask) else np.mean(bkg_fit))
     print(f'[phot] background level={bkg_level:.4g}  RMS={residual_rms:.4g}  '
           f'threshold ({detection_sigma}σ)={detection_sigma * residual_rms:.4g}', file=sys.stderr)
 
@@ -313,6 +357,9 @@ def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=20.0
             'bkg_rms': residual_rms,
             'threshold': detection_sigma * residual_rms,
             'n_sources': 0,
+            'bkg_fit': bkg_fit,
+            'data_sub': data_sub,
+            'poly_degree': bkg_poly_degree,
         }
         return None, None, sp, stats
 
@@ -334,7 +381,9 @@ def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=20.0
         'bkg_rms': residual_rms,
         'threshold': detection_sigma * residual_rms,
         'n_sources': n_sources,
+        'bkg_fit': bkg_fit,
         'data_sub': data_sub,
+        'poly_degree': bkg_poly_degree,
     }
     return sources, phot_table, sp, stats
 
@@ -390,7 +439,7 @@ def phot_to_region_str(sources, phot_table, sp):
 
 def display_in_ds9(data, regions, *, title='Roman WFI', wcs_header=None,
                    dq=None, ds9_target=None, scale='zscale', cmap='viridis',
-                   sources=None, phot_table=None, sp=None):
+                   sources=None, phot_table=None, sp=None, data_sub=None):
     """Send a 2-D array to DS9 and apply the region overlay.
 
     Parameters
@@ -456,6 +505,19 @@ def display_in_ds9(data, regions, *, title='Roman WFI', wcs_header=None,
         combined_regions = regions + '\n' + phot_regions
         d.set('regions delete all')
         d.set('regions', combined_regions)
+
+    if data_sub is not None:
+        buf2 = io.BytesIO()
+        hdr2 = wcs_header.copy() if wcs_header is not None else fits.Header()
+        hdr2['OBJECT'] = title + ' [bkg residuals]'
+        fits.PrimaryHDU(data=data_sub, header=hdr2).writeto(buf2)
+        d.set('frame new')
+        d.set('fits', buf2.getvalue())
+        d.set('scale zscale')
+        d.set('cmap bb')
+        d.set('zoom to fit')
+        print('[view_sca_ds9] residuals pushed to frame 2 (blink with frame 1)', file=sys.stderr)
+        d.set('frame first')
 
     print('[view_sca_ds9] done — DS9 is open', file=sys.stderr)
     return d
@@ -609,6 +671,73 @@ def display_in_mpl(data, detector, *, dq=None, title=None, wcs_header=None,
     return fig, ax
 
 
+def display_residuals_mpl(data_sub, detector, *, bkg_fit=None, bkg_level=0.0,
+                           residual_rms=None, poly_degree=None, dq=None,
+                           wcs_header=None, figsize=(14, 6), n_sigma=5.0):
+    """Two-panel diagnostic figure for background subtraction quality.
+
+    Left panel  — polynomial background model (viridis, full range).
+    Right panel — data minus background (RdBu_r, symmetric ±n_sigma × RMS).
+
+    Pass bkg_fit=None to show only the residuals panel.
+    """
+    import matplotlib.pyplot as plt
+    import matplotlib.colors as mcolors
+
+    if residual_rms is None:
+        sky_mask = np.isfinite(data_sub)
+        if dq is not None:
+            sky_mask &= (dq == 0)
+        flat = data_sub[sky_mask]
+        if flat.size == 0:
+            flat = data_sub[np.isfinite(data_sub)].ravel()
+        _, _, residual_rms = sigma_clipped_stats(flat, sigma=5.0)
+
+    half = max(n_sigma * residual_rms, 1e-10)
+    resid_norm = mcolors.Normalize(vmin=-half, vmax=half)
+
+    n_panels = 2 if bkg_fit is not None else 1
+    fig, axes = plt.subplots(1, n_panels, figsize=figsize)
+    if n_panels == 1:
+        axes = [axes]
+
+    if bkg_fit is not None:
+        im0 = axes[0].imshow(bkg_fit, origin='lower', cmap='viridis',
+                             aspect='equal', interpolation='nearest')
+        plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04,
+                     label='Background (DN/s)')
+        deg_str = f'  degree={poly_degree}' if poly_degree is not None else ''
+        axes[0].set_title(f'Background model{deg_str}')
+        axes[0].set_xlabel('X (pixels)')
+        axes[0].set_ylabel('Y (pixels)')
+
+    im1 = axes[-1].imshow(data_sub, origin='lower', cmap='RdBu_r',
+                          norm=resid_norm, aspect='equal', interpolation='nearest')
+    plt.colorbar(im1, ax=axes[-1], fraction=0.046, pad=0.04,
+                 label='Residual (DN/s)')
+    axes[-1].set_title(
+        f'Residuals after background subtraction\n'
+        f'RMS = {residual_rms:.4g} DN/s    '
+        f'level = {bkg_level:.4g} DN/s    '
+        f'stretch = ±{n_sigma:.0f}σ = ±{half:.3g}'
+    )
+    axes[-1].set_xlabel('X (pixels)')
+    if n_panels == 1:
+        axes[-1].set_ylabel('Y (pixels)')
+
+    if dq is not None:
+        dq_overlay = np.where(dq != 0, 1.0, np.nan)
+        for ax in axes:
+            ax.imshow(dq_overlay, origin='lower', cmap='Reds',
+                      alpha=0.35, vmin=0, vmax=1, aspect='equal')
+
+    fig.suptitle(f'Roman WFI {detector} — background subtraction quality',
+                 fontsize=12)
+    plt.tight_layout()
+    plt.show()
+    return fig, axes
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -673,6 +802,15 @@ def main():
     ap.add_argument('--ds9',     default=None, metavar='TARGET',
                     help='XPA target name of a running DS9 (default: any; ds9 only)')
 
+    # Background subtraction options
+    ap.add_argument('--bkg', action='store_true',
+                    help='Fit and subtract a 2D polynomial background; show a two-panel '
+                         'residuals figure (model + residuals). Also usable with --phot '
+                         '(shares the same polynomial fit).')
+    ap.add_argument('--bkg-scale', type=float, default=5.0, metavar='N',
+                    help='Residuals plot colour stretch in units of sigma-clipped RMS '
+                         '(default: 5.0; --bkg only)')
+
     # Photometry options
     ap.add_argument('--phot', action='store_true',
                     help='Enable aperture photometry analysis')
@@ -687,7 +825,7 @@ def main():
     ap.add_argument('--annulus-outer', type=float, default=8.0, metavar='N',
                     help='Outer annulus radius as multiple of FWHM (default: 8.0; photometry only)')
     ap.add_argument('--bkg-poly-degree', type=int, default=3, metavar='N',
-                    help='2D polynomial background fitting degree (default: 3; photometry only)')
+                    help='2D polynomial background fitting degree (default: 3; --bkg and --phot)')
     ap.add_argument('--snr-threshold', type=float, default=5.0, metavar='N',
                     help='Minimum SNR to include a source in output (default: 5.0; photometry only)')
     ap.add_argument('--phot-out', default=None, metavar='PATH',
@@ -772,12 +910,21 @@ def main():
 
     dq_wanted = not args.no_dq
 
-    # Run photometry if requested
+    # Background subtraction (standalone — when --bkg without --phot)
+    bkg_fit = data_sub = bkg_level = bkg_rms = None
+    if args.bkg and not args.phot:
+        bkg_fit, data_sub, _, bkg_level, bkg_rms = fit_background(
+            data,
+            dq=dq if dq_wanted else None,
+            poly_degree=args.bkg_poly_degree,
+        )
+
+    # Run photometry if requested (includes background fitting internally)
     sources, phot_table, sp, stats = None, None, None, None
     if args.phot:
         sources, phot_table, sp, stats = run_aperture_photometry(
             data,
-            dq=dq,
+            dq=dq if dq_wanted else None,
             fwhm_pix=args.fwhm,
             detection_sigma=args.det_sigma,
             aperture_radius_fwhm=args.aper,
@@ -789,6 +936,12 @@ def main():
         if phot_table is not None and args.phot_out:
             phot_table.write(args.phot_out, format='ascii.csv', overwrite=True)
             print(f'[view_sca] Photometry written to {args.phot_out}', file=sys.stderr)
+        # Expose bkg results for residuals display when --bkg --phot
+        if args.bkg and stats is not None:
+            bkg_fit = stats.get('bkg_fit')
+            data_sub = stats.get('data_sub')
+            bkg_level = stats.get('bkg_level', 0.0)
+            bkg_rms = stats.get('bkg_rms')
 
     if args.display == 'mpl':
         display_in_mpl(
@@ -803,6 +956,17 @@ def main():
             sp=sp,
             stats=stats,
         )
+        if args.bkg and data_sub is not None:
+            display_residuals_mpl(
+                data_sub, detector,
+                bkg_fit=bkg_fit,
+                bkg_level=bkg_level or 0.0,
+                residual_rms=bkg_rms,
+                poly_degree=args.bkg_poly_degree,
+                dq=dq if dq_wanted else None,
+                wcs_header=wcs_hdr,
+                n_sigma=args.bkg_scale,
+            )
     else:
         regions = make_channel_regions(
             data, detector,
@@ -820,6 +984,7 @@ def main():
             sources=sources,
             phot_table=phot_table,
             sp=sp,
+            data_sub=data_sub if args.bkg else None,
         )
 
 
