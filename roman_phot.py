@@ -120,7 +120,7 @@ def phot_one_sca(uri, filename, *, phot_kwargs, bkg_kwargs=None, _SourcePhotomet
     bkg_map = None
     if bkg_kwargs is not None:
         try:
-            bkg_map = background_map_one_sca(data, dq, **bkg_kwargs)
+            bkg_map = background_map_one_sca(data, dq, data_sub=stats['data_sub'], **bkg_kwargs)
         except Exception as exc:
             print(f'[roman_phot] WARNING: background map failed for SCA {sca_num}: {exc}',
                   file=sys.stderr)
@@ -140,11 +140,11 @@ def phot_one_sca(uri, filename, *, phot_kwargs, bkg_kwargs=None, _SourcePhotomet
 # ---------------------------------------------------------------------------
 
 def background_map_one_sca(data, dq, *, superpixel=512, mask_sigma=1.5,
-                            dilate_radius=20, bkg_poly_degree=3):
+                            dilate_radius=20, bkg_poly_degree=3, data_sub=None):
     """Compute a superpixel background map for one SCA.
 
     Steps:
-      1. Fit and subtract a 2D polynomial background.
+      1. Fit and subtract a 2D polynomial background (skipped if data_sub provided).
       2. Mask all sources (point and extended) via a segmentation map with
          binary dilation so halos are fully covered.
       3. Replace masked pixels with NaN.
@@ -153,30 +153,31 @@ def background_map_one_sca(data, dq, *, superpixel=512, mask_sigma=1.5,
     Returns a 2D float array of shape (ny//superpixel, nx//superpixel), or
     None if the image is too small.
     """
-    from astropy.modeling import models, fitting
     from astropy.stats import sigma_clipped_stats
 
     ny, nx = data.shape
     mask = (dq != 0) if dq is not None else np.zeros_like(data, dtype=bool)
 
-    # Polynomial background fit (same logic as run_aperture_photometry)
-    poly_init = models.Polynomial2D(degree=bkg_poly_degree)
-    fitter = fitting.LevMarLSQFitter()
-    ds = 4
-    y_ds, x_ds = np.mgrid[0:ny:ds, 0:nx:ds]
-    valid = ~mask[::ds, ::ds]
-    if np.any(valid):
-        data_ds = data[::ds, ::ds]
-        poly = fitter(poly_init, x_ds[valid], y_ds[valid], data_ds[valid])
-        y_full, x_full = np.mgrid[:ny, :nx]
-        bkg_fit = poly(x_full, y_full)
-    else:
-        bkg_fit = np.zeros_like(data, dtype=float)
-
-    data_sub = data - bkg_fit
+    if data_sub is None:
+        # Polynomial background fit (same logic as run_aperture_photometry)
+        from astropy.modeling import models, fitting
+        poly_init = models.Polynomial2D(degree=bkg_poly_degree)
+        fitter = fitting.LinearLSQFitter()
+        ds = 4
+        y_ds, x_ds = np.mgrid[0:ny:ds, 0:nx:ds]
+        valid = ~mask[::ds, ::ds]
+        if np.any(valid):
+            data_ds = data[::ds, ::ds]
+            poly = fitter(poly_init, x_ds[valid], y_ds[valid], data_ds[valid])
+            y_full, x_full = np.mgrid[:ny, :nx]
+            bkg_fit = poly(x_full, y_full)
+        else:
+            bkg_fit = np.zeros_like(data, dtype=float)
+        data_sub = data - bkg_fit
 
     # RMS of background residual (sigma-clipped, excluding bad pixels)
     residuals = data_sub[~mask] if np.any(~mask) else data_sub.ravel()
+    residuals = residuals[np.isfinite(residuals)]
     _, _, rms = sigma_clipped_stats(residuals, sigma=5.0)
 
     # Build source mask via segmentation
@@ -184,13 +185,16 @@ def background_map_one_sca(data, dq, *, superpixel=512, mask_sigma=1.5,
     try:
         from photutils.segmentation import detect_sources
         from astropy.convolution import Gaussian2DKernel, convolve
-        from scipy.ndimage import binary_dilation
+        from scipy.ndimage import binary_dilation, generate_binary_structure, iterate_structure
 
         kernel = Gaussian2DKernel(x_stddev=2.0)
-        conv = convolve(data_sub, kernel, mask=mask)
-        segmap = detect_sources(conv, mask_sigma * rms, npixels=5)
+        conv = convolve(data_sub, kernel, mask=mask, nan_treatment='fill', preserve_nan=False)
+        segmap = detect_sources(conv, mask_sigma * rms, n_pixels=5)
         if segmap is not None:
-            src_mask = binary_dilation(segmap.data > 0, iterations=dilate_radius)
+            # Single-pass dilation with a pre-expanded disk avoids dilate_radius
+            # serial GIL-holding iterations over the full array.
+            disk = iterate_structure(generate_binary_structure(2, 1), dilate_radius)
+            src_mask = binary_dilation(segmap.data > 0, structure=disk)
     except Exception as exc:
         print(f'[roman_phot] WARNING: source masking skipped: {exc}', file=sys.stderr)
 

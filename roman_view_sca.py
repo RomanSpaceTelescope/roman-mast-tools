@@ -264,7 +264,7 @@ def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=20.0
     # Fit 2D polynomial background to unmasked pixels (downsampled for speed)
     from astropy.modeling import models, fitting
     poly_init = models.Polynomial2D(degree=bkg_poly_degree)
-    fitter = fitting.LevMarLSQFitter()
+    fitter = fitting.LinearLSQFitter()
 
     # Downsample by factor of 4 for fitting
     ds = 4
@@ -287,6 +287,7 @@ def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=20.0
     # Sigma-clipped stats on residuals: rejects source pixels so RMS reflects
     # true sky noise, not the (much larger) std dominated by bright sources.
     residuals = data_sub[~mask] if np.any(~mask) else data_sub.ravel()
+    residuals = residuals[np.isfinite(residuals)]
     _, _, residual_rms = sigma_clipped_stats(residuals, sigma=5.0)
     bkg_level = float(np.mean(bkg_fit[~mask]) if np.any(~mask) else np.mean(bkg_fit))
     print(f'[phot] background level={bkg_level:.4g}  RMS={residual_rms:.4g}  '
@@ -333,6 +334,7 @@ def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=20.0
         'bkg_rms': residual_rms,
         'threshold': detection_sigma * residual_rms,
         'n_sources': n_sources,
+        'data_sub': data_sub,
     }
     return sources, phot_table, sp, stats
 
@@ -350,8 +352,8 @@ def phot_to_region_str(sources, phot_table, sp):
     rgns = ['# Region file format: DS9 version 4.1', 'image']
 
     for i in range(len(sources)):
-        x = sources['xcentroid'][i] + 1.0   # numpy 0-based -> DS9 image (FITS) 1-based
-        y = sources['ycentroid'][i] + 1.0
+        x = sources['x_centroid'][i] + 1.0   # numpy 0-based -> DS9 image (FITS) 1-based
+        y = sources['y_centroid'][i] + 1.0
 
         # SNR-based colour
         color = 'red'
@@ -543,8 +545,8 @@ def display_in_mpl(data, detector, *, dq=None, title=None, wcs_header=None,
     if sources is not None and len(sources) > 0 and sp is not None:
         from matplotlib.patches import Circle
         for i in range(len(sources)):
-            x = sources['xcentroid'][i]
-            y = sources['ycentroid'][i]
+            x = sources['x_centroid'][i]
+            y = sources['y_centroid'][i]
 
             # SNR-based colour
             color = 'red'

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "roman-mast-tools"
-version = "0.1.0"
+version = "0.2.0"
 description = "Tools for streaming Roman WFI data from MAST and analyzing with aperture photometry"
 requires-python = ">=3.10"
 dependencies = [
