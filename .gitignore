@@ -5,3 +5,15 @@ mast_api_token.txt
 *.parquet
 *.reg
 metadata*
+.DS_Store
+roman_mast_tools.egg-info/dependency_links.txt
+roman_mast_tools.egg-info/entry_points.txt
+roman_mast_tools.egg-info/PKG-INFO
+roman_mast_tools.egg-info/requires.txt
+roman_mast_tools.egg-info/SOURCES.txt
+roman_mast_tools.egg-info/top_level.txt
+v0012001013001001001_exp01/sca_01.fits
+roman_phot_bkg_mosaic.png
+roman_phot_combined.csv
+roman_phot_histograms.png
+roman_phot_summary.csv
