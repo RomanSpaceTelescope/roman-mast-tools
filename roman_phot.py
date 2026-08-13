@@ -72,7 +72,7 @@ _WFI_SCA_LAYOUT = {
 # Per-SCA photometry
 # ---------------------------------------------------------------------------
 
-def phot_one_sca(uri, filename, *, phot_kwargs, bkg_kwargs=None):
+def phot_one_sca(uri, filename, *, phot_kwargs, bkg_kwargs=None, _SourcePhotometry=None):
     """Stream one SCA and run aperture photometry.
 
     Returns a dict with keys: sca, detector, table, stats, sp, bkg_map.
@@ -90,7 +90,7 @@ def phot_one_sca(uri, filename, *, phot_kwargs, bkg_kwargs=None):
 
     try:
         sources, phot_table, sp, stats = run_aperture_photometry(
-            data, dq=dq, **phot_kwargs
+            data, dq=dq, _SourcePhotometry=_SourcePhotometry, **phot_kwargs
         )
     except Exception as exc:
         print(f'[roman_phot] WARNING: photometry failed for SCA {sca_num}: {exc}', file=sys.stderr)
@@ -348,6 +348,12 @@ def phot_exposure(uri_filename_pairs, *, phot_kwargs=None, bkg_kwargs=None, max_
     Returns a list of result dicts (sorted by SCA number), with None entries
     removed.
     """
+    # Load roman_lolo once at the start, shared across all SCAs
+    try:
+        from roman_lolo.romanphot import SourcePhotometry
+    except ImportError:
+        raise ImportError('roman-lolo not installed; install with: pip install -e .')
+
     if phot_kwargs is None:
         phot_kwargs = {}
 
@@ -355,7 +361,8 @@ def phot_exposure(uri_filename_pairs, *, phot_kwargs=None, bkg_kwargs=None, max_
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
             pool.submit(phot_one_sca, uri, fn,
-                        phot_kwargs=phot_kwargs, bkg_kwargs=bkg_kwargs): fn
+                        phot_kwargs=phot_kwargs, bkg_kwargs=bkg_kwargs,
+                        _SourcePhotometry=SourcePhotometry): fn
             for uri, fn in uri_filename_pairs
         }
         for fut in as_completed(futures):

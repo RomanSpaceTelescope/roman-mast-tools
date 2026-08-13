@@ -230,7 +230,8 @@ def make_channel_regions(data, detector, *, show_channels=False, show_gridlines=
 
 def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=20.0,
                              aperture_radius_fwhm=2.5, annulus_inner_fwhm=6.0,
-                             annulus_outer_fwhm=8.0, bkg_poly_degree=3, snr_threshold=5.0):
+                             annulus_outer_fwhm=8.0, bkg_poly_degree=3, snr_threshold=5.0,
+                             _SourcePhotometry=None):
     """Background-subtract, detect sources, and run aperture photometry.
 
     Fits a 2D polynomial background, then performs source detection and
@@ -247,10 +248,12 @@ def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=20.0
     stats : dict
         Background statistics: 'bkg_level', 'bkg_rms', 'threshold', 'n_sources'
     """
-    try:
-        from roman_lolo.romanphot import SourcePhotometry
-    except ImportError:
-        raise ImportError('roman-lolo not installed; install with: pip install -e .')
+    if _SourcePhotometry is None:
+        try:
+            from roman_lolo.romanphot import SourcePhotometry
+            _SourcePhotometry = SourcePhotometry
+        except ImportError:
+            raise ImportError('roman-lolo not installed; install with: pip install -e .')
 
     mask = (dq != 0) if dq is not None else np.zeros_like(data, dtype=bool)
     ny, nx = data.shape
@@ -289,7 +292,7 @@ def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=20.0
     print(f'[phot] background level={bkg_level:.4g}  RMS={residual_rms:.4g}  '
           f'threshold ({detection_sigma}σ)={detection_sigma * residual_rms:.4g}', file=sys.stderr)
 
-    sp = SourcePhotometry(
+    sp = _SourcePhotometry(
         fwhm_pix=fwhm_pix,
         detection_sigma=detection_sigma,
         aperture_radius_fwhm=aperture_radius_fwhm,
