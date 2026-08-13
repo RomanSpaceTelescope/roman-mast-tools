@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Stream a single Roman WFI SCA from S3 into DS9 or matplotlib with channel grid overlay.
+"""Stream a single Roman WFI SCA from MAST or S3 into DS9 or matplotlib with channel grid overlay.
 
 Optionally runs aperture photometry and overlays detected sources with SNR-coloured apertures.
 
@@ -7,21 +7,32 @@ DS9 must already be running before you call this script (for --display ds9).
 
 Usage
 -----
-    conda run -n roman-mast-tools python roman_view_sca.py <uri> <filename>
+    # Via roman_mast query (requires MAST auth token):
+    # List matching exposures:
+    conda run -n roman-mast-tools python roman_view_sca.py --program 114 --pass 57 --list
 
-    # public tutorial data (anonymous S3):
+    # View SCA 1 from first matching exposure in DS9:
+    conda run -n roman-mast-tools python roman_view_sca.py --program 114 --pass 57 --sca 1
+
+    # View SCA 11 from 2nd matching exposure with photometry:
+    conda run -n roman-mast-tools python roman_view_sca.py \\
+        --program 114 --pass 57 --exposure 2 --sca 11 --phot --phot-out phot.csv
+
+    # Direct S3 streaming (anonymous access):
     python roman_view_sca.py \\
         s3://stpubdata/roman/nexus/soc_simulations/tutorial_data/roman-2026.2/ \\
         r0003201001001001004_0001_wfi11_f106_cal.asdf
 
-    # matplotlib display with aperture photometry:
-    python roman_view_sca.py --display mpl --phot --phot-out phot.csv <uri> <filename>
+    # Anonymous S3 with matplotlib + photometry:
+    python roman_view_sca.py --display mpl --phot --phot-out phot.csv \\
+        s3://stpubdata/roman/nexus/soc_simulations/tutorial_data/roman-2026.2/ \\
+        r0003201001001001004_0001_wfi11_f106_cal.asdf
 
-    # suppress channel dividers, keep section grid:
-    python roman_view_sca.py --no-channels <uri> <filename>
+    # Suppress channel dividers, keep section grid:
+    python roman_view_sca.py s3://... r0003...asdf --no-channels
 
-    # connect to a named DS9 instance:
-    python roman_view_sca.py --ds9 myds9 <uri> <filename>
+    # Connect to a named DS9 instance:
+    python roman_view_sca.py --program 114 --pass 57 --sca 1 --ds9 myds9
 """
 
 import argparse
@@ -53,16 +64,22 @@ _SCA_ROTATION = {n: (0 if n % 3 == 0 else 180) for n in range(1, 19)}
 # Streaming
 # ---------------------------------------------------------------------------
 
-def stream_sca(uri, filename, *, sip_degree=4):
-    """Open an ASDF file from S3 (anonymous) or local path and return (data_f32, detector, wcs_hdr, dq).
+def stream_sca(uri, filename=None, *, sip_degree=4, asdf_file=None):
+    """Open an ASDF file and return (data_f32, detector, wcs_hdr, dq).
+
+    Three input modes:
+    1. Via open AsdfFile (asdf_file): datamodel already loaded, no network I/O.
+    2. Via S3 URI + filename: 's3://...' → anonymous access.
+    3. Via local path + filename: '/path/to/dir' + 'filename.asdf'.
 
     Materialises ``dm.data`` and computes the SIP WCS approximation while the
     ASDF file handle is still open (gwcs needs the live tree for to_fits_sip).
-
-    If ``uri`` starts with 's3://', it's treated as an S3 URI (anonymous access).
-    Otherwise, treated as a local directory path.
     """
-    if uri.startswith('s3://'):
+    if asdf_file is not None:
+        # Already have an open AsdfFile (from roman_mast streaming)
+        print(f'[view_sca] using provided AsdfFile', file=sys.stderr)
+        dm = rdm.open(asdf_file)
+    elif uri.startswith('s3://'):
         # S3 file path (anonymous access)
         path = uri.rstrip('/') + '/' + filename
         fs = s3fs.S3FileSystem(anon=True)
@@ -78,8 +95,11 @@ def stream_sca(uri, filename, *, sip_degree=4):
             print(f'[view_sca] computing SIP WCS (degree={sip_degree}) ...', file=sys.stderr)
             gwcs    = dm.meta.wcs
             wcs_hdr = gwcs.to_fits_sip(bounding_box=gwcs.bounding_box, degree=sip_degree)
+        print(f'[view_sca] {detector}  shape={data.shape}', file=sys.stderr)
+        return data, detector, wcs_hdr, dq
     else:
-        # Local file path
+        # Local file path — materialise inside the with block; ASDF blocks are
+        # lazily mapped and become inaccessible once the file handle is closed.
         path = os.path.join(uri.rstrip('/'), filename)
         print(f'[view_sca] reading from local: {path}', file=sys.stderr)
         with open(path, 'rb') as f:
@@ -89,10 +109,23 @@ def stream_sca(uri, filename, *, sip_degree=4):
             try:
                 dq = np.asarray(dm.dq[...], dtype=np.int32)
             except AttributeError:
-                dq = None   # uncal products have no DQ layer
+                dq = None
             print(f'[view_sca] computing SIP WCS (degree={sip_degree}) ...', file=sys.stderr)
             gwcs    = dm.meta.wcs
             wcs_hdr = gwcs.to_fits_sip(bounding_box=gwcs.bounding_box, degree=sip_degree)
+        print(f'[view_sca] {detector}  shape={data.shape}', file=sys.stderr)
+        return data, detector, wcs_hdr, dq
+
+    # asdf_file path (already-open handle from roman_mast streaming)
+    data     = np.asarray(dm.data[...], dtype=np.float32)
+    detector = str(dm.meta.instrument.detector).upper()
+    try:
+        dq = np.asarray(dm.dq[...], dtype=np.int32)
+    except AttributeError:
+        dq = None
+    print(f'[view_sca] computing SIP WCS (degree={sip_degree}) ...', file=sys.stderr)
+    gwcs    = dm.meta.wcs
+    wcs_hdr = gwcs.to_fits_sip(bounding_box=gwcs.bounding_box, degree=sip_degree)
     print(f'[view_sca] {detector}  shape={data.shape}', file=sys.stderr)
     return data, detector, wcs_hdr, dq
 
@@ -579,14 +612,46 @@ def display_in_mpl(data, detector, *, dq=None, title=None, wcs_header=None,
 def main():
     ap = argparse.ArgumentParser(
         description=(
-            'Stream a single Roman WFI SCA from S3 and display it '
+            'Stream a single Roman WFI SCA from MAST (via roman_mast) or S3 and display it '
             'in DS9 or matplotlib with H4RG channel/section grid overlay.'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    ap.add_argument('uri',      help='S3 base URI (e.g. s3://stpubdata/roman/...) or local directory path (e.g. ./cache)')
-    ap.add_argument('filename', help='ASDF filename, e.g. r0003..._wfi11_f106_cal.asdf')
+
+    # Roman MAST query mode (optional positional args for S3/local fallback)
+    ap.add_argument('uri', nargs='?', default=None,
+                    help='S3 base URI (e.g. s3://stpubdata/roman/...) or local directory path (e.g. ./cache)')
+    ap.add_argument('filename', nargs='?', default=None,
+                    help='ASDF filename, e.g. r0003..._wfi11_f106_cal.asdf')
+
+    # Roman MAST filters (when not using uri + filename)
+    ap.add_argument('--program', type=int, default=None, metavar='N',
+                    help='APT program ID (e.g. 114)')
+    ap.add_argument('--pass', type=int, default=None, metavar='N', dest='pass_',
+                    help='Pass within the program (e.g. 57)')
+    ap.add_argument('--execution-plan', type=int, default=None, metavar='N',
+                    help='Execution plan within the program')
+    ap.add_argument('--segment', type=int, default=None, metavar='N',
+                    help='Segment within the pass')
+    ap.add_argument('--observation', type=int, default=None, metavar='N',
+                    help='Observation within the segment')
+    ap.add_argument('--visit', type=int, default=None, metavar='N',
+                    help='Visit within the observation')
+    ap.add_argument('--exposure', type=int, default=1, metavar='N',
+                    help='Exposure index (1-based, matching --list order; default: 1)')
+    ap.add_argument('--sca', type=int, required=False, metavar='N',
+                    help='SCA number to view (1-18). Required when using roman_mast query mode.')
+    ap.add_argument('--optical-element', default=None, metavar='ELEM',
+                    help='Filter name (e.g. F106, F129)')
+    ap.add_argument('--detector', default=None, metavar='NAME',
+                    help='Detector name (e.g. WFI04)')
+    ap.add_argument('--data-level', type=int, choices=[1, 2], default=2, metavar='N',
+                    help='Data level: 1=uncal, 2=cal (default: 2)')
+    ap.add_argument('--list', action='store_true', dest='list_exposures',
+                    help='List matching exposures and exit (no display)')
+
+    # Display options (all modes)
     ap.add_argument('--channels', action='store_true',
                     help='Draw 32-channel thin dividers and channel numbers')
     ap.add_argument('--grid',     action='store_true',
@@ -603,6 +668,8 @@ def main():
                     help='DS9 colour map (default: viridis; ds9 only)')
     ap.add_argument('--ds9',     default=None, metavar='TARGET',
                     help='XPA target name of a running DS9 (default: any; ds9 only)')
+
+    # Photometry options
     ap.add_argument('--phot', action='store_true',
                     help='Enable aperture photometry analysis')
     ap.add_argument('--fwhm', type=float, default=1.5, metavar='N',
@@ -621,16 +688,85 @@ def main():
                     help='Minimum SNR to include a source in output (default: 5.0; photometry only)')
     ap.add_argument('--phot-out', default=None, metavar='PATH',
                     help='Write photometry table to this CSV path (photometry only)')
+
     args = ap.parse_args()
 
-    dq_wanted = not args.no_dq
-    data, detector, wcs_hdr, dq = stream_sca(args.uri, args.filename,
-                                               sip_degree=args.sip_degree)
+    # Determine which mode: roman_mast query or direct S3/local
+    if args.program is not None or args.pass_ is not None or args.execution_plan is not None or \
+       args.segment is not None or args.observation is not None or args.visit is not None or \
+       args.detector is not None or args.optical_element is not None:
+        # Roman MAST mode
+        from roman_mast import list_data, print_summary
 
-    meta = parse_filename(args.filename)
-    title = (f'{detector} {meta["visit_id"]}  '
-             f'Exp: {meta["exposure_num"]} '
-             f'{meta["filter"]}')
+        print(f'[view_sca] Querying MAST...', file=sys.stderr)
+        res = list_data(
+            program=args.program,
+            execution_plan=args.execution_plan,
+            pass_=args.pass_,
+            segment=args.segment,
+            observation=args.observation,
+            visit=args.visit,
+            detector=args.detector,
+            optical_element=args.optical_element,
+            sca_only=True,
+            data_level=args.data_level,
+        )
+        if len(res.exposures) == 0:
+            sys.exit('[view_sca] No exposures found matching your query')
+
+        # List mode: show matching exposures and exit
+        if args.list_exposures:
+            print_summary(res)
+            return
+
+        # Select exposure (1-based index)
+        try:
+            exp = res.exposures[args.exposure - 1]
+        except IndexError:
+            sys.exit(f'[view_sca] Exposure index {args.exposure} out of range '
+                     f'(found {len(res.exposures)} exposure(s); use --list to see them)')
+
+        print(f'[view_sca] Selected exposure {args.exposure}/{len(res.exposures)}: '
+              f'{exp.visit_id} exp {exp.exposure}', file=sys.stderr)
+
+        # Validate SCA
+        if args.sca is None:
+            ap.error('--sca is required when using roman_mast query filters (--program, --pass, etc.)')
+
+        if args.sca not in exp.scas:
+            available = ', '.join(str(s) for s in sorted(exp.scas))
+            sys.exit(f'[view_sca] SCA {args.sca} not in exposure. Available: {available}')
+
+        sca_idx = exp.scas.index(args.sca)
+        filename = exp.filenames[sca_idx]
+        print(f'[view_sca] Streaming {filename}', file=sys.stderr)
+
+        # Stream the single SCA
+        asdf_file = res.missions.read_product(filename)
+        try:
+            data, detector, wcs_hdr, dq = stream_sca(
+                None, None, asdf_file=asdf_file, sip_degree=args.sip_degree
+            )
+            title = (f'{detector} {exp.visit_id}  Exp: {exp.exposure:04d}  '
+                     f'{exp.optical_element or "?"}')
+        finally:
+            if hasattr(asdf_file, 'close'):
+                asdf_file.close()
+    else:
+        # Direct S3/local mode
+        if args.uri is None or args.filename is None:
+            ap.error('Either provide <uri> <filename> for direct S3/local access, '
+                     'or use --program/--pass/etc. for roman_mast query mode')
+
+        data, detector, wcs_hdr, dq = stream_sca(
+            args.uri, args.filename, sip_degree=args.sip_degree
+        )
+        meta = parse_filename(args.filename)
+        title = (f'{detector} {meta["visit_id"]}  '
+                 f'Exp: {meta["exposure_num"]} '
+                 f'{meta["filter"]}')
+
+    dq_wanted = not args.no_dq
 
     # Run photometry if requested
     sources, phot_table, sp, stats = None, None, None, None
