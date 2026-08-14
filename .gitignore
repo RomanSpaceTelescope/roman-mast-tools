@@ -18,3 +18,7 @@ roman_mast_tools.egg-info/requires.txt
 roman_mast_tools.egg-info/SOURCES.txt
 roman_mast_tools.egg-info/top_level.txt
 v0012001013001001001_exp01/sca_01.fits
+*.png
+*.csv
+*.npz
+*.log
