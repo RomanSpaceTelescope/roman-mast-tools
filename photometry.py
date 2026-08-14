@@ -2,9 +2,10 @@ import sys
 
 import numpy as np
 from astropy.io import fits
-from astropy.stats import sigma_clipped_stats
 from photutils.detection import DAOStarFinder
-from photutils.aperture import CircularAperture, CircularAnnulus, aperture_photometry
+from photutils.aperture import CircularAperture, CircularAnnulus, aperture_photometry, ApertureStats
+from photutils.background import Background2D, MedianBackground
+from astropy.stats import SigmaClip
 import matplotlib.pyplot as plt
 from dataclasses import dataclass
 import os
@@ -66,8 +67,8 @@ class SourcePhotometry:
         finder = DAOStarFinder(
             fwhm=self.fwhm_pix,
             threshold=threshold,
-            sharplo=0.2, sharphi=1.5,
-            roundlo=-1.0, roundhi=1.0
+            sharpness_range=(0.2, 1.5),
+            roundness_range=(-1.0, 1.0)
         )
 
         sources = finder(image)
@@ -94,7 +95,7 @@ class SourcePhotometry:
         image : np.ndarray
             Science image (background already subtracted globally).
         sources : astropy.table.Table
-            Source catalog with 'xcentroid', 'ycentroid' columns.
+            Source catalog with 'x_centroid', 'y_centroid' columns.
         bkg_rms : np.ndarray
             Background RMS map for error estimation.
         local_bkg_subtraction : bool
@@ -108,8 +109,8 @@ class SourcePhotometry:
         if len(sources) == 0:
             return None
 
-        positions = np.column_stack([sources['xcentroid'],
-                                     sources['ycentroid']])
+        positions = np.column_stack([sources['x_centroid'],
+                                     sources['y_centroid']])
 
         # Source aperture
         apertures = CircularAperture(positions, r=self.aperture_radius)
@@ -126,16 +127,11 @@ class SourcePhotometry:
         annulus_area = annuli.area
         aperture_area = apertures.area
 
-        # Sigma-clipped median in annulus for each source
-        local_bkg_per_pix = np.zeros(len(sources))
-        for i, pos in enumerate(positions):
-            ann_mask = annuli[i].to_mask(method='center')
-            ann_data = ann_mask.multiply(image)
-            ann_weights = ann_mask.data
-            valid = ann_weights > 0
-            if np.any(valid):
-                _, local_bkg_per_pix[i], _ = sigma_clipped_stats(
-                    ann_data[valid] / ann_weights[valid])
+        # Sigma-clipped median in annulus for each source (vectorized)
+        sigclip = SigmaClip(sigma=3.0, maxiters=10)
+        ann_stats = ApertureStats(image, annuli, sigma_clip=sigclip)
+        local_bkg_per_pix = np.where(np.isfinite(ann_stats.median),
+                                     ann_stats.median, 0.0)
 
         phot['local_bkg_per_pix'] = local_bkg_per_pix
         phot['local_bkg_total'] = local_bkg_per_pix * aperture_area
@@ -201,8 +197,8 @@ class SourcePhotometry:
 
         # Set up initial guesses from detection
         init_params = {
-            'x_0': sources['xcentroid'],
-            'y_0': sources['ycentroid'],
+            'x_0': sources['x_centroid'],
+            'y_0': sources['y_centroid'],
             'flux_0': sources['flux']
         }
 
@@ -217,8 +213,8 @@ class SourcePhotometry:
         from astropy.table import Table
 
         init_table = Table()
-        init_table['x_init'] = sources['xcentroid']
-        init_table['y_init'] = sources['ycentroid']
+        init_table['x_init'] = sources['x_centroid']
+        init_table['y_init'] = sources['y_centroid']
         init_table['flux_init'] = sources['flux']
 
         psfphot = PSFPhotometry(
@@ -404,8 +400,8 @@ class SourcePhotometry:
 
         for i in range(len(sources)):
             # DS9 uses 1-based pixel coordinates
-            x = sources['xcentroid'][i] + 1.0
-            y = sources['ycentroid'][i] + 1.0
+            x = sources['x_centroid'][i] + 1.0
+            y = sources['y_centroid'][i] + 1.0
 
             # Color by SNR
             color = 'green'
@@ -492,8 +488,8 @@ class SourcePhotometry:
                          '---------\t---------\t---------')
 
             for i in range(len(sources)):
-                x = sources['xcentroid'][i] + 1.0  # 1-indexed
-                y = sources['ycentroid'][i] + 1.0
+                x = sources['x_centroid'][i] + 1.0  # 1-indexed
+                y = sources['y_centroid'][i] + 1.0
 
                 flux = (photometry['flux_bkgsub'][i]
                         if 'flux_bkgsub' in photometry.colnames
@@ -521,8 +517,8 @@ class SourcePhotometry:
             lines.append('# ---\t-------\t-------\t----\t---------\t---------')
 
             for i in range(len(sources)):
-                x = sources['xcentroid'][i] + 1.0
-                y = sources['ycentroid'][i] + 1.0
+                x = sources['x_centroid'][i] + 1.0
+                y = sources['y_centroid'][i] + 1.0
                 flux = sources['flux'][i]
                 sharp = (sources['sharpness'][i]
                          if 'sharpness' in sources.colnames else 0)
@@ -544,57 +540,169 @@ class SourcePhotometry:
 # Background fitting
 # ---------------------------------------------------------------------------
 
-def fit_background(data, dq=None, poly_degree=3):
-    """Fit a 2D polynomial background to *data*, ignoring bad pixels.
+def fit_background(data, dq=None, box_size=64, filter_size=3,
+                   sigma=3.0, exclude_percentile=50.0,
+                   bkg_estimator='median'):
+    """Estimate a smooth 2D background using coarse-mesh statistics
+    with spline interpolation (photutils.Background2D).
+
+    This replaces the previous 2D polynomial fit. It is typically faster
+    and tracks localized background structure (amp glow, scattered light,
+    thermal patterns) that a low-order polynomial cannot follow.
 
     Parameters
     ----------
-    data : ndarray (ny, nx), float32
+    data : ndarray (ny, nx)
+        Input image. Will be used in its native dtype (float32 recommended).
     dq : ndarray of int, optional
-        Bad-pixel mask; pixels where dq != 0 are excluded from the fit.
-    poly_degree : int
-        Degree of the 2D polynomial (default 3).
+        Bad-pixel mask; pixels where dq != 0 are excluded.
+    box_size : int or tuple of int
+        Mesh cell size in pixels. Should be several times the PSF FWHM
+        but small compared to the scale of background variations.
+        64 or 128 is a good starting point for WFI-like data.
+    filter_size : int or tuple of int
+        Size of the median filter applied to the low-resolution mesh
+        to smooth cell-to-cell noise. 3 is typical.
+    sigma : float
+        Sigma-clipping threshold used inside each mesh cell to reject
+        sources and outliers.
+    exclude_percentile : float
+        Mesh cells with more than this percent of masked pixels are
+        excluded from the interpolation and filled from neighbors.
+    bkg_estimator : {'median', 'mean', 'sextractor'}
+        Statistic used in each mesh cell.
 
     Returns
     -------
     bkg_fit : ndarray, same shape as data
+        Smooth background model.
     data_sub : ndarray, same shape as data
-    mask : ndarray of bool
+        Background-subtracted image.
+    mask : ndarray of bool, same shape as data
+        Bad-pixel mask (True = bad). Same as (dq != 0) if dq was given,
+        else all False.
     bkg_level : float
-    residual_rms : float
+        Median of the background model over good pixels.
+    residual_rms : ndarray, same shape as data
+        Per-pixel background RMS map from Background2D.
     """
-    from astropy.modeling import models, fitting
+    from photutils.background import (
+        Background2D, MedianBackground, MeanBackground, SExtractorBackground,
+    )
 
-    ny, nx = data.shape
-    mask = (dq != 0) if dq is not None else np.zeros(data.shape, dtype=bool)
+    # -------- input handling --------
+    data = np.asarray(data)
+    if data.dtype != np.float32:
+        data = data.astype(np.float32, copy=False)
 
-    poly_init = models.Polynomial2D(degree=poly_degree)
-    fitter = fitting.LinearLSQFitter()
-
-    ds = 4
-    y_ds, x_ds = np.mgrid[0:ny:ds, 0:nx:ds]
-    data_ds = data[::ds, ::ds]
-    mask_ds = mask[::ds, ::ds]
-    valid = ~mask_ds
-
-    print(f'[view_sca] fitting degree-{poly_degree} 2D polynomial background '
-          f'({int(np.sum(valid))} points at 1/{ds} resolution) ...', file=sys.stderr)
-    if np.any(valid):
-        poly = fitter(poly_init, x_ds[valid], y_ds[valid], data_ds[valid])
-        y_full, x_full = np.mgrid[:ny, :nx]
-        bkg_fit = poly(x_full, y_full).astype(np.float32)
+    if dq is not None:
+        mask = (dq != 0)
     else:
-        bkg_fit = np.zeros(data.shape, dtype=np.float32)
+        mask = np.zeros(data.shape, dtype=bool)
 
+    # Also mask non-finite pixels so they don't poison mesh statistics
+    bad_finite = ~np.isfinite(data)
+    if bad_finite.any():
+        mask = mask | bad_finite
+
+    # -------- estimator selection --------
+    est = {
+        'median': MedianBackground(),
+        'mean': MeanBackground(),
+        'sextractor': SExtractorBackground(),
+    }[bkg_estimator]
+
+    sigma_clip = SigmaClip(sigma=sigma)
+
+    # -------- coerce box/filter sizes to tuples --------
+    if np.isscalar(box_size):
+        box_size = (int(box_size), int(box_size))
+    if np.isscalar(filter_size):
+        filter_size = (int(filter_size), int(filter_size))
+
+    # -------- run Background2D --------
+    bkg = Background2D(
+        data,
+        box_size=box_size,
+        filter_size=filter_size,
+        mask=mask,
+        sigma_clip=sigma_clip,
+        bkg_estimator=est,
+        exclude_percentile=exclude_percentile,
+    )
+
+    bkg_fit = bkg.background.astype(np.float32, copy=False)
+    residual_rms = bkg.background_rms.astype(np.float32, copy=False)
     data_sub = data - bkg_fit
 
-    sky_mask = np.isfinite(data_sub) & ~mask
-    flat = data_sub[sky_mask] if sky_mask.any() else data_sub[np.isfinite(data_sub)]
-    _, _, residual_rms = sigma_clipped_stats(flat, sigma=5.0)
-    bkg_level = float(np.mean(bkg_fit[~mask]) if np.any(~mask) else np.mean(bkg_fit))
+    # Scalar summary of the background level over good pixels
+    if mask.all():
+        bkg_level = float(np.nan)
+    else:
+        bkg_level = float(np.median(bkg_fit[~mask]))
 
-    print(f'[view_sca] background level={bkg_level:.4g}  RMS={residual_rms:.4g}', file=sys.stderr)
     return bkg_fit, data_sub, mask, bkg_level, residual_rms
+
+# def fit_background(data, dq=None, poly_degree=3):
+#     """Fit a 2D polynomial background to *data*, ignoring bad pixels.
+
+#     Parameters
+#     ----------
+#     data : ndarray (ny, nx), float32
+#     dq : ndarray of int, optional
+#         Bad-pixel mask; pixels where dq != 0 are excluded from the fit.
+#     poly_degree : int
+#         Degree of the 2D polynomial (default 3).
+
+#     Returns
+#     -------
+#     bkg_fit : ndarray, same shape as data
+#     data_sub : ndarray, same shape as data
+#     mask : ndarray of bool
+#     bkg_level : float
+#     residual_rms : float
+#     """
+#     from astropy.modeling import models, fitting
+
+#     ny, nx = data.shape
+#     mask = (dq != 0) if dq is not None else np.zeros(data.shape, dtype=bool)
+
+#     poly_init = models.Polynomial2D(degree=poly_degree)
+#     fitter = fitting.LinearLSQFitter()
+
+#     ds = 4
+#     y_ds, x_ds = np.mgrid[0:ny:ds, 0:nx:ds]
+#     data_ds = data[::ds, ::ds]
+#     mask_ds = mask[::ds, ::ds]
+#     valid = ~mask_ds
+
+#     print(f'[view_sca] fitting degree-{poly_degree} 2D polynomial background '
+#           f'({int(np.sum(valid))} points at 1/{ds} resolution) ...', file=sys.stderr)
+#     if np.any(valid):
+#         # Normalize coordinates to [-1, 1] for better numerical stability
+#         x_norm = 2.0 * x_ds[valid] / nx - 1.0
+#         y_norm = 2.0 * y_ds[valid] / ny - 1.0
+#         poly = fitter(poly_init, x_norm, y_norm, data_ds[valid])
+#         # Evaluate on normalized full grid
+#         y_full, x_full = np.mgrid[:ny, :nx]
+#         x_full_norm = 2.0 * x_full / nx - 1.0
+#         y_full_norm = 2.0 * y_full / ny - 1.0
+#         bkg_fit = poly(x_full_norm, y_full_norm).astype(np.float32)
+#     else:
+#         bkg_fit = np.zeros(data.shape, dtype=np.float32)
+
+#     data_sub = data - bkg_fit
+
+#     sky_mask = np.isfinite(data_sub) & ~mask
+#     flat = data_sub[sky_mask] if sky_mask.any() else data_sub[np.isfinite(data_sub)]
+#     if len(flat) > 0:
+#         _, _, residual_rms = sigma_clipped_stats(flat, sigma=5.0)
+#     else:
+#         residual_rms = 0
+#     bkg_level = float(np.mean(bkg_fit[~mask]) if np.any(~mask) else np.mean(bkg_fit))
+
+#     print(f'[view_sca] background level={bkg_level:.4g}  RMS={residual_rms:.4g}', file=sys.stderr)
+#     return bkg_fit, data_sub, mask, bkg_level, residual_rms
 
 
 # ---------------------------------------------------------------------------
@@ -603,7 +711,9 @@ def fit_background(data, dq=None, poly_degree=3):
 
 def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=20.0,
                              aperture_radius_fwhm=2.5, annulus_inner_fwhm=6.0,
-                             annulus_outer_fwhm=8.0, bkg_poly_degree=3, snr_threshold=5.0):
+                             annulus_outer_fwhm=8.0,
+                             box_size=64, filter_size=3,
+                             snr_threshold=5.0):
     """Fit background, detect sources, and run aperture photometry.
 
     Returns
@@ -616,14 +726,15 @@ def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=20.0
     """
     ny, nx = data.shape
     bkg_fit, data_sub, mask, bkg_level, residual_rms = fit_background(
-        data, dq=dq, poly_degree=bkg_poly_degree,
+        data, dq=dq, box_size=box_size, filter_size=filter_size,
     )
     n_masked = int(np.sum(mask))
     print(f'[phot] image {ny}x{nx}  masked pixels: {n_masked} ({100*n_masked/mask.size:.1f}%)',
           file=sys.stderr)
-    print(f'[phot] background level={bkg_level:.4g}  RMS={residual_rms:.4g}  '
-          f'threshold ({detection_sigma}σ)={detection_sigma * residual_rms:.4g}', file=sys.stderr)
-
+    rms_median = float(np.median(residual_rms))
+    print(f'[phot] background level={bkg_level:.4g}  RMS(median)={rms_median:.4g}  '
+        f'threshold ({detection_sigma}σ)={detection_sigma * rms_median:.4g}',
+        file=sys.stderr)
     sp = SourcePhotometry(
         fwhm_pix=fwhm_pix,
         detection_sigma=detection_sigma,
@@ -637,13 +748,24 @@ def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=20.0
     sources = sp.detect_sources(data_sub, residual_rms)
     n_sources = len(sources) if sources is not None else 0
 
-    if sources is None or len(sources) == 0:
-        stats = {
-            'bkg_level': bkg_level, 'bkg_rms': residual_rms,
-            'threshold': detection_sigma * residual_rms, 'n_sources': 0,
-            'bkg_fit': bkg_fit, 'data_sub': data_sub, 'poly_degree': bkg_poly_degree,
+    def _make_stats(n_sources):
+        rms_median = (float(np.median(residual_rms))
+                    if np.ndim(residual_rms) else float(residual_rms))
+        return {
+            'bkg_level': bkg_level,
+            'bkg_rms': residual_rms,
+            'bkg_rms_median': rms_median,
+            'threshold': detection_sigma * rms_median,
+            'n_sources': n_sources,
+            'bkg_fit': bkg_fit,
+            'data_sub': data_sub,
+            'bkg_method': 'Background2D',
+            'box_size': box_size,
+            'filter_size': filter_size,
         }
-        return None, None, sp, stats
+
+    if sources is None or len(sources) == 0: 
+        return None, None, sp, _make_stats(0)
 
     print(f'[phot] {n_sources} sources detected — running aperture photometry ...', file=sys.stderr)
     phot_table = sp.aperture_photometry_on_frame(data_sub, sources, residual_rms)
@@ -659,9 +781,8 @@ def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=20.0
             phot_table = phot_table[keep]
             n_sources = n_kept
 
-    stats = {
-        'bkg_level': bkg_level, 'bkg_rms': residual_rms,
-        'threshold': detection_sigma * residual_rms, 'n_sources': n_sources,
-        'bkg_fit': bkg_fit, 'data_sub': data_sub, 'poly_degree': bkg_poly_degree,
-    }
-    return sources, phot_table, sp, stats
+    # residual_rms is now a 2D map from Background2D; keep a scalar summary
+    rms_median = float(np.median(residual_rms)) if np.ndim(residual_rms) else float(residual_rms)
+
+    return sources, phot_table, sp, _make_stats(n_sources)
+

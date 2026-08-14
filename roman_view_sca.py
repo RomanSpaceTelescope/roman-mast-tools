@@ -375,14 +375,14 @@ def display_in_ds9(data, regions, *, title='Roman WFI', wcs_header=None,
 
 def display_in_mpl(data, detector, *, dq=None, title=None, wcs_header=None,
                    show_channels=False, show_gridlines=False,
-                   figsize=(9, 8), norm=None, sources=None, phot_table=None, sp=None, stats=None):
+                   figsize=(9, 8), norm=None, sources=None, phot_table=None, sp=None, stats=None,
+                   save_path=None):
     """Display a single SCA in an interactive matplotlib window.
 
     When wcs_header is provided the axes use WCSAxes projection so ticks and
     the status bar show RA/Dec; the data value (and DQ flag if present) are
     appended to the WCSAxes format_coord output.
     """
-    import matplotlib.pyplot as plt
     from astropy.visualization import simple_norm
 
     ny, nx  = data.shape
@@ -394,8 +394,17 @@ def display_in_mpl(data, detector, *, dq=None, title=None, wcs_header=None,
         norm = simple_norm(data, 'asinh', vmin=0.5, vmax=4)
 
     projection = WCS(wcs_header) if wcs_header is not None else None
-    fig, ax = plt.subplots(figsize=figsize,
-                           subplot_kw={'projection': projection} if projection else {})
+
+    if save_path is not None:
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        fig = Figure(figsize=figsize)
+        FigureCanvasAgg(fig)
+        ax = fig.add_subplot(111, projection=projection)
+    else:
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=figsize,
+                               subplot_kw={'projection': projection} if projection else {})
     ax.imshow(data, norm=norm, origin='lower')
     if dq is not None:
         dq_overlay = np.where(dq != 0, 1.0, np.nan)
@@ -451,43 +460,48 @@ def display_in_mpl(data, detector, *, dq=None, title=None, wcs_header=None,
                     ha='center', fontsize=6)
 
     if sources is not None and len(sources) > 0 and sp is not None:
-        from matplotlib.patches import Circle
-        for i in range(len(sources)):
-            x = sources['x_centroid'][i]
-            y = sources['y_centroid'][i]
+        from matplotlib.collections import EllipseCollection
 
-            # SNR-based colour
-            color = 'red'
-            if phot_table is not None and i < len(phot_table) and 'snr' in phot_table.colnames:
-                snr_val = phot_table['snr'][i]
-                if snr_val >= 50:
-                    color = 'green'
-                elif snr_val >= 20:
-                    color = 'cyan'
-                elif snr_val >= 10:
-                    color = 'yellow'
-                elif snr_val >= 5:
-                    color = 'magenta'
+        xs = np.asarray(sources['x_centroid'], dtype=float)
+        ys = np.asarray(sources['y_centroid'], dtype=float)
 
-            # Aperture circle (no text)
-            aperture_circle = Circle((x, y), sp.aperture_radius,
-                                    fill=False, edgecolor=color, linewidth=1.5, alpha=0.8)
-            ax.add_patch(aperture_circle)
+        # Assign SNR-based colours per source
+        colors = np.full(len(sources), 'red', dtype=object)
+        if phot_table is not None and 'snr' in phot_table.colnames:
+            snr = np.asarray(phot_table['snr'][:len(sources)], dtype=float)
+            colors[snr >= 5]  = 'magenta'
+            colors[snr >= 10] = 'yellow'
+            colors[snr >= 20] = 'cyan'
+            colors[snr >= 50] = 'green'
 
-            # Background annulus (dashed)
-            annulus_inner = Circle((x, y), sp.annulus_inner,
-                                  fill=False, edgecolor=color, linewidth=1, linestyle='--', alpha=0.4)
-            ax.add_patch(annulus_inner)
-            annulus_outer = Circle((x, y), sp.annulus_outer,
-                                  fill=False, edgecolor=color, linewidth=1, linestyle='--', alpha=0.4)
-            ax.add_patch(annulus_outer)
+        offsets = np.column_stack([xs, ys])
+        ax.set_autoscale_on(False)
+
+        for color in np.unique(colors):
+            mask = colors == color
+            off = offsets[mask]
+            n = mask.sum()
+            for radius, lw, ls, alpha in [
+                (sp.aperture_radius, 1.5, '-',  0.8),
+                (sp.annulus_inner,   1.0, '--', 0.4),
+                (sp.annulus_outer,   1.0, '--', 0.4),
+            ]:
+                col = EllipseCollection(
+                    widths=2*radius, heights=2*radius, angles=0, units='xy',
+                    offsets=off, offset_transform=ax.transData,
+                    facecolors='none', edgecolors=color,
+                    linewidths=lw, linestyles=ls, alpha=alpha,
+                )
+                ax.add_collection(col)
+
+        ax.set_autoscale_on(True)
 
     if stats is not None:
         # Display background statistics in a text panel (upper-left corner)
         stats_text = (
             f"Background Stats:\n"
             f"Level: {stats['bkg_level']:.2f}\n"
-            f"RMS: {stats['bkg_rms']:.2f}\n"
+            f"RMS: {stats.get('bkg_rms_median', np.median(stats['bkg_rms'])):.2f}\n"
             f"Threshold: {stats['threshold']:.2f}\n"
             f"Sources: {stats['n_sources']}"
         )
@@ -512,14 +526,18 @@ def display_in_mpl(data, detector, *, dq=None, title=None, wcs_header=None,
         return wcs_str
     ax.format_coord = _fmt
 
-    plt.tight_layout()
-    plt.show()
+    fig.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    else:
+        plt.show()
     return fig, ax
 
 
 def display_residuals_mpl(data_sub, detector, *, bkg_fit=None, bkg_level=0.0,
                            residual_rms=None, poly_degree=None, dq=None,
-                           wcs_header=None, figsize=(14, 6), n_sigma=5.0):
+                           wcs_header=None, figsize=(14, 6), n_sigma=5.0,
+                           save_path=None):
     """Two-panel diagnostic figure for background subtraction quality.
 
     Left panel  — polynomial background model (viridis, full range).
@@ -527,7 +545,6 @@ def display_residuals_mpl(data_sub, detector, *, bkg_fit=None, bkg_level=0.0,
 
     Pass bkg_fit=None to show only the residuals panel.
     """
-    import matplotlib.pyplot as plt
     import matplotlib.colors as mcolors
 
     if residual_rms is None:
@@ -543,14 +560,23 @@ def display_residuals_mpl(data_sub, detector, *, bkg_fit=None, bkg_level=0.0,
     resid_norm = mcolors.Normalize(vmin=-half, vmax=half)
 
     n_panels = 2 if bkg_fit is not None else 1
-    fig, axes = plt.subplots(1, n_panels, figsize=figsize)
-    if n_panels == 1:
-        axes = [axes]
+
+    if save_path is not None:
+        from matplotlib.figure import Figure
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        fig = Figure(figsize=figsize)
+        FigureCanvasAgg(fig)
+        axes = [fig.add_subplot(1, n_panels, i + 1) for i in range(n_panels)]
+    else:
+        import matplotlib.pyplot as plt
+        fig, axes = plt.subplots(1, n_panels, figsize=figsize)
+        if n_panels == 1:
+            axes = [axes]
 
     if bkg_fit is not None:
         im0 = axes[0].imshow(bkg_fit, origin='lower', cmap='viridis',
                              aspect='equal', interpolation='nearest')
-        plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04,
+        fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04,
                      label='Background (DN/s)')
         deg_str = f'  degree={poly_degree}' if poly_degree is not None else ''
         axes[0].set_title(f'Background model{deg_str}')
@@ -559,7 +585,7 @@ def display_residuals_mpl(data_sub, detector, *, bkg_fit=None, bkg_level=0.0,
 
     im1 = axes[-1].imshow(data_sub, origin='lower', cmap='RdBu_r',
                           norm=resid_norm, aspect='equal', interpolation='nearest')
-    plt.colorbar(im1, ax=axes[-1], fraction=0.046, pad=0.04,
+    fig.colorbar(im1, ax=axes[-1], fraction=0.046, pad=0.04,
                  label='Residual (DN/s)')
     axes[-1].set_title(
         f'Residuals after background subtraction\n'
@@ -579,8 +605,11 @@ def display_residuals_mpl(data_sub, detector, *, bkg_fit=None, bkg_level=0.0,
 
     fig.suptitle(f'Roman WFI {detector} — background subtraction quality',
                  fontsize=12)
-    plt.tight_layout()
-    plt.show()
+    fig.tight_layout()
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+    else:
+        plt.show()
     return fig, axes
 
 
@@ -787,7 +816,9 @@ def main():
             bkg_fit = stats.get('bkg_fit')
             data_sub = stats.get('data_sub')
             bkg_level = stats.get('bkg_level', 0.0)
-            bkg_rms = stats.get('bkg_rms')
+            bkg_rms = stats.get('bkg_rms_median') or (
+                float(np.median(stats['bkg_rms'])) if stats.get('bkg_rms') is not None else None
+            )
 
     if args.display == 'mpl':
         display_in_mpl(
