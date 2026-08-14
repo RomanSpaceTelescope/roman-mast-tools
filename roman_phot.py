@@ -33,7 +33,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 from astropy.table import vstack, Table
 
-from roman_view_sca import stream_sca, run_aperture_photometry, parse_filename
+from roman_view_sca import stream_sca, parse_filename
+from photometry import run_aperture_photometry
 
 # ---------------------------------------------------------------------------
 # WFI focal-plane constants
@@ -73,7 +74,7 @@ _WFI_SCA_LAYOUT = {
 # Per-SCA photometry
 # ---------------------------------------------------------------------------
 
-def phot_one_sca(uri, filename, *, phot_kwargs, bkg_kwargs=None, _SourcePhotometry=None):
+def phot_one_sca(uri, filename, *, phot_kwargs, bkg_kwargs=None):
     """Stream one SCA and run aperture photometry.
 
     Returns a dict with keys: sca, detector, table, stats, sp, bkg_map.
@@ -91,7 +92,7 @@ def phot_one_sca(uri, filename, *, phot_kwargs, bkg_kwargs=None, _SourcePhotomet
 
     try:
         sources, phot_table, sp, stats = run_aperture_photometry(
-            data, dq=dq, _SourcePhotometry=_SourcePhotometry, **phot_kwargs
+            data, dq=dq, **phot_kwargs
         )
     except Exception as exc:
         print(f'[roman_phot] WARNING: photometry failed for SCA {sca_num}: {exc}', file=sys.stderr)
@@ -358,12 +359,6 @@ def phot_exposure(uri_filename_pairs, *, phot_kwargs=None, bkg_kwargs=None, max_
     Returns a list of result dicts (sorted by SCA number), with None entries
     removed.
     """
-    # Load photometry module once at the start, shared across all SCAs
-    try:
-        from photometry import SourcePhotometry
-    except ImportError:
-        raise ImportError('roman-lolo not installed; install with: pip install -e .')
-
     if phot_kwargs is None:
         phot_kwargs = {}
 
@@ -371,8 +366,7 @@ def phot_exposure(uri_filename_pairs, *, phot_kwargs=None, bkg_kwargs=None, max_
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {
             pool.submit(phot_one_sca, uri, fn,
-                        phot_kwargs=phot_kwargs, bkg_kwargs=bkg_kwargs,
-                        _SourcePhotometry=SourcePhotometry): fn
+                        phot_kwargs=phot_kwargs, bkg_kwargs=bkg_kwargs): fn
             for uri, fn in uri_filename_pairs
         }
         for fut in as_completed(futures):

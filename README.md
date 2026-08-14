@@ -233,7 +233,7 @@ The core photometry functionality is in `photometry.py`, which contains the `Sou
 - **PSF photometry** — integrated Gaussian PRF fitting
 - **DS9 visualization** — region files and overlays
 
-This replaces the external `roman-lolo` dependency, making the package self-contained.
+The package is fully self-contained with no external roman-specific photometry dependencies.
 
 ### Streaming Pipeline
 

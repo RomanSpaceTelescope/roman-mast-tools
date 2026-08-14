@@ -1,3 +1,5 @@
+import sys
+
 import numpy as np
 from astropy.io import fits
 from astropy.stats import sigma_clipped_stats
@@ -536,3 +538,130 @@ class SourcePhotometry:
             f.write('\n'.join(lines))
 
         print(f"  DS9 catalog written: {cat_file}")
+
+
+# ---------------------------------------------------------------------------
+# Background fitting
+# ---------------------------------------------------------------------------
+
+def fit_background(data, dq=None, poly_degree=3):
+    """Fit a 2D polynomial background to *data*, ignoring bad pixels.
+
+    Parameters
+    ----------
+    data : ndarray (ny, nx), float32
+    dq : ndarray of int, optional
+        Bad-pixel mask; pixels where dq != 0 are excluded from the fit.
+    poly_degree : int
+        Degree of the 2D polynomial (default 3).
+
+    Returns
+    -------
+    bkg_fit : ndarray, same shape as data
+    data_sub : ndarray, same shape as data
+    mask : ndarray of bool
+    bkg_level : float
+    residual_rms : float
+    """
+    from astropy.modeling import models, fitting
+
+    ny, nx = data.shape
+    mask = (dq != 0) if dq is not None else np.zeros(data.shape, dtype=bool)
+
+    poly_init = models.Polynomial2D(degree=poly_degree)
+    fitter = fitting.LinearLSQFitter()
+
+    ds = 4
+    y_ds, x_ds = np.mgrid[0:ny:ds, 0:nx:ds]
+    data_ds = data[::ds, ::ds]
+    mask_ds = mask[::ds, ::ds]
+    valid = ~mask_ds
+
+    print(f'[view_sca] fitting degree-{poly_degree} 2D polynomial background '
+          f'({int(np.sum(valid))} points at 1/{ds} resolution) ...', file=sys.stderr)
+    if np.any(valid):
+        poly = fitter(poly_init, x_ds[valid], y_ds[valid], data_ds[valid])
+        y_full, x_full = np.mgrid[:ny, :nx]
+        bkg_fit = poly(x_full, y_full).astype(np.float32)
+    else:
+        bkg_fit = np.zeros(data.shape, dtype=np.float32)
+
+    data_sub = data - bkg_fit
+
+    sky_mask = np.isfinite(data_sub) & ~mask
+    flat = data_sub[sky_mask] if sky_mask.any() else data_sub[np.isfinite(data_sub)]
+    _, _, residual_rms = sigma_clipped_stats(flat, sigma=5.0)
+    bkg_level = float(np.mean(bkg_fit[~mask]) if np.any(~mask) else np.mean(bkg_fit))
+
+    print(f'[view_sca] background level={bkg_level:.4g}  RMS={residual_rms:.4g}', file=sys.stderr)
+    return bkg_fit, data_sub, mask, bkg_level, residual_rms
+
+
+# ---------------------------------------------------------------------------
+# Combined background + aperture photometry pipeline
+# ---------------------------------------------------------------------------
+
+def run_aperture_photometry(data, *, dq=None, fwhm_pix=1.5, detection_sigma=20.0,
+                             aperture_radius_fwhm=2.5, annulus_inner_fwhm=6.0,
+                             annulus_outer_fwhm=8.0, bkg_poly_degree=3, snr_threshold=5.0):
+    """Fit background, detect sources, and run aperture photometry.
+
+    Returns
+    -------
+    sources : astropy.table.Table or None
+    phot_table : astropy.table.Table or None
+    sp : SourcePhotometry
+    stats : dict
+        Keys: bkg_level, bkg_rms, threshold, n_sources, bkg_fit, data_sub, poly_degree
+    """
+    ny, nx = data.shape
+    bkg_fit, data_sub, mask, bkg_level, residual_rms = fit_background(
+        data, dq=dq, poly_degree=bkg_poly_degree,
+    )
+    n_masked = int(np.sum(mask))
+    print(f'[phot] image {ny}x{nx}  masked pixels: {n_masked} ({100*n_masked/mask.size:.1f}%)',
+          file=sys.stderr)
+    print(f'[phot] background level={bkg_level:.4g}  RMS={residual_rms:.4g}  '
+          f'threshold ({detection_sigma}σ)={detection_sigma * residual_rms:.4g}', file=sys.stderr)
+
+    sp = SourcePhotometry(
+        fwhm_pix=fwhm_pix,
+        detection_sigma=detection_sigma,
+        aperture_radius_fwhm=aperture_radius_fwhm,
+        annulus_inner_fwhm=annulus_inner_fwhm,
+        annulus_outer_fwhm=annulus_outer_fwhm,
+    )
+
+    print(f'[phot] detecting sources (FWHM={fwhm_pix}px  aper={aperture_radius_fwhm}×FWHM  '
+          f'annulus={annulus_inner_fwhm}–{annulus_outer_fwhm}×FWHM) ...', file=sys.stderr)
+    sources = sp.detect_sources(data_sub, residual_rms)
+    n_sources = len(sources) if sources is not None else 0
+
+    if sources is None or len(sources) == 0:
+        stats = {
+            'bkg_level': bkg_level, 'bkg_rms': residual_rms,
+            'threshold': detection_sigma * residual_rms, 'n_sources': 0,
+            'bkg_fit': bkg_fit, 'data_sub': data_sub, 'poly_degree': bkg_poly_degree,
+        }
+        return None, None, sp, stats
+
+    print(f'[phot] {n_sources} sources detected — running aperture photometry ...', file=sys.stderr)
+    phot_table = sp.aperture_photometry_on_frame(data_sub, sources, residual_rms)
+    if phot_table is not None and 'snr' in phot_table.colnames:
+        snr = phot_table['snr']
+        print(f'[phot] SNR  min={float(snr.min()):.1f}  median={float(np.median(snr)):.1f}  '
+              f'max={float(snr.max()):.1f}', file=sys.stderr)
+        keep = snr >= snr_threshold
+        n_kept = int(np.sum(keep))
+        if n_kept < n_sources:
+            print(f'[phot] SNR >= {snr_threshold}: {n_kept}/{n_sources} sources kept', file=sys.stderr)
+            sources = sources[keep]
+            phot_table = phot_table[keep]
+            n_sources = n_kept
+
+    stats = {
+        'bkg_level': bkg_level, 'bkg_rms': residual_rms,
+        'threshold': detection_sigma * residual_rms, 'n_sources': n_sources,
+        'bkg_fit': bkg_fit, 'data_sub': data_sub, 'poly_degree': bkg_poly_degree,
+    }
+    return sources, phot_table, sp, stats
