@@ -432,16 +432,21 @@ def display_in_mpl(data, detector, *, dq=None, title=None, wcs_header=None,
 
     if projection is None:
         # Plain axes: show native pixel coordinates at section boundaries
-        tick_locs = [0] + section_locs + [nx - 1]
-        tick_vals = [ref_pix] + [512 * j for j in range(1, 8)] + [4096 - ref_pix]
-        ax.set_xticks(tick_locs)
-        ax.set_yticks(tick_locs)
-        if rotated:
-            ax.set_xticklabels(tick_vals)
-            ax.set_yticklabels(tick_vals[::-1])
+        # Disable tick labels when saving to PNG to avoid expensive text measurement in Agg backend
+        if save_path is None:
+            tick_locs = [0] + section_locs + [nx - 1]
+            tick_vals = [ref_pix] + [512 * j for j in range(1, 8)] + [4096 - ref_pix]
+            ax.set_xticks(tick_locs)
+            ax.set_yticks(tick_locs)
+            if rotated:
+                ax.set_xticklabels(tick_vals)
+                ax.set_yticklabels(tick_vals[::-1])
+            else:
+                ax.set_xticklabels(tick_vals[::-1])
+                ax.set_yticklabels(tick_vals)
         else:
-            ax.set_xticklabels(tick_vals[::-1])
-            ax.set_yticklabels(tick_vals)
+            ax.set_xticks([])
+            ax.set_yticks([])
 
     col_label_y = ny + 20
     ax.set_xlim(-0.5, nx + 50)
@@ -496,8 +501,9 @@ def display_in_mpl(data, detector, *, dq=None, title=None, wcs_header=None,
 
         ax.set_autoscale_on(True)
 
-    if stats is not None:
+    if stats is not None and save_path is None:
         # Display background statistics in a text panel (upper-left corner)
+        # Skip for saved PNGs to avoid expensive text measurement
         stats_text = (
             f"Background Stats:\n"
             f"Level: {stats['bkg_level']:.2f}\n"
@@ -528,7 +534,7 @@ def display_in_mpl(data, detector, *, dq=None, title=None, wcs_header=None,
 
     fig.tight_layout()
     if save_path is not None:
-        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        fig.savefig(save_path, dpi=150)
     else:
         plt.show()
     return fig, ax
@@ -607,7 +613,7 @@ def display_residuals_mpl(data_sub, detector, *, bkg_fit=None, bkg_level=0.0,
                  fontsize=12)
     fig.tight_layout()
     if save_path is not None:
-        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        fig.savefig(save_path, dpi=150)
     else:
         plt.show()
     return fig, axes

@@ -39,20 +39,12 @@ Usage
 import argparse
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+
+import matplotlib
+matplotlib.use('Agg')
 
 import numpy as np
-import matplotlib.pyplot as plt
-from astropy.table import vstack, Table
-from astropy.stats import sigma_clipped_stats
-from astropy.modeling import models, fitting
-from astropy.convolution import Gaussian2DKernel, convolve
-from astropy.visualization import simple_norm
-from photutils.segmentation import detect_sources
-from scipy.ndimage import binary_dilation, generate_binary_structure, iterate_structure
-
-from roman_view_sca import stream_sca, parse_filename, display_in_mpl, display_residuals_mpl
-from photometry import run_aperture_photometry
 
 # ---------------------------------------------------------------------------
 # WFI focal-plane constants
@@ -88,6 +80,29 @@ _WFI_SCA_LAYOUT = {
 }
 
 
+def parse_filename(filename):
+    """Extract visit ID, exposure number, SCA number, and filter from Roman filename.
+
+    E.g. r0003201001001001004_0001_wfi11_f106_cal.asdf
+    """
+    base = filename.replace('.asdf', '')
+    parts = base.split('_')
+
+    visit_id = parts[0]           # r0003201001001001004
+    exposure_num = parts[1]       # 0001
+    sca_str = parts[2]            # wfi11
+    filter_str = parts[3]         # f106
+
+    sca_num = int(sca_str.replace('wfi', ''))
+
+    return {
+        'visit_id': visit_id,
+        'exposure_num': exposure_num,
+        'sca_num': sca_num,
+        'filter': filter_str,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Per-SCA photometry
 # ---------------------------------------------------------------------------
@@ -100,11 +115,23 @@ def phot_one_sca(uri, filename, *, phot_kwargs, bkg_kwargs=None, png_path=None,
     bkg_map is None when bkg_kwargs is None; thumb is None when image_mosaic is False.
     Returns None on failure (logs a warning).
     """
+    import time
+    pid = os.getpid()
+    t_start = time.perf_counter()
+    def log(stage):
+        print(f'[pid {pid}] {filename[-30:]} {stage} '
+              f'@ {time.perf_counter()-t_start:.1f}s', file=sys.stderr, flush=True)
+
+    from roman_view_sca import stream_sca, display_in_mpl, display_residuals_mpl
+    from photometry import run_aperture_photometry
+
+    log('start')
     try:
         data, detector, _wcs_hdr, dq = stream_sca(uri, filename)
     except Exception as exc:
         print(f'[roman_phot] WARNING: failed to stream {filename}: {exc}', file=sys.stderr)
         return None
+    log('stream done')
 
     parsed = parse_filename(filename)
     sca_num = parsed['sca_num']
@@ -116,6 +143,7 @@ def phot_one_sca(uri, filename, *, phot_kwargs, bkg_kwargs=None, png_path=None,
     except Exception as exc:
         print(f'[roman_phot] WARNING: photometry failed for SCA {sca_num}: {exc}', file=sys.stderr)
         return None
+    log('phot done')
 
     if phot_table is not None and len(phot_table) > 0:
         phot_table['sca'] = sca_num
@@ -145,6 +173,7 @@ def phot_one_sca(uri, filename, *, phot_kwargs, bkg_kwargs=None, png_path=None,
         except Exception as exc:
             print(f'[roman_phot] WARNING: background map failed for SCA {sca_num}: {exc}',
                   file=sys.stderr)
+    log('bkg map done')
 
     if png_path is not None:
         try:
@@ -178,14 +207,22 @@ def phot_one_sca(uri, filename, *, phot_kwargs, bkg_kwargs=None, png_path=None,
             except Exception as exc:
                 print(f'[roman_phot] WARNING: bkg PNG failed for SCA {sca_num}: {exc}',
                       file=sys.stderr)
+    log('png saved')
 
     thumb = data[::2, ::2].astype(np.float32) if image_mosaic else None
 
+    # Strip full-resolution arrays before pickling the result back to the parent.
+    # bkg_fit, data_sub, bkg_rms are each ~67 MB; they were only needed inside
+    # this worker (for the PNGs and bkg_map above) and are not used in the parent.
+    stats_slim = {k: v for k, v in stats.items()
+                  if k not in ('bkg_fit', 'data_sub', 'bkg_rms')}
+
+    log('return')
     return {
         'sca': sca_num,
         'detector': detector,
         'table': phot_table,
-        'stats': stats,
+        'stats': stats_slim,
         'sp': sp,
         'bkg_map': bkg_map,
         'thumb': thumb,
@@ -210,6 +247,12 @@ def background_map_one_sca(data, dq, *, superpixel=512, mask_sigma=1.5,
     Returns a 2D float array of shape (ny//superpixel, nx//superpixel), or
     None if the image is too small.
     """
+    from astropy.stats import sigma_clipped_stats
+    from astropy.modeling import models, fitting
+    from astropy.convolution import Gaussian2DKernel, convolve
+    from photutils.segmentation import detect_sources
+    from scipy.ndimage import binary_dilation, generate_binary_structure, iterate_structure
+
     ny, nx = data.shape
     mask = (dq != 0) if dq is not None else np.zeros_like(data, dtype=bool)
 
@@ -298,6 +341,7 @@ def make_image_mosaic_png(sca_thumbs, out_path, *, title=None):
     """
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
+    from astropy.visualization import simple_norm
 
     thumbs = {k: v for k, v in sca_thumbs.items() if v is not None}
     if not thumbs:
@@ -326,6 +370,8 @@ def make_image_mosaic_png(sca_thumbs, out_path, *, title=None):
     ax.set_xlim(x_lo, x_hi)
     ax.set_ylim(y_lo, y_hi)
     ax.set_aspect('equal')
+    ax.set_xticks([])
+    ax.set_yticks([])
 
     for sca_num, (cx_mm, cy_mm, rot) in _WFI_SCA_LAYOUT.items():
         tile = thumbs.get(sca_num)
@@ -359,7 +405,7 @@ def make_image_mosaic_png(sca_thumbs, out_path, *, title=None):
                  color='white', fontsize=12, pad=10)
     ax.axis('off')
     fig.tight_layout()
-    fig.savefig(out_path, dpi=300, bbox_inches='tight', facecolor=fig.get_facecolor())
+    fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor())
     plt.close(fig)
     print(f'[roman_phot] image mosaic -> {out_path}', file=sys.stderr)
 
@@ -473,7 +519,7 @@ def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
                  color='white', fontsize=12, pad=10)
     ax.axis('off')
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor=fig.get_facecolor())
+    fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor())
     plt.close(fig)
     print(f'[roman_phot] background mosaic -> {out_path}', file=sys.stderr)
 
@@ -493,6 +539,7 @@ def make_source_dot_mosaic_png(sources_csv_path, out_path, *, title=None):
     """
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
+    from astropy.table import Table
 
     try:
         sources = Table.read(sources_csv_path, format='ascii.csv')
@@ -529,6 +576,8 @@ def make_source_dot_mosaic_png(sources_csv_path, out_path, *, title=None):
     ax.set_xlim(x_lo, x_hi)
     ax.set_ylim(y_lo, y_hi)
     ax.set_aspect('equal')
+    ax.set_xticks([])
+    ax.set_yticks([])
 
     for sca_num, (cx_mm, cy_mm, rot) in _WFI_SCA_LAYOUT.items():
         mask = np.asarray(sources['sca']) == sca_num
@@ -570,7 +619,7 @@ def make_source_dot_mosaic_png(sources_csv_path, out_path, *, title=None):
                  color='white', fontsize=12, pad=10)
     ax.axis('off')
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches='tight', facecolor=fig.get_facecolor())
+    fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor())
     plt.close(fig)
     print(f'[roman_phot] source dot mosaic -> {out_path}', file=sys.stderr)
 
@@ -586,13 +635,24 @@ def phot_exposure(uri_filename_pairs, *, phot_kwargs=None, bkg_kwargs=None,
     Returns a list of result dicts (sorted by SCA number), with None entries
     removed.
     """
-
-
     if phot_kwargs is None:
         phot_kwargs = {}
 
+    import multiprocessing
+    import importlib.metadata as _im
+    _orig_pd = _im.packages_distributions
+    _im.packages_distributions = lambda: {'photutils': ['photutils']}
+
+    import photutils  # noqa: E402
+    _im.packages_distributions = _orig_pd  # restore for anyone else
+
+
+    n_tasks = len(uri_filename_pairs)
+    n_workers = min(max_workers, n_tasks, os.cpu_count() or max_workers)
+    ctx = multiprocessing.get_context('fork')
+
     results = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as pool:
         futures = {}
         for uri, fn in uri_filename_pairs:
             meta = parse_filename(fn)
@@ -611,6 +671,8 @@ def phot_exposure(uri_filename_pairs, *, phot_kwargs=None, bkg_kwargs=None,
 
 def stream_image_mosaic(uri_filename_pairs, *, max_workers=8):
     """Stream all SCAs and return a dict of {sca_num: decimated thumbnail}."""
+    from roman_view_sca import stream_sca
+
     def _stream_one(uri, fn):
         try:
             data, _det, _wcs, _dq = stream_sca(uri, fn)
@@ -658,6 +720,8 @@ def load_uri_file(path):
 
 def build_summary(results):
     """Build an astropy Table with one row per SCA."""
+    from astropy.table import Table
+
     rows = []
     for r in results:
         sca = r['sca']
@@ -676,10 +740,10 @@ def build_summary(results):
         rows.append({
             'sca':               sca,
             'detector':          det,
-            'bkg_level':         stats['bkg_level'],
-            'bkg_rms':           stats['bkg_rms_median'],
-            'detection_threshold': stats['threshold'],
-            'n_sources':         stats['n_sources'],
+            'bkg_level':         stats.get('bkg_level', float('nan')),
+            'bkg_rms':           stats.get('bkg_rms_median', float('nan')),
+            'detection_threshold': stats.get('threshold', float('nan')),
+            'n_sources':         stats.get('n_sources', 0),
             'snr_min':           snr_min,
             'snr_median':        snr_median,
             'snr_max':           snr_max,
@@ -763,6 +827,9 @@ def make_histograms_from_csv(csv_path, output_path, columns=None, bins=30, outli
     outlier_method : str
         Outlier rejection method ('iqr' or 'none')
     """
+    import matplotlib.pyplot as plt
+    from astropy.table import Table
+
     if columns is None:
         columns = ['aperture_sum_0', 'snr']
 
@@ -839,7 +906,7 @@ def make_histograms_from_csv(csv_path, output_path, columns=None, bins=30, outli
     fig.tight_layout()
 
     try:
-        fig.savefig(output_path, dpi=150, bbox_inches='tight')
+        fig.savefig(output_path, dpi=150)
         print(f'[roman_phot] histograms -> {output_path}', file=sys.stderr)
     except Exception as exc:
         print(f'[roman_phot] WARNING: failed to save histograms: {exc}', file=sys.stderr)
@@ -906,7 +973,7 @@ def main():
 
     args = ap.parse_args()
 
-
+    from astropy.table import vstack, Table
 
     # --remake-mosaics: skip photometry, load saved arrays and re-render PNGs
     if args.remake_mosaics:
@@ -1008,34 +1075,55 @@ def main():
         summary.write(p('summary.csv'), format='ascii.csv', overwrite=True)
         print(f'[roman_phot] summary ({len(summary)} SCAs) -> {p("summary.csv")}', file=sys.stderr)
 
-    # Background mosaic PNG and source dot mosaic
+    # Mosaic PNGs — rendered in parallel (each is independent and CPU-bound)
+    mosaic_tasks = []
+    sca_maps = {}
     if args.bkg_mosaic:
         sca_maps = {r['sca']: r['bkg_map'] for r in results}
         save_mosaic_data(sca_maps, p('mosaic_data.npz'))
-        make_bkg_mosaic_png(
-            sca_maps, p('bkg_mosaic.png'),
-            superpixel=args.bkg_superpixel,
-            title=f'{exp_title} — background mosaic',
-        )
+        mosaic_tasks.append((make_bkg_mosaic_png, (sca_maps, p('bkg_mosaic.png')),
+                             dict(superpixel=args.bkg_superpixel,
+                                  title=f'{exp_title} — background mosaic')))
         if tables:
-            make_source_dot_mosaic_png(
-                p('sources.csv'), p('source_mosaic.png'),
-                title=f'{exp_title} — sources',
-            )
+            mosaic_tasks.append((make_source_dot_mosaic_png,
+                                 (p('sources.csv'), p('source_mosaic.png')),
+                                 dict(title=f'{exp_title} — sources')))
 
-    # Image mosaic
     if args.image_mosaic:
         sca_thumbs = {r['sca']: r['thumb'] for r in results}
-        make_image_mosaic_png(
-            sca_thumbs, p('image_mosaic.png'),
-            title=f'{exp_title} — image mosaic',
-        )
+        mosaic_tasks.append((make_image_mosaic_png, (sca_thumbs, p('image_mosaic.png')),
+                             dict(title=f'{exp_title} — image mosaic')))
+
+    if mosaic_tasks:
+        import multiprocessing
+        with ProcessPoolExecutor(max_workers=len(mosaic_tasks),
+                                 mp_context=multiprocessing.get_context('fork')) as pool:
+            futs = [pool.submit(fn, *a, **kw) for fn, a, kw in mosaic_tasks]
+            for fut in as_completed(futs):
+                fut.result()  # re-raise any exception
 
     # Generate histograms
     if not args.no_hist and tables:
         make_histograms_from_csv(p('sources.csv'), p('histograms.png'),
                                  columns=['aperture_sum_0', 'snr'])
 
+
+def _register_as_importable():
+    # ProcessPoolExecutor pickles tasks by (module, name). When this script is
+    # run via exec() — e.g. `python -m cProfile roman_phot.py` — cProfile owns
+    # sys.modules['__main__'], so our functions' __module__='__main__' can't be
+    # looked up there. Fix: register ourselves under 'roman_phot' and patch
+    # __module__ on all callables so pickle resolves them correctly.
+    import sys, types
+    if 'roman_phot' not in sys.modules:
+        mod = types.ModuleType('roman_phot')
+        mod.__dict__.update(globals())
+        sys.modules['roman_phot'] = mod
+        for obj in globals().values():
+            if callable(obj) and getattr(obj, '__module__', None) == '__main__':
+                obj.__module__ = 'roman_phot'
+
+_register_as_importable()
 
 if __name__ == '__main__':
     main()
