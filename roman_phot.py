@@ -405,7 +405,7 @@ def make_image_mosaic_png(sca_thumbs, out_path, *, title=None):
                  color='white', fontsize=12, pad=10)
     ax.axis('off')
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor())
+    fig.savefig(out_path, dpi=300, facecolor=fig.get_facecolor())
     plt.close(fig)
     print(f'[roman_phot] image mosaic -> {out_path}', file=sys.stderr)
 
@@ -519,7 +519,7 @@ def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
                  color='white', fontsize=12, pad=10)
     ax.axis('off')
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor())
+    fig.savefig(out_path, dpi=300, facecolor=fig.get_facecolor())
     plt.close(fig)
     print(f'[roman_phot] background mosaic -> {out_path}', file=sys.stderr)
 
@@ -619,7 +619,7 @@ def make_source_dot_mosaic_png(sources_csv_path, out_path, *, title=None):
                  color='white', fontsize=12, pad=10)
     ax.axis('off')
     fig.tight_layout()
-    fig.savefig(out_path, dpi=150, facecolor=fig.get_facecolor())
+    fig.savefig(out_path, dpi=300, facecolor=fig.get_facecolor())
     plt.close(fig)
     print(f'[roman_phot] source dot mosaic -> {out_path}', file=sys.stderr)
 
@@ -906,7 +906,7 @@ def make_histograms_from_csv(csv_path, output_path, columns=None, bins=30, outli
     fig.tight_layout()
 
     try:
-        fig.savefig(output_path, dpi=150)
+        fig.savefig(output_path, dpi=300)
         print(f'[roman_phot] histograms -> {output_path}', file=sys.stderr)
     except Exception as exc:
         print(f'[roman_phot] WARNING: failed to save histograms: {exc}', file=sys.stderr)

@@ -534,7 +534,7 @@ def display_in_mpl(data, detector, *, dq=None, title=None, wcs_header=None,
 
     fig.tight_layout()
     if save_path is not None:
-        fig.savefig(save_path, dpi=150)
+        fig.savefig(save_path, dpi=300)
     else:
         plt.show()
     return fig, ax
@@ -613,7 +613,7 @@ def display_residuals_mpl(data_sub, detector, *, bkg_fit=None, bkg_level=0.0,
                  fontsize=12)
     fig.tight_layout()
     if save_path is not None:
-        fig.savefig(save_path, dpi=150)
+        fig.savefig(save_path, dpi=300)
     else:
         plt.show()
     return fig, axes
