@@ -52,11 +52,8 @@ import sys
 
 import numpy as np
 import s3fs
-import roman_datamodels as rdm
 from astropy.io import fits
 from astropy.wcs import WCS
-
-from photometry import fit_background, run_aperture_photometry
 
 # ---------------------------------------------------------------------------
 # Focal-plane rotation table (from MPA_SCA_info).
@@ -80,6 +77,8 @@ def stream_sca(uri, filename=None, *, sip_degree=4, asdf_file=None):
     Materialises ``dm.data`` and computes the SIP WCS approximation while the
     ASDF file handle is still open (gwcs needs the live tree for to_fits_sip).
     """
+    import roman_datamodels as rdm
+
     if asdf_file is not None:
         # Already have an open AsdfFile (from roman_mast streaming)
         print(f'[view_sca] using provided AsdfFile', file=sys.stderr)
@@ -790,6 +789,9 @@ def main():
                  f'{meta["filter"]}')
 
     dq_wanted = not args.no_dq
+
+    # Delay photometry imports until actually needed to avoid hanging at module load
+    from photometry import fit_background, run_aperture_photometry
 
     # Background subtraction (standalone — when --bkg without --phot)
     bkg_fit = data_sub = bkg_level = bkg_rms = None

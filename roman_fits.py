@@ -187,6 +187,318 @@ def stream_materialized(exposure: Exposure, missions, *, scas=None,
 
 
 # ---------------------------------------------------------------------------
+# Coadd mosaic streaming
+# ---------------------------------------------------------------------------
+
+def _stream_one_coadd(filename: str, missions) -> tuple:
+    """Worker: open one coadd tile, materialize arrays. Thread-safe.
+
+    Returns (filename, dm) on success, (filename, None) on failure.
+    """
+    try:
+        af = missions.read_product(filename)
+        dm = rdm.open(af)
+        _materialize_dm(dm)
+        return filename, dm
+    except Exception as e:
+        _log(f"ERROR streaming coadd {filename}: {type(e).__name__}: {e}")
+        return filename, None
+
+
+def stream_coadd(
+    filenames,
+    missions,
+    *,
+    show_progress: bool = True,
+    max_workers: int = 8,
+) -> dict:
+    """Stream coadd mosaic tile files in parallel, materializing arrays inline.
+
+    Like `stream_materialized` for SCAs, but operates on a flat list of coadd
+    filenames (``_coadd.asdf``) rather than a per-SCA Exposure structure. Each
+    file is opened, wrapped into a roman_datamodels DataModel, and has its big
+    arrays pre-loaded so no downstream sink ever re-hits the 60 s pre-signed
+    S3 URL.
+
+    Parameters
+    ----------
+    filenames : list of str
+        Coadd filenames to stream (e.g. from ``DataResults.filenames`` when
+        ``kinds='coadd'`` was used).
+    missions : MastMissions
+        Authenticated session (e.g. ``res.missions``).
+    show_progress : bool
+        Show a tqdm progress bar. Default True.
+    max_workers : int
+        Concurrent tile fetches. Default 8.
+
+    Returns
+    -------
+    dict[str, DataModel]
+        Mapping filename → open DataModel with arrays resident in memory.
+        A None value marks a tile that failed to stream.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:  # pragma: no cover
+        def tqdm(iterable, **_):
+            return iterable
+
+    filenames = list(filenames)
+    workers = max(1, min(max_workers, len(filenames)))
+    _log(f"Streaming {len(filenames)} coadd tile(s) "
+         f"({workers} workers, materializing inline)")
+
+    dm_dict: dict = {}
+
+    if workers == 1:
+        iterator = tqdm(filenames, desc="Streaming coadd tiles",
+                        disable=not show_progress)
+        for filename in iterator:
+            _, dm = _stream_one_coadd(filename, missions)
+            dm_dict[filename] = dm
+        return dm_dict
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [
+            pool.submit(_stream_one_coadd, filename, missions)
+            for filename in filenames
+        ]
+        iterator = tqdm(
+            as_completed(futures), total=len(futures),
+            desc="Streaming coadd tiles", disable=not show_progress,
+        )
+        for fut in iterator:
+            filename, dm = fut.result()
+            dm_dict[filename] = dm
+
+    # Preserve input order.
+    return {fn: dm_dict[fn] for fn in filenames if fn in dm_dict}
+
+
+def _build_coadd_header(dm, sip_degree: int) -> fits.Header:
+    """Return a FITS header for one coadd tile — SIP WCS + metadata keywords.
+
+    Mirrors `_build_sca_header` but without SCA-specific fields. Falls back
+    gracefully if the model carries a standard FITS WCS rather than gwcs.
+    """
+    wcs = getattr(getattr(dm, 'meta', None), 'wcs', None)
+    if wcs is not None and hasattr(wcs, 'to_fits_sip'):
+        try:
+            bb = getattr(wcs, 'bounding_box', None)
+            hdr = wcs.to_fits_sip(bounding_box=bb, degree=sip_degree)
+        except Exception:
+            hdr = fits.Header()
+    elif wcs is not None and hasattr(wcs, 'to_header'):
+        hdr = wcs.to_header()
+    else:
+        hdr = fits.Header()
+
+    for src, dest, comment in _META_KEYWORDS:
+        try:
+            val = dm.meta
+            for attr in src.split('.'):
+                val = getattr(val, attr)
+            hdr[dest] = (str(val), comment)
+        except AttributeError:
+            pass
+
+    return hdr
+
+
+def to_fits_files_coadd(
+    dm_dict: dict,
+    *,
+    out_dir: Optional[str] = None,
+    compress: bool = False,
+    sip_degree: int = 4,
+    overwrite: bool = True,
+) -> str:
+    """Write each coadd tile to its own FITS file.
+
+    Parameters
+    ----------
+    dm_dict : dict[str, DataModel]
+        Mapping filename → DataModel, as returned by `stream_coadd`.
+    out_dir : str, optional
+        Output directory. Defaults to ``coadd_fits/`` in the cwd.
+    compress : bool
+        RICE_1 tile-compressed ``.fits.fz`` if True. Default False.
+    sip_degree : int
+        SIP polynomial degree for the gwcs → FITS approximation. Default 4.
+    overwrite : bool
+        Overwrite existing files. Default True.
+
+    Returns
+    -------
+    str
+        The output directory path.
+    """
+    if out_dir is None:
+        out_dir = 'coadd_fits'
+    os.makedirs(out_dir, exist_ok=True)
+    ext = 'fits.fz' if compress else 'fits'
+
+    _log(f"Writing coadd FITS files → {out_dir}/  "
+         f"(compress={compress}, sip_degree={sip_degree})")
+
+    written = 0
+    for filename, dm in dm_dict.items():
+        if dm is None:
+            _log(f"  {filename}: no data, skipping")
+            continue
+
+        data = np.asarray(dm.data[...]).astype(np.float32)
+        hdr = _build_coadd_header(dm, sip_degree)
+
+        stem = os.path.basename(filename)
+        for suffix in ('.asdf', '.fits'):
+            if stem.endswith(suffix):
+                stem = stem[:-len(suffix)]
+        out_path = os.path.join(out_dir, f'{stem}.{ext}')
+
+        if compress:
+            comp = fits.CompImageHDU(
+                data=data, header=hdr,
+                compression_type='RICE_1', tile_shape=(256, 256),
+            )
+            hdul = fits.HDUList([fits.PrimaryHDU(), comp])
+        else:
+            hdul = fits.HDUList([fits.PrimaryHDU(data=data, header=hdr)])
+
+        hdul.writeto(out_path, overwrite=overwrite)
+        size_mb = os.path.getsize(out_path) / 1e6
+        _log(f"  {stem}: wrote {out_path}  "
+             f"({data.shape[0]}x{data.shape[1]}, {size_mb:.0f} MB)")
+        written += 1
+
+    _log(f"Wrote {written} coadd FITS file(s) in {out_dir}/")
+    _log(f"  Open in DS9:  ds9 -mosaic {out_dir}/*.{ext}")
+    return out_dir
+
+
+def to_ds9_coadd(
+    dm_dict: dict,
+    *,
+    sip_degree: int = 4,
+    dq_overlay: bool = True,
+    ds9_target: Optional[str] = None,
+):
+    """Pipe coadd mosaic tiles into DS9 as a WCS mosaic via XPA.
+
+    Equivalent of `to_ds9` for coadd tiles — builds an in-memory MEF from
+    the streamed DataModels and ships it to DS9 with
+    ``fits mosaicimage wcs``. Nothing hits local disk.
+
+    Parameters
+    ----------
+    dm_dict : dict[str, DataModel]
+        Mapping filename → DataModel, as returned by `stream_coadd`.
+    sip_degree : int
+        SIP polynomial degree for gwcs → FITS. Default 4.
+    dq_overlay : bool
+        Send DQ as a mask overlay when available. Default True.
+    ds9_target : str, optional
+        DS9 XPA target name. Defaults to the first DS9 found.
+
+    Returns
+    -------
+    pyds9.DS9
+        The DS9 instance, loaded with the coadd mosaic.
+    """
+    if pyds9 is None:
+        raise ImportError(
+            "pyds9 is required for to_ds9_coadd. Install with `pip install pyds9` "
+            "(and make sure DS9 itself is running: `ds9 &`)."
+        )
+
+    try:
+        d = pyds9.DS9(target=ds9_target) if ds9_target else pyds9.DS9()
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to connect to DS9: {e}\n"
+            f"Make sure DS9 is running: ds9 &"
+        )
+
+    _log(f"Building in-memory coadd MEF for DS9 "
+         f"({len(dm_dict)} tile(s), sip_degree={sip_degree})")
+
+    data_hdulist = fits.HDUList([fits.PrimaryHDU()])
+    dq_hdulist   = fits.HDUList([fits.PrimaryHDU()])
+    n_data = 0
+    n_dq   = 0
+
+    for i, (filename, dm) in enumerate(dm_dict.items()):
+        if dm is None:
+            _log(f"  tile {i} ({filename}): no data, skipping")
+            continue
+
+        data = np.asarray(dm.data[...]).astype(np.float32)
+        hdr  = _build_coadd_header(dm, sip_degree)
+        stem = os.path.basename(filename).replace('.asdf', '')
+        extname = f'TILE{i:02d}'
+
+        data_hdulist.append(
+            fits.ImageHDU(data=data, header=hdr.copy(), name=extname)
+        )
+        n_data += 1
+
+        if dq_overlay:
+            try:
+                dq = np.asarray(dm.dq[...])
+                dq_mask = (dq != 0).astype(np.uint8)
+                dq_hdr = hdr.copy()
+                dq_hdr['BUNIT']   = 'flag'
+                dq_hdr['CONTENT'] = ('DQ_MASK', 'Non-zero = bad pixel (any DQ bit set)')
+                dq_hdulist.append(
+                    fits.ImageHDU(data=dq_mask, header=dq_hdr,
+                                  name=f'DQ{i:02d}')
+                )
+                n_dq += 1
+            except (AttributeError, KeyError):
+                pass
+
+        _log(f"  tile {i} ({stem}): added to mosaic "
+             f"({data.shape[0]}x{data.shape[1]})")
+
+    if n_data == 0:
+        raise RuntimeError("No coadd data streamed; nothing to load into DS9.")
+
+    data_buf = io.BytesIO()
+    data_hdulist.writeto(data_buf)
+    data_bytes = data_buf.getvalue()
+
+    _log(f"Piping {len(data_bytes)/1e6:.0f} MB coadd MEF into DS9 as WCS mosaic")
+    d.set('frame delete all')
+    d.set('frame new')
+    d.set('fits mosaicimage wcs', data_bytes)
+
+    if dq_overlay and n_dq > 0:
+        dq_buf = io.BytesIO()
+        dq_hdulist.writeto(dq_buf)
+        dq_bytes = dq_buf.getvalue()
+
+        _log(f"Piping {len(dq_bytes)/1e6:.1f} MB DQ mask MEF into DS9 as overlay")
+        d.set('mask clear')
+        d.set('mask color red')
+        d.set('mask transparency 50')
+        d.set('mask mark nonzero')
+        d.set('fits mask mosaicimage wcs', dq_bytes)
+
+    d.set('zoom to fit')
+
+    extras = []
+    if n_dq:
+        extras.append(f"DQ overlay ({n_dq} tiles)")
+    extras_str = f" + {' + '.join(extras)}" if extras else ""
+    _log(f"Loaded {n_data} coadd tile(s) into DS9{extras_str}")
+
+    return d
+
+
+# ---------------------------------------------------------------------------
 # Optional pyds9 — only needed for to_ds9()
 # ---------------------------------------------------------------------------
 
@@ -747,6 +1059,399 @@ def to_ds9(
 
     return d
 
+# # ---------------------------------------------------------------------------
+# # to_imviz — load every SCA into an in-notebook Jdaviz/Imviz viewer
+# # ---------------------------------------------------------------------------
+
+# def to_imviz(
+#     dm_dict: dict,
+#     exposure: Exposure,
+#     *,
+#     sip_degree: int = 4,
+#     dq_overlay: bool = True,
+#     catalog_paths: Optional[dict] = None,
+#     catalog_radius_arcsec: float = 0.4,
+#     catalog_include_flagged: bool = False,
+#     catalog_marker_color: str = 'green',
+#     catalog_extended_marker_color: Optional[str] = 'yellow',
+#     wcs_link: bool = True,
+#     imviz=None,
+# ):
+#     """Load every SCA of one exposure into an Imviz viewer.
+
+#     Mirrors `to_ds9` but targets Jdaviz/Imviz so it runs headless — the
+#     viewer is an ipywidget that renders in a Jupyter cell (works great
+#     inside VS Code's Remote-SSH notebook UI; no X server needed).
+
+#     Parameters
+#     ----------
+#     dm_dict : dict[int, DataModel]
+#         The `{sca: DataModel}` produced by `stream_materialized`.
+#     exposure : Exposure
+#         Originating exposure (used for header keywords + logging).
+#     sip_degree : int
+#         SIP degree for the gwcs → FITS WCS approximation (default 4,
+#         same default as to_ds9 / to_fits_files).
+#     dq_overlay : bool
+#         If True, load each SCA's DQ mask as a companion data layer so
+#         you can blink between science and DQ or set DQ as a boolean
+#         mask via the Plot Options plugin.
+#     catalog_paths : dict[int, str], optional
+#         `{sca: parquet_path}` from `download_catalogs()`. If given,
+#         catalog sources are pushed as Imviz markers, colored by
+#         is_extended just like the DS9 regions.
+#     wcs_link : bool
+#         If True (default), link all loaded layers by WCS so pan/zoom
+#         is synchronized across SCAs. Set False for pixel-linked mode.
+#     imviz : jdaviz.Imviz, optional
+#         Reuse an existing Imviz instance (e.g., to layer a second
+#         exposure on top). If None, a fresh one is created.
+
+#     Returns
+#     -------
+#     jdaviz.Imviz
+#         The Imviz instance. Call ``.show()`` in a notebook cell to display.
+#     """
+#     from jdaviz import Imviz
+#     from astropy.nddata import NDData
+#     from astropy.wcs import WCS
+
+#     if imviz is None:
+#         imviz = Imviz()
+
+#     tag = f"v{exposure.visit_id}_exp{exposure.exposure:02d}"
+#     n_data = n_dq = 0
+
+#     for scanum in sorted(dm_dict):
+#         dm = dm_dict[scanum]
+#         if dm is None:
+#             _log(f"  SCA {scanum:02d}: no data, skipping")
+#             continue
+
+#         # Same SIP header the FITS/DS9 sinks use → identical WCS.
+#         hdr = _build_sca_header(dm, exposure, scanum, sip_degree)
+#         wcs = WCS(hdr, relax=True)
+
+#         # Science layer
+#         sci = NDData(
+#             data=np.asarray(dm.data[...]).astype(np.float32),
+#             wcs=wcs,
+#             meta=dict(hdr),
+#         )
+#         sci_label = f"{tag}_SCA{scanum:02d}"
+#         imviz.load_data(sci, data_label=sci_label)
+#         n_data += 1
+
+#         # DQ layer (optional). Boolean-cast so the Plot Options plugin
+#         # treats non-zero DQ bits as "bad" for masking overlays.
+#         if dq_overlay:
+#             dq = getattr(dm, 'dq', None)
+#             if dq is not None:
+#                 dq_arr = np.asarray(dq[...]).astype(np.uint32)
+#                 dq_nd = NDData(data=dq_arr, wcs=wcs)
+#                 imviz.load_data(dq_nd, data_label=f"{sci_label}_DQ")
+#                 n_dq += 1
+
+#     # Link everything by WCS so pan/zoom across SCAs is coherent — same
+#     # spirit as DS9's 'mosaic wcs'. Newer jdaviz uses the Orientation
+#     # plugin; older versions expose link_data(). Try both.
+#     if wcs_link and n_data > 1:
+#         try:
+#             orient = imviz.plugins['Orientation']
+#             orient.link_type = 'WCS'
+#         except (KeyError, AttributeError):
+#             try:
+#                 imviz.link_data(link_type='wcs', wcs_fallback_scheme='pixels')
+#             except Exception as e:
+#                 _log(f"WCS linking failed ({e}); falling back to pixel linking")
+
+#     # Catalog markers (optional).
+#     n_cat = 0
+#     if catalog_paths:
+#         n_cat = _push_catalog_markers_to_imviz(
+#             imviz, catalog_paths,
+#             radius_arcsec=catalog_radius_arcsec,
+#             include_flagged=catalog_include_flagged,
+#             point_color=catalog_marker_color,
+#             extended_color=catalog_extended_marker_color,
+#         )
+
+#     extras = []
+#     if n_dq:
+#         extras.append(f"DQ overlay ({n_dq} SCAs)")
+#     if n_cat:
+#         extras.append(f"L4 catalog ({n_cat} sources)")
+#     extras_str = f" + {' + '.join(extras)}" if extras else ""
+#     _log(f"Loaded {n_data} SCAs into Imviz{extras_str}  "
+#          f"(visit {exposure.visit_id} / exposure {exposure.exposure})")
+#     _log("Call `.show()` on the returned Imviz to render in a notebook cell.")
+
+#     return imviz
+
+
+# def _push_catalog_markers_to_imviz(
+#     imviz, catalog_paths, *,
+#     radius_arcsec, include_flagged, point_color, extended_color,
+# ):
+#     """Push L4 cat_sca parquet sources as Imviz markers.
+
+#     Reuses the same column set + flag policy as the DS9 region builder
+#     so users see the same catalog under both viewers.
+#     """
+#     import pyarrow.parquet as pq
+#     from astropy.table import Table
+#     import astropy.units as u
+
+#     viewer = imviz.default_viewer
+
+#     total = 0
+#     for scanum, path in sorted(catalog_paths.items()):
+#         if not path:
+#             continue
+#         tbl = pq.read_table(path, columns=list(_REGION_COLUMNS)).to_pandas()
+#         if not include_flagged:
+#             tbl = tbl[tbl['warning_flags'] == 0]
+#         if len(tbl) == 0:
+#             continue
+
+#         # Split point vs. extended so we can color them differently, matching
+#         # to_ds9's --catalog-extended-color behavior.
+#         is_ext = tbl['is_extended'].astype(bool).values
+#         groups = [('point', ~is_ext, point_color)]
+#         if extended_color:
+#             groups.append(('extended', is_ext, extended_color))
+#         else:
+#             groups[0] = ('all', np.ones(len(tbl), dtype=bool), point_color)
+
+#         for kind, mask, color in groups:
+#             sub = tbl[mask]
+#             if len(sub) == 0:
+#                 continue
+#             markers = Table({
+#                 'sky_centroid': _skycoords(sub['ra'].values, sub['dec'].values),
+#                 'label': [f"SCA{scanum:02d}.{lbl}" for lbl in sub['label']],
+#                 'kron_abmag': sub['kron_abmag'].values,
+#             })
+#             table_name = f"cat_SCA{scanum:02d}_{kind}"
+#             # Newer jdaviz: viewer.marker = {...}; then load_catalog / add_markers.
+#             viewer.marker = {'color': color, 'alpha': 0.8,
+#                              'markersize': max(3, radius_arcsec * 10),
+#                              'fill': False}
+#             viewer.add_markers(markers, use_skycoord=True,
+#                                marker_name=table_name)
+#             total += len(sub)
+
+#     _log(f"Imviz catalog overlay: pushed {total} source markers")
+#     return total
+
+
+# def _skycoords(ra, dec):
+#     from astropy.coordinates import SkyCoord
+#     import astropy.units as u
+#     return SkyCoord(ra=ra, dec=dec, unit=(u.deg, u.deg))
+
+
+# ---------------------------------------------------------------------------
+# to_imviz — load every SCA into an in-notebook Jdaviz/Imviz viewer
+#
+# Targets jdaviz >= 5.0 (uses `App(configuration='imviz')` and the Orientation
+# plugin's `align_by` attribute). For older jdaviz, pin your env or use an
+# earlier version of this file.
+# ---------------------------------------------------------------------------
+
+def to_imviz(
+    dm_dict: dict,
+    exposure: Exposure,
+    *,
+    sip_degree: int = 4,
+    dq_overlay: bool = True,
+    catalog_paths: Optional[dict] = None,
+    catalog_radius_arcsec: float = 0.4,
+    catalog_include_flagged: bool = False,
+    catalog_marker_color: str = 'green',
+    catalog_extended_marker_color: Optional[str] = 'yellow',
+    wcs_link: bool = True,
+    app=None,
+):
+    """Load every SCA of one exposure into a jdaviz Imviz-configured App.
+
+    Mirrors `to_ds9` but targets Jdaviz so it runs headless — the viewer is
+    an ipywidget that renders in a Jupyter cell (works great inside VS
+    Code's Remote-SSH notebook UI; no X server needed).
+
+    Parameters
+    ----------
+    dm_dict : dict[int, DataModel]
+        The `{sca: DataModel}` produced by `stream_materialized`.
+    exposure : Exposure
+        Originating exposure (used for data labels + logging).
+    sip_degree : int
+        SIP degree for the gwcs → FITS WCS approximation (default 4).
+    dq_overlay : bool
+        If True, load each SCA's DQ mask as a companion data layer.
+    catalog_paths : dict[int, str], optional
+        `{sca: parquet_path}` from `download_catalogs()`. Sources are
+        pushed as Imviz markers, colored by is_extended.
+    catalog_radius_arcsec : float
+        Marker radius in arcsec (default 0.4, matches to_ds9).
+    catalog_include_flagged : bool
+        If True, keep sources with non-zero warning_flags. Default drops them.
+    catalog_marker_color, catalog_extended_marker_color : str
+        Marker colors for point-like / extended sources. Set the extended
+        color to None to draw everything in `catalog_marker_color`.
+    wcs_link : bool
+        If True (default), align all layers by WCS so pan/zoom is
+        synchronized across SCAs. Set False for pixel-aligned mode.
+    app : jdaviz.App, optional
+        Reuse an existing Imviz-configured App (e.g., to layer a second
+        exposure on top). If None, a fresh one is created.
+
+    Returns
+    -------
+    jdaviz.App
+        The Imviz-configured App. Call `.show()` in a notebook cell.
+    """
+    from jdaviz import App
+    from astropy.nddata import NDData
+    from astropy.wcs import WCS
+
+    if app is None:
+        try:
+            app = App()                              # jdaviz 5.x deconfigged
+        except TypeError:
+            # In case a future version reintroduces required kwargs, or you're
+            # briefly on a version that still expects them.
+            app = App(configuration='imviz')
+
+    tag = f"v{exposure.visit_id}_exp{exposure.exposure:02d}"
+    n_data = n_dq = 0
+
+    for scanum in sorted(dm_dict):
+        dm = dm_dict[scanum]
+        if dm is None:
+            _log(f"  SCA {scanum:02d}: no data, skipping")
+            continue
+
+        # Same SIP header the FITS / DS9 sinks use → identical WCS.
+        hdr = _build_sca_header(dm, exposure, scanum, sip_degree)
+        wcs = WCS(hdr, relax=True)
+
+        # Science layer
+        sci = NDData(
+            data=np.asarray(dm.data[...]).astype(np.float32),
+            wcs=wcs,
+            meta=dict(hdr),
+        )
+        sci_label = f"{tag}_SCA{scanum:02d}"
+        app.load(sci, data_label=sci_label)
+        n_data += 1
+
+        # DQ layer (optional). Loaded as its own data entry so users can
+        # blink between SCI and DQ, or use Plot Options to mask by DQ.
+        if dq_overlay:
+            dq = getattr(dm, 'dq', None)
+            if dq is not None:
+                dq_arr = np.asarray(dq[...]).astype(np.uint32)
+                app.load(NDData(data=dq_arr, wcs=wcs),
+                         data_label=f"{sci_label}_DQ")
+                n_dq += 1
+
+    # Align all layers by WCS so pan/zoom across SCAs is coherent — same
+    # spirit as DS9's 'mosaic wcs'.
+    if wcs_link and n_data > 1:
+        try:
+            app.plugins['Orientation'].align_by = 'WCS'
+        except (KeyError, ValueError) as e:
+            _log(f"WCS alignment failed ({e}); layers remain pixel-aligned.")
+
+    # Catalog markers (optional).
+    n_cat = 0
+    if catalog_paths:
+        n_cat = _push_catalog_markers_to_imviz(
+            app, catalog_paths,
+            radius_arcsec=catalog_radius_arcsec,
+            include_flagged=catalog_include_flagged,
+            point_color=catalog_marker_color,
+            extended_color=catalog_extended_marker_color,
+        )
+
+    extras = []
+    if n_dq:
+        extras.append(f"DQ overlay ({n_dq} SCAs)")
+    if n_cat:
+        extras.append(f"L4 catalog ({n_cat} sources)")
+    extras_str = f" + {' + '.join(extras)}" if extras else ""
+    _log(f"Loaded {n_data} SCAs into Imviz{extras_str}  "
+         f"(visit {exposure.visit_id} / exposure {exposure.exposure})")
+    _log("Call `.show()` on the returned App to render in a notebook cell.")
+
+    return app
+
+
+def _push_catalog_markers_to_imviz(
+    app, catalog_paths, *,
+    radius_arcsec, include_flagged, point_color, extended_color,
+):
+    """Push L4 cat_sca parquet sources as Imviz markers.
+
+    Uses the same column set + flag policy as the DS9 region builder
+    (via _REGION_COLUMNS) so users see the same catalog under both viewers.
+    """
+    import pyarrow.parquet as pq
+    from astropy.table import Table
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+
+    # jdaviz 5.x App: viewers is a dict-like keyed by viewer id.
+    viewer = next(iter(app.viewers.values()))
+
+    total = 0
+    for scanum, path in sorted(catalog_paths.items()):
+        if not path:
+            continue
+
+        tbl = pq.read_table(path, columns=list(_REGION_COLUMNS)).to_pandas()
+        if not include_flagged:
+            tbl = tbl[tbl['warning_flags'] == 0]
+        if len(tbl) == 0:
+            continue
+
+        # Split point vs. extended so we can color them differently, matching
+        # to_ds9's --catalog-extended-color behavior.
+        is_ext = tbl['is_extended'].astype(bool).values
+        if extended_color:
+            groups = [('point',    ~is_ext, point_color),
+                      ('extended',  is_ext, extended_color)]
+        else:
+            groups = [('all', np.ones(len(tbl), dtype=bool), point_color)]
+
+        for kind, mask, color in groups:
+            sub = tbl[mask]
+            if len(sub) == 0:
+                continue
+            sky = SkyCoord(ra=sub['ra'].values * u.deg,
+                           dec=sub['dec'].values * u.deg)
+            markers = Table({
+                'sky_centroid': sky,
+                'label': [f"SCA{scanum:02d}.{lbl}" for lbl in sub['label']],
+                'kron_abmag': sub['kron_abmag'].values,
+            })
+            viewer.marker = {
+                'color': color,
+                'alpha': 0.8,
+                'markersize': max(3, radius_arcsec * 10),
+                'fill': False,
+            }
+            viewer.add_markers(
+                markers,
+                use_skycoord=True,
+                skycoord_colname='sky_centroid',
+                marker_name=f"cat_SCA{scanum:02d}_{kind}",
+            )            
+            total += len(sub)
+
+    _log(f"Imviz catalog overlay: pushed {total} source markers")
+    return total
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -901,18 +1606,56 @@ Examples:
                         'streaming anything.')
     p.add_argument('--max-rows', type=int, default=50,
                    help='Max exposures to show in the summary (default 50)')
+    p.add_argument('--coadd', action='store_true',
+                   help='Stream coadd mosaic tiles (product_type=p_visit_coadd) '
+                        'instead of per-SCA exposures. Implies --kinds coadd '
+                        'if --kinds is not already set.')
 
     args = p.parse_args()
 
+    # Propagate --coadd into the kinds/product-type before the MAST query.
+    if getattr(args, 'coadd', False) and not getattr(args, 'kinds', None):
+        args.kinds = 'coadd'
+        args.sca_only = False
+
     res = list_data_from_args(args)
+
+    if args.list:
+        print_summary(res, max_rows=args.max_rows)
+        return
+
+    # --coadd: stream mosaic tiles directly, bypassing the per-SCA exposure loop.
+    if getattr(args, 'coadd', False):
+        if not res.filenames:
+            print("No coadd files found — nothing to stream.")
+            return
+        root = args.out_dir or '.'
+        coadd_out = os.path.join(root, 'coadd') if args.to == 'fits' else None
+        dm_dict = stream_coadd(
+            res.filenames, res.missions, max_workers=args.workers,
+        )
+        try:
+            if args.to == 'fits':
+                to_fits_files_coadd(
+                    dm_dict,
+                    out_dir=coadd_out,
+                    compress=args.compress,
+                    sip_degree=args.sip_degree,
+                )
+            else:  # ds9
+                to_ds9_coadd(
+                    dm_dict,
+                    sip_degree=args.sip_degree,
+                    dq_overlay=not args.no_dq_overlay,
+                    ds9_target=args.ds9_target,
+                )
+        finally:
+            close_streams(dm_dict)
+        return
 
     if res.n_exposures == 0:
         print_summary(res, max_rows=args.max_rows)
         print("\nNo exposures match — nothing to output.")
-        return
-
-    if args.list:
-        print_summary(res, max_rows=args.max_rows)
         return
 
     indices = _resolve_exposure_keys(res, args.exposures)

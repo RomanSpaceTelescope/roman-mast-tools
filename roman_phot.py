@@ -669,6 +669,203 @@ def phot_exposure(uri_filename_pairs, *, phot_kwargs=None, bkg_kwargs=None,
     return [results[k] for k in sorted(results)]
 
 
+def phot_one_sca_from_arrays(data, dq, detector, sca_num, *,
+                              phot_kwargs, bkg_kwargs=None,
+                              png_path=None, image_mosaic=False):
+    """Subprocess worker: run photometry on pre-loaded arrays (MAST path).
+
+    Like `phot_one_sca` but receives numpy arrays directly instead of
+    streaming from an S3 URI.  Called by `phot_exposure_mast`'s
+    ProcessPoolExecutor — the caller extracts arrays from each DataModel
+    before the fork so they pickle cleanly.
+
+    Returns the same dict structure as `phot_one_sca`, or None on failure.
+    """
+    import time
+    from photometry import run_aperture_photometry
+
+    pid = os.getpid()
+    t_start = time.perf_counter()
+    def log(stage):
+        print(f'[pid {pid}] SCA{sca_num:02d} {stage} '
+              f'@ {time.perf_counter()-t_start:.1f}s', file=sys.stderr, flush=True)
+
+    log('start')
+    try:
+        sources, phot_table, sp, stats = run_aperture_photometry(
+            data, dq=dq, **phot_kwargs
+        )
+    except Exception as exc:
+        print(f'[roman_phot] WARNING: photometry failed for SCA {sca_num}: {exc}',
+              file=sys.stderr)
+        return None
+    log('phot done')
+
+    if phot_table is not None and len(phot_table) > 0:
+        phot_table['sca'] = sca_num
+        phot_table['detector'] = detector
+        col_order = ['sca', 'detector'] + [c for c in phot_table.colnames
+                                            if c not in ('sca', 'detector')]
+        phot_table = phot_table[col_order]
+
+    snr_arr = (phot_table['snr'] if phot_table is not None and len(phot_table) > 0
+               and 'snr' in phot_table.colnames else None)
+    print(
+        f'[roman_phot] SCA {sca_num:02d} ({detector}): '
+        f'bkg={stats["bkg_level"]:.3g}  rms={stats["bkg_rms_median"]:.3g}  '
+        f'n_sources={stats["n_sources"]}' +
+        (f'  snr=[{float(snr_arr.min()):.1f}, {float(np.median(snr_arr)):.1f}, {float(snr_arr.max()):.1f}]'
+         if snr_arr is not None and len(snr_arr) > 0 else ''),
+        file=sys.stderr,
+    )
+
+    bkg_map = None
+    if bkg_kwargs is not None:
+        try:
+            bkg_map = background_map_one_sca(
+                data, dq, data_sub=stats.get('data_sub'), **bkg_kwargs
+            )
+        except Exception as exc:
+            print(f'[roman_phot] WARNING: background map failed for SCA {sca_num}: {exc}',
+                  file=sys.stderr)
+    log('bkg map done')
+
+    if png_path is not None:
+        try:
+            from roman_view_sca import display_in_mpl
+            display_in_mpl(
+                data, detector, dq=dq,
+                title=f'{detector}  SCA{sca_num:02d}',
+                sources=sources, phot_table=phot_table, sp=sp, stats=stats,
+                save_path=png_path,
+            )
+            print(f'[roman_phot] SCA {sca_num:02d} image -> {png_path}', file=sys.stderr)
+        except Exception as exc:
+            print(f'[roman_phot] WARNING: image PNG failed for SCA {sca_num}: {exc}',
+                  file=sys.stderr)
+
+        data_sub = stats.get('data_sub')
+        if data_sub is not None:
+            resid_path = png_path.replace('.png', '_bkg.png')
+            try:
+                from roman_view_sca import display_residuals_mpl
+                display_residuals_mpl(
+                    data_sub, detector,
+                    bkg_fit=stats.get('bkg_fit'),
+                    bkg_level=stats['bkg_level'],
+                    residual_rms=stats['bkg_rms_median'],
+                    poly_degree=stats.get('poly_degree'),
+                    dq=dq,
+                    save_path=resid_path,
+                )
+                print(f'[roman_phot] SCA {sca_num:02d} bkg/residuals -> {resid_path}',
+                      file=sys.stderr)
+            except Exception as exc:
+                print(f'[roman_phot] WARNING: bkg PNG failed for SCA {sca_num}: {exc}',
+                      file=sys.stderr)
+    log('png saved')
+
+    thumb = data[::2, ::2].astype(np.float32) if image_mosaic else None
+    stats_slim = {k: v for k, v in stats.items()
+                  if k not in ('bkg_fit', 'data_sub', 'bkg_rms')}
+    log('return')
+    return {
+        'sca': sca_num,
+        'detector': detector,
+        'table': phot_table,
+        'stats': stats_slim,
+        'sp': sp,
+        'bkg_map': bkg_map,
+        'thumb': thumb,
+    }
+
+
+def phot_exposure_mast(dm_dict, *, phot_kwargs=None, bkg_kwargs=None,
+                       out_dir=None, max_workers=8, image_mosaic=False):
+    """Run photometry on a ``{sca: DataModel}`` dict from MAST streaming.
+
+    Equivalent of `phot_exposure` for the MAST path.  Extracts numpy arrays
+    from each DataModel on the main process (where they are already resident
+    in memory — `stream_materialized` pre-loaded them), then fans photometry
+    out over a ProcessPoolExecutor using `phot_one_sca_from_arrays`.
+
+    Parameters
+    ----------
+    dm_dict : dict[int, DataModel]
+        As returned by `roman_fits.stream_materialized`.
+    phot_kwargs, bkg_kwargs, out_dir, max_workers, image_mosaic
+        Same semantics as in `phot_exposure`.
+
+    Returns
+    -------
+    list of dict
+        Same structure as `phot_exposure` — sorted by SCA number, None
+        entries removed.
+    """
+    import multiprocessing
+    import importlib.metadata as _im
+
+    if phot_kwargs is None:
+        phot_kwargs = {}
+
+    # Same photutils import-hook dance as phot_exposure.
+    _orig_pd = _im.packages_distributions
+    _im.packages_distributions = lambda: {'photutils': ['photutils']}
+    import photutils  # noqa: F401
+    _im.packages_distributions = _orig_pd
+
+    # Extract arrays from DataModels here, before the fork. Plain numpy
+    # arrays pickle cleanly; roman_datamodels DataModels may not.
+    tasks = []
+    for sca_num, dm in dm_dict.items():
+        if dm is None:
+            print(f'[roman_phot] WARNING: SCA {sca_num:02d} has no data; skipping',
+                  file=sys.stderr)
+            continue
+        try:
+            data = np.asarray(dm.data[...]).astype(np.float32)
+        except Exception as exc:
+            print(f'[roman_phot] WARNING: cannot read data for SCA {sca_num}: {exc}',
+                  file=sys.stderr)
+            continue
+        dq = None
+        try:
+            dq = np.asarray(dm.dq[...])
+        except (AttributeError, KeyError):
+            pass
+        try:
+            detector = str(dm.meta.instrument.detector)
+        except AttributeError:
+            detector = f'WFI{sca_num:02d}'
+        png_path = os.path.join(out_dir, f'sca{sca_num:02d}.png') if out_dir else None
+        tasks.append((data, dq, detector, sca_num, png_path))
+
+    if not tasks:
+        return []
+
+    n_workers = min(max_workers, len(tasks), os.cpu_count() or max_workers)
+    ctx = multiprocessing.get_context('fork')
+
+    results = {}
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as pool:
+        futures = {}
+        for data, dq, detector, sca_num, png_path in tasks:
+            futures[pool.submit(
+                phot_one_sca_from_arrays,
+                data, dq, detector, sca_num,
+                phot_kwargs=phot_kwargs,
+                bkg_kwargs=bkg_kwargs,
+                png_path=png_path,
+                image_mosaic=image_mosaic,
+            )] = sca_num
+        for fut in as_completed(futures):
+            res = fut.result()
+            if res is not None:
+                results[res['sca']] = res
+
+    return [results[k] for k in sorted(results)]
+
+
 def stream_image_mosaic(uri_filename_pairs, *, max_workers=8):
     """Stream all SCAs and return a dict of {sca_num: decimated thumbnail}."""
     from roman_view_sca import stream_sca
@@ -918,15 +1115,107 @@ def make_histograms_from_csv(csv_path, output_path, columns=None, bins=30, outli
 # CLI
 # ---------------------------------------------------------------------------
 
+def _run_phot_results(args, results, *, exp_label, exp_title, out_dir, p):
+    """Write CSV/PNG outputs from a completed photometry results list.
+
+    Shared by both the MAST and URI-file code paths so the output logic
+    lives in one place. `results` is the list returned by `phot_exposure` or
+    `phot_exposure_mast`; everything else mirrors the local variables that
+    both callers already have.
+    """
+    from astropy.table import vstack
+
+    if not results:
+        sys.exit('[roman_phot] ERROR: no SCAs completed successfully')
+
+    if args.per_sca:
+        for r in results:
+            if r['table'] is not None and len(r['table']) > 0:
+                path = p(f'sca{r["sca"]:02d}.csv')
+                r['table'].write(path, format='ascii.csv', overwrite=True)
+                print(f'[roman_phot] wrote {path}', file=sys.stderr)
+
+    tables = [r['table'] for r in results if r['table'] is not None and len(r['table']) > 0]
+    if tables:
+        combined = vstack(tables, metadata_conflicts='silent')
+        combined.write(p('sources.csv'), format='ascii.csv', overwrite=True)
+        print(f'[roman_phot] combined source table ({len(combined)} rows) -> {p("sources.csv")}',
+              file=sys.stderr)
+    else:
+        print('[roman_phot] WARNING: no sources detected in any SCA; combined CSV not written',
+              file=sys.stderr)
+
+    summary = build_summary(results)
+    if len(summary) > 0:
+        summary.write(p('summary.csv'), format='ascii.csv', overwrite=True)
+        print(f'[roman_phot] summary ({len(summary)} SCAs) -> {p("summary.csv")}',
+              file=sys.stderr)
+
+    mosaic_tasks = []
+    sca_maps = {}
+    if args.bkg_mosaic:
+        sca_maps = {r['sca']: r['bkg_map'] for r in results}
+        save_mosaic_data(sca_maps, p('mosaic_data.npz'))
+        mosaic_tasks.append((make_bkg_mosaic_png, (sca_maps, p('bkg_mosaic.png')),
+                             dict(superpixel=args.bkg_superpixel,
+                                  title=f'{exp_title} — background mosaic')))
+        if tables:
+            mosaic_tasks.append((make_source_dot_mosaic_png,
+                                 (p('sources.csv'), p('source_mosaic.png')),
+                                 dict(title=f'{exp_title} — sources')))
+
+    if args.image_mosaic:
+        sca_thumbs = {r['sca']: r['thumb'] for r in results}
+        mosaic_tasks.append((make_image_mosaic_png, (sca_thumbs, p('image_mosaic.png')),
+                             dict(title=f'{exp_title} — image mosaic')))
+
+    if mosaic_tasks:
+        import multiprocessing
+        with ProcessPoolExecutor(max_workers=len(mosaic_tasks),
+                                 mp_context=multiprocessing.get_context('fork')) as pool:
+            futs = [pool.submit(fn, *a, **kw) for fn, a, kw in mosaic_tasks]
+            for fut in as_completed(futs):
+                fut.result()
+
+    if not args.no_hist and tables:
+        make_histograms_from_csv(p('sources.csv'), p('histograms.png'),
+                                 columns=['aperture_sum_0', 'snr'])
+
+
 def main():
     ap = argparse.ArgumentParser(
         description='Aperture photometry across all SCAs of a Roman WFI exposure.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+
+    # MAST query flags — same set as roman_fits.py.  When any MAST filter is
+    # supplied (and --uri-file is omitted), the script queries MAST, streams
+    # the SCAs, and runs photometry without touching the local disk.
+    from roman_mast import add_list_data_args
+    add_list_data_args(ap)
+    ap.add_argument(
+        '--exposures', default='1', metavar='SPEC',
+        help="Which exposure(s) from the MAST result to process, 1-based "
+             "(e.g. '1', '1-4', '1,3', 'all').  Default: '1'.  Ignored when "
+             "--uri-file is used.",
+    )
+    ap.add_argument(
+        '--scas', default=None, metavar='SPEC',
+        help="Restrict to a subset of SCAs, e.g. '4' or '1-6' or '1,3,5'. "
+             "Applies to both MAST and --uri-file modes.  Default: all SCAs.",
+    )
+    ap.add_argument(
+        '--list', action='store_true',
+        help='Query MAST and print the matching exposures, then exit without '
+             'streaming or running photometry.  MAST mode only.',
+    )
+
     ap.add_argument(
         '--uri-file', metavar='PATH',
-        help='Text file with one S3 (or local) URI per line (required unless --remake-mosaics)',
+        help='Text file with one S3 (or local) URI per line.  Mutually '
+             'exclusive with the MAST query flags above; one of the two must '
+             'be given unless --remake-mosaics is used.',
     )
     ap.add_argument(
         '--per-sca', action='store_true',
@@ -993,12 +1282,129 @@ def main():
             )
         return
 
-    if not args.uri_file:
-        sys.exit('[roman_phot] ERROR: --uri-file is required unless --remake-mosaics is given')
+    # ---------------------------------------------------------------------------
+    # Determine input mode: MAST query or local URI file
+    # ---------------------------------------------------------------------------
+    _mast_args = ('program', 'execution_plan', 'pass_', 'segment', 'observation',
+                  'visit', 'detector', 'visit_id', 'exposure', 'optical_element',
+                  'exposure_type', 'product_type')
+    _has_mast_filter = any(getattr(args, a, None) not in (None, '') for a in _mast_args)
 
+    use_mast = _has_mast_filter and not args.uri_file
+
+    if not use_mast and not args.uri_file:
+        sys.exit(
+            '[roman_phot] ERROR: supply either --uri-file OR MAST query flags '
+            '(--program / --visit-id / --pass / etc.) unless --remake-mosaics is used'
+        )
+
+    if use_mast:
+        # -----------------------------------------------------------------------
+        # MAST path: query → stream → photometry
+        # -----------------------------------------------------------------------
+        from roman_mast import (
+            list_data_from_args, print_summary, parse_int_spec, print_kinds,
+        )
+        from roman_fits import stream_materialized
+
+        if getattr(args, 'list_kinds', False):
+            print_kinds()
+            return
+
+        # Force sca_only=True so we only get per-SCA L2 cal files.
+        args.sca_only = True
+
+        res = list_data_from_args(args)
+
+        if args.list:
+            print_summary(res)
+            return
+
+        if res.n_exposures == 0:
+            print_summary(res)
+            sys.exit('[roman_phot] ERROR: no exposures found for the given MAST filters')
+
+        # Parse --exposures spec (1-based indices into res.exposures)
+        from roman_mast import parse_int_spec as _parse_int
+        exp_spec = getattr(args, 'exposures', '1') or '1'
+        if str(exp_spec).strip().lower() in ('all', '*', ''):
+            exp_indices = list(range(1, res.n_exposures + 1))
+        else:
+            exp_indices = _parse_int(exp_spec)
+
+        scas = None
+        if getattr(args, 'scas', None):
+            scas = parse_int_spec(args.scas)
+
+        for exp_idx in exp_indices:
+            exp = res.select(exp_idx)
+            exp_label = f'{exp.visit_id}_{exp.exposure:04d}'
+            exp_title  = (f'WFI {exp.visit_id}  '
+                          f'Exp: {exp.exposure:04d}  '
+                          f'{exp.optical_element or "?"}')
+            out_dir = exp_label
+            os.makedirs(out_dir, exist_ok=True)
+            print(f'[roman_phot] output directory: {out_dir}/', file=sys.stderr)
+
+            def p(name, _d=out_dir):
+                return os.path.join(_d, name)
+
+            dm_dict = stream_materialized(
+                exp, res.missions, scas=scas, max_workers=args.workers,
+            )
+
+            try:
+                phot_kwargs = dict(
+                    fwhm_pix=args.fwhm,
+                    detection_sigma=args.det_sigma,
+                    aperture_radius_fwhm=args.aper,
+                    annulus_inner_fwhm=args.annulus_inner,
+                    annulus_outer_fwhm=args.annulus_outer,
+                    snr_threshold=args.snr_threshold,
+                )
+                bkg_kwargs = None
+                if args.bkg_mosaic:
+                    bkg_kwargs = dict(
+                        superpixel=args.bkg_superpixel,
+                        mask_sigma=args.bkg_mask_sigma,
+                        dilate_radius=args.bkg_dilate,
+                        bkg_poly_degree=args.bkg_poly,
+                    )
+
+                results = phot_exposure_mast(
+                    dm_dict,
+                    phot_kwargs=phot_kwargs,
+                    bkg_kwargs=bkg_kwargs,
+                    out_dir=out_dir,
+                    max_workers=args.workers,
+                    image_mosaic=args.image_mosaic,
+                )
+                _run_phot_results(
+                    args, results,
+                    exp_label=exp_label, exp_title=exp_title,
+                    out_dir=out_dir, p=p,
+                )
+            finally:
+                from roman_mast import close_streams
+                close_streams(dm_dict)
+        return
+
+    # ---------------------------------------------------------------------------
+    # URI-file path (existing behaviour)
+    # ---------------------------------------------------------------------------
     pairs = load_uri_file(args.uri_file)
     if not pairs:
         sys.exit(f'[roman_phot] ERROR: no valid URIs found in {args.uri_file}')
+
+    # Apply --scas filter if given
+    if getattr(args, 'scas', None):
+        from roman_mast import parse_int_spec
+        wanted_scas = set(parse_int_spec(args.scas))
+        pairs = [(u, f) for u, f in pairs
+                 if parse_filename(f)['sca_num'] in wanted_scas]
+        if not pairs:
+            sys.exit('[roman_phot] ERROR: no SCAs remain after --scas filter')
+
     print(f'[roman_phot] {len(pairs)} SCA(s) to process', file=sys.stderr)
 
     # Derive exposure label from the first filename: {visit_id}_{exposure_num}

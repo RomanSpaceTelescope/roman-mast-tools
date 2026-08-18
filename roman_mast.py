@@ -83,7 +83,7 @@ VERBOSE = True
 # Temporary: MAST OPS is cleared before launch; point to the I&T instance instead.
 # Set this to 'https://mastint.stsci.edu' (or pass --server on the CLI) while
 # the production archive is unavailable.  Reset to None when OPS is live again.
-MAST_SERVER = 'https://mastint.stsci.edu'
+MAST_SERVER = None #'https://mastint.stsci.edu'
 
 def _log(msg):
     if VERBOSE:
