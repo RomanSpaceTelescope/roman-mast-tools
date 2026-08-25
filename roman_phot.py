@@ -215,12 +215,27 @@ def phot_one_sca(uri, filename, *, phot_kwargs, bkg_kwargs=None, png_path=None,
     )
 
     bkg_map = None
+    bkg_map_full = None
     if bkg_kwargs is not None:
+        # Extract superpixel_full before passing to background_map_one_sca
+        superpixel_full = bkg_kwargs.get('superpixel_full')
+        bkg_kwargs_filtered = {k: v for k, v in bkg_kwargs.items() if k != 'superpixel_full'}
+
         try:
-            bkg_map = background_map_one_sca(data, dq, data_sub=stats['data_sub'], **bkg_kwargs)
+            bkg_map = background_map_one_sca(data, dq, data_sub=stats['data_sub'], **bkg_kwargs_filtered)
         except Exception as exc:
             print(f'[roman_phot] WARNING: background map failed for SCA {sca_num}: {exc}',
                   file=sys.stderr)
+
+        # Also compute fine-resolution fitted background for bkg_mosaic_full.png
+        if superpixel_full is not None:
+            try:
+                bkg_fit = stats.get('bkg_fit')
+                if bkg_fit is not None:
+                    bkg_map_full = bin_to_superpixels(bkg_fit, superpixel_full)
+            except Exception as exc:
+                print(f'[roman_phot] WARNING: full background map failed for SCA {sca_num}: {exc}',
+                      file=sys.stderr)
     log('bkg map done')
 
     if png_path is not None:
@@ -273,6 +288,7 @@ def phot_one_sca(uri, filename, *, phot_kwargs, bkg_kwargs=None, png_path=None,
         'stats': stats_slim,
         'sp': sp,
         'bkg_map': bkg_map,
+        'bkg_map_full': bkg_map_full,
         'thumb': thumb,
     }
 
@@ -280,6 +296,103 @@ def phot_one_sca(uri, filename, *, phot_kwargs, bkg_kwargs=None, png_path=None,
 # ---------------------------------------------------------------------------
 # Background mapping
 # ---------------------------------------------------------------------------
+
+def bin_to_superpixels(data, superpixel):
+    """Bin a 2D array into superpixels aligned to detector channels and the 4096×4096 grid.
+
+    Roman detectors have readout channels every 128 columns. Superpixel boundaries
+    are aligned to these channels and to the original detector grid (before reference
+    pixel removal). For this alignment to respect channel boundaries, `superpixel`
+    should divide evenly into 128.
+
+    Parameters
+    ----------
+    data : ndarray
+        2D array to bin (typically with reference pixels removed, so shape ~4088×4088).
+    superpixel : int
+        Superpixel size in pixels. Should divide evenly into 128 for optimal
+        channel alignment.
+
+    Returns
+    -------
+    binned : ndarray
+        2D array of shape (n_chunks, n_chunks) where n_chunks = 4096 // superpixel.
+    """
+    ny, nx = data.shape
+    ref = _ROMAN_REF_PIX
+    sp = superpixel
+    n_chunks = _ROMAN_SCA_FULL_SIZE // sp
+
+    # Bin edges in original detector coords, then in science-array coords
+    bin_edges_orig = np.arange(0, _ROMAN_SCA_FULL_SIZE + 1, sp)
+    bin_edges_sci = bin_edges_orig - ref
+    row_edges = np.clip(bin_edges_sci, 0, ny)
+    col_edges = np.clip(bin_edges_sci, 0, nx)
+
+    binned = np.full((n_chunks, n_chunks), np.nan)
+
+    # --- Identify the interior range of fully-covered superpixels ---------
+    # A superpixel i is "full" in rows if row_edges[i+1] - row_edges[i] == sp
+    # AND its start in science coords equals bin_edges_sci[i] (no clipping).
+    # Equivalent: bin_edges_sci[i] >= 0 and bin_edges_sci[i+1] <= ny.
+    r_first = int(np.ceil(ref / sp))                    # first fully-covered row bin
+    r_last  = (ref + ny) // sp                          # one past last fully-covered
+    c_first = int(np.ceil(ref / sp))
+    c_last  = (ref + nx) // sp
+
+    # --- Vectorized nanmedian over the interior block ---------------------
+    if r_last > r_first and c_last > c_first:
+        r0 = r_first * sp - ref
+        r1 = r_last  * sp - ref
+        c0 = c_first * sp - ref
+        c1 = c_last  * sp - ref
+        core = data[r0:r1, c0:c1]
+
+        n_r = r_last - r_first
+        n_c = c_last - c_first
+        # Group each superpixel's pixels along the last axis, then one nanmedian call
+        reshaped = (core
+                    .reshape(n_r, sp, n_c, sp)
+                    .transpose(0, 2, 1, 3)
+                    .reshape(n_r, n_c, sp * sp))
+        binned[r_first:r_last, c_first:c_last] = np.nanmedian(reshaped, axis=-1)
+
+    # --- Handle partial edge bins with the original loop ------------------
+    row_sizes = row_edges[1:] - row_edges[:-1]
+    col_sizes = col_edges[1:] - col_edges[:-1]
+
+    def _edge_indices(first, last, n):
+        # Indices that are NOT in the fully-vectorized interior
+        return [k for k in range(n) if k < first or k >= last]
+
+    edge_rows = _edge_indices(r_first, r_last, n_chunks)
+    edge_cols = _edge_indices(c_first, c_last, n_chunks)
+
+    # Edge rows × all cols
+    for i in edge_rows:
+        if row_sizes[i] == 0:
+            continue
+        r0, r1 = row_edges[i], row_edges[i + 1]
+        for j in range(n_chunks):
+            if col_sizes[j] == 0:
+                continue
+            c0, c1 = col_edges[j], col_edges[j + 1]
+            binned[i, j] = np.nanmedian(data[r0:r1, c0:c1])
+
+    # Interior rows × edge cols (avoid double-counting edge rows)
+    interior_rows = range(r_first, r_last)
+    for i in interior_rows:
+        if row_sizes[i] == 0:
+            continue
+        r0, r1 = row_edges[i], row_edges[i + 1]
+        for j in edge_cols:
+            if col_sizes[j] == 0:
+                continue
+            c0, c1 = col_edges[j], col_edges[j + 1]
+            binned[i, j] = np.nanmedian(data[r0:r1, c0:c1])
+
+    return binned
+
 
 def background_map_one_sca(data, dq, *, superpixel=512, mask_sigma=1.5,
                             dilate_radius=20, bkg_poly_degree=3, data_sub=None):
@@ -343,29 +456,12 @@ def background_map_one_sca(data, dq, *, superpixel=512, mask_sigma=1.5,
     residual = data_sub.astype(float)
     residual[mask | src_mask] = np.nan
 
-    # Bin into superpixels aligned to the original 4096×4096 detector grid.
-    # Reference pixels shift all data coordinates by -_ROMAN_REF_PIX; edge
-    # superpixels end up with _ROMAN_REF_PIX fewer rows/columns, which is fine.
-    n_chunks = _ROMAN_SCA_FULL_SIZE // superpixel  # 8 for superpixel=512
-
-    orig_bounds = [i * superpixel for i in range(n_chunks + 1)]
-    row_bounds = [max(0, min(ny, b - _ROMAN_REF_PIX)) for b in orig_bounds]
-    col_bounds = [max(0, min(nx, b - _ROMAN_REF_PIX)) for b in orig_bounds]
-
-    binned = np.full((n_chunks, n_chunks), np.nan)
-    for i in range(n_chunks):
-        r0, r1 = row_bounds[i], row_bounds[i + 1]
-        if r1 <= r0:
-            continue
-        for j in range(n_chunks):
-            c0, c1 = col_bounds[j], col_bounds[j + 1]
-            if c1 <= c0:
-                continue
-            chunk = residual[r0:r1, c0:c1]
-            binned[i, j] = np.nanmedian(chunk)
+    # Bin into superpixels
+    binned = bin_to_superpixels(residual, superpixel)
 
     n_src = int(np.sum(src_mask))
     n_tot = src_mask.size
+    n_chunks = _ROMAN_SCA_FULL_SIZE // superpixel
     print(
         f'[roman_phot] bkg map: {n_chunks}×{n_chunks} superpixels  '
         f'source mask={100*n_src/n_tot:.1f}%  rms={rms:.4g}',
@@ -459,7 +555,7 @@ def make_image_mosaic_png(sca_thumbs, out_path, *, title=None):
 
 
 def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
-                        pct_lo=2, pct_hi=98):
+                        pct_lo=2, pct_hi=98, stretch_mode='symmetric'):
     """Render a WFI focal-plane background mosaic and save to a PNG.
 
     Parameters
@@ -473,7 +569,10 @@ def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
     title : str or None
         Figure title.
     pct_lo, pct_hi : float
-        Percentile bounds for the symmetric colour stretch.
+        Percentile bounds for colour stretch.
+    stretch_mode : str
+        'symmetric' (default): symmetric around zero, diverging colormap.
+        'percentile': stretch from pct_lo to pct_hi percentiles, sequential colormap.
     """
     import matplotlib.pyplot as plt
     import matplotlib.cm as cm
@@ -503,15 +602,27 @@ def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
     y_lo = min(all_cy) - half_h_mm - pad
     y_hi = max(all_cy) + half_h_mm + pad
 
-    # Colour stretch: symmetric around zero (diverging), from all available tiles
+    # Colour stretch from all available tiles
     all_vals = np.concatenate([v.ravel() for v in sca_maps.values()
                                 if v is not None and np.any(np.isfinite(v))])
     all_vals = all_vals[np.isfinite(all_vals)]
     if len(all_vals) == 0:
         print(f'[roman_phot] WARNING: background mosaic is entirely NaN; skipping PNG', file=sys.stderr)
         return
-    abs_lim = max(abs(np.percentile(all_vals, pct_lo)), abs(np.percentile(all_vals, pct_hi)))
-    norm = mcolors.Normalize(vmin=-abs_lim, vmax=abs_lim)
+
+    if stretch_mode == 'percentile':
+        # Percentile stretch: vmin=pct_lo, vmax=pct_hi
+        vmin = np.percentile(all_vals, pct_lo)
+        vmax = np.percentile(all_vals, pct_hi)
+        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+        cmap = 'viridis'
+        cbar_label = 'Background level (DN/s)'
+    else:
+        # Symmetric around zero (diverging)
+        abs_lim = max(abs(np.percentile(all_vals, pct_lo)), abs(np.percentile(all_vals, pct_hi)))
+        norm = mcolors.Normalize(vmin=-abs_lim, vmax=abs_lim)
+        cmap = 'RdBu_r'
+        cbar_label = 'Background residual (DN/s)'
 
     aspect = (x_hi - x_lo) / (y_hi - y_lo)
     fig_w = 12.0
@@ -539,7 +650,7 @@ def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
             # extent=[left, right, bottom, top]; origin='upper' maps row 0 to top
             ax.imshow(
                 tile, extent=[x0, x1, y0, y1],
-                origin='upper', cmap='RdBu_r', norm=norm,
+                origin='upper', cmap=cmap, norm=norm,
                 interpolation='nearest', aspect='auto',
             )
 
@@ -557,9 +668,9 @@ def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
                 alpha=0.8 if has_data else 0.4,
                 fontweight='bold')
 
-    sm = cm.ScalarMappable(norm=norm, cmap='RdBu_r')
+    sm = cm.ScalarMappable(norm=norm, cmap=cmap)
     cbar = fig.colorbar(sm, ax=ax, fraction=0.02, pad=0.02)
-    cbar.set_label('Background residual (DN/s)', color='white', fontsize=10)
+    cbar.set_label(cbar_label, color='white', fontsize=10)
     cbar.ax.yaxis.set_tick_params(color='white')
     plt.setp(cbar.ax.yaxis.get_ticklabels(), color='white')
 
@@ -768,14 +879,29 @@ def phot_one_sca_from_arrays(data, dq, detector, sca_num, *,
     )
 
     bkg_map = None
+    bkg_map_full = None
     if bkg_kwargs is not None:
+        # Extract superpixel_full before passing to background_map_one_sca
+        superpixel_full = bkg_kwargs.get('superpixel_full')
+        bkg_kwargs_filtered = {k: v for k, v in bkg_kwargs.items() if k != 'superpixel_full'}
+
         try:
             bkg_map = background_map_one_sca(
-                data, dq, data_sub=stats.get('data_sub'), **bkg_kwargs
+                data, dq, data_sub=stats.get('data_sub'), **bkg_kwargs_filtered
             )
         except Exception as exc:
             print(f'[roman_phot] WARNING: background map failed for SCA {sca_num}: {exc}',
                   file=sys.stderr)
+
+        # Also compute fine-resolution fitted background for bkg_mosaic_full.png
+        if superpixel_full is not None:
+            try:
+                bkg_fit = stats.get('bkg_fit')
+                if bkg_fit is not None:
+                    bkg_map_full = bin_to_superpixels(bkg_fit, superpixel_full)
+            except Exception as exc:
+                print(f'[roman_phot] WARNING: full background map failed for SCA {sca_num}: {exc}',
+                      file=sys.stderr)
     log('bkg map done')
 
     if png_path is not None:
@@ -824,6 +950,7 @@ def phot_one_sca_from_arrays(data, dq, detector, sca_num, *,
         'stats': stats_slim,
         'sp': sp,
         'bkg_map': bkg_map,
+        'bkg_map_full': bkg_map_full,
         'thumb': thumb,
     }
 
@@ -1004,18 +1131,25 @@ def build_summary(results):
 # Mosaic data persistence
 # ---------------------------------------------------------------------------
 
-def save_mosaic_data(sca_maps, out_path):
+def save_mosaic_data(sca_maps, sca_maps_full, out_path):
     """Save background maps to a compressed .npz file.
 
     Parameters
     ----------
     sca_maps : dict
-        SCA number → 2D background array (or None).
+        SCA number → 2D coarse background array (or None).
+    sca_maps_full : dict
+        SCA number → 2D fine background array (or None).
     out_path : str
         Destination .npz path.
     """
-    arrays = {f'bkg_{sca_num:02d}': arr
-              for sca_num, arr in sca_maps.items() if arr is not None}
+    arrays = {}
+    for sca_num, arr in sca_maps.items():
+        if arr is not None:
+            arrays[f'bkg_{sca_num:02d}'] = arr
+    for sca_num, arr in sca_maps_full.items():
+        if arr is not None:
+            arrays[f'bkg_full_{sca_num:02d}'] = arr
     np.savez_compressed(out_path, **arrays)
     print(f'[roman_phot] mosaic data -> {out_path}', file=sys.stderr)
 
@@ -1026,14 +1160,21 @@ def load_mosaic_data(path):
     Returns
     -------
     sca_maps : dict
+        Coarse background maps.
+    sca_maps_full : dict
+        Fine background maps.
     """
     data = np.load(path)
     sca_maps = {}
+    sca_maps_full = {}
     for key in data.files:
-        if key.startswith('bkg_'):
+        if key.startswith('bkg_full_'):
+            sca_maps_full[int(key[9:])] = data[key]
+        elif key.startswith('bkg_'):
             sca_maps[int(key[4:])] = data[key]
-    print(f'[roman_phot] loaded mosaic data from {path} ({len(sca_maps)} bkg maps)', file=sys.stderr)
-    return sca_maps
+    print(f'[roman_phot] loaded mosaic data from {path} ({len(sca_maps)} bkg, {len(sca_maps_full)} full)',
+          file=sys.stderr)
+    return sca_maps, sca_maps_full
 
 
 # ---------------------------------------------------------------------------
@@ -1203,10 +1344,18 @@ def _run_phot_results(args, results, *, exp_label, exp_title, out_dir, p):
     sca_maps = {}
     if args.bkg_mosaic:
         sca_maps = {r['sca']: r['bkg_map'] for r in results}
-        save_mosaic_data(sca_maps, p('mosaic_data.npz'))
+        sca_maps_full = {r['sca']: r['bkg_map_full'] for r in results}
+        save_mosaic_data(sca_maps, sca_maps_full, p('mosaic_data.npz'))
         mosaic_tasks.append((make_bkg_mosaic_png, (sca_maps, p('bkg_mosaic.png')),
                              dict(superpixel=args.bkg_superpixel,
                                   title=f'{exp_title} — background mosaic')))
+
+        # Full focal-plane fitted background mosaic at fine resolution
+        mosaic_tasks.append((make_bkg_mosaic_png, (sca_maps_full, p('bkg_mosaic_full.png')),
+                             dict(superpixel=args.bkg_superpixel_full,
+                                  stretch_mode='percentile',
+                                  title=f'{exp_title} — background mosaic (full)')))
+
         if tables:
             mosaic_tasks.append((make_source_dot_mosaic_png,
                                  (p('sources.csv'), p('source_mosaic.png')),
@@ -1305,7 +1454,9 @@ def main():
     ap.add_argument('--remake-mosaics', metavar='PATH',
                     help='Skip photometry; regenerate mosaic PNGs from a previously saved mosaic_data.npz')
     ap.add_argument('--bkg-superpixel', type=int, default=512, metavar='N',
-                    help='Superpixel bin size in pixels (default: 512)')
+                    help='Superpixel bin size in pixels for bkg_mosaic.png (default: 512)')
+    ap.add_argument('--bkg-superpixel-full', type=int, default=32, metavar='N',
+                    help='Superpixel bin size for bkg_mosaic_full.png fitted background (default: 32)')
     ap.add_argument('--bkg-mask-sigma', type=float, default=1.5, metavar='N',
                     help='Source detection threshold for masking, in σ (default: 1.5)')
     ap.add_argument('--bkg-dilate', type=int, default=20, metavar='N',
@@ -1321,7 +1472,7 @@ def main():
 
     # --remake-mosaics: skip photometry, load saved arrays and re-render PNGs
     if args.remake_mosaics:
-        sca_maps = load_mosaic_data(args.remake_mosaics)
+        sca_maps, sca_maps_full = load_mosaic_data(args.remake_mosaics)
         out_dir = os.path.dirname(os.path.abspath(args.remake_mosaics))
         exp_label = os.path.basename(out_dir)
         make_bkg_mosaic_png(
@@ -1329,6 +1480,13 @@ def main():
             superpixel=args.bkg_superpixel,
             title=f'WFI {exp_label} — background mosaic',
         )
+        if sca_maps_full:
+            make_bkg_mosaic_png(
+                sca_maps_full, os.path.join(out_dir, 'bkg_mosaic_full.png'),
+                superpixel=args.bkg_superpixel_full,
+                stretch_mode='percentile',
+                title=f'WFI {exp_label} — background mosaic (full)',
+            )
         sources_csv = os.path.join(out_dir, 'sources.csv')
         if os.path.exists(sources_csv):
             make_source_dot_mosaic_png(
@@ -1430,6 +1588,7 @@ def main():
                 if args.bkg_mosaic:
                     bkg_kwargs = dict(
                         superpixel=args.bkg_superpixel,
+                        superpixel_full=args.bkg_superpixel_full,
                         mask_sigma=args.bkg_mask_sigma,
                         dilate_radius=args.bkg_dilate,
                         bkg_poly_degree=args.bkg_poly,
@@ -1515,6 +1674,7 @@ def main():
     if args.bkg_mosaic:
         bkg_kwargs = dict(
             superpixel=args.bkg_superpixel,
+            superpixel_full=args.bkg_superpixel_full,
             mask_sigma=args.bkg_mask_sigma,
             dilate_radius=args.bkg_dilate,
             bkg_poly_degree=args.bkg_poly,
@@ -1558,10 +1718,18 @@ def main():
     sca_maps = {}
     if args.bkg_mosaic:
         sca_maps = {r['sca']: r['bkg_map'] for r in results}
-        save_mosaic_data(sca_maps, p('mosaic_data.npz'))
+        sca_maps_full = {r['sca']: r['bkg_map_full'] for r in results}
+        save_mosaic_data(sca_maps, sca_maps_full, p('mosaic_data.npz'))
         mosaic_tasks.append((make_bkg_mosaic_png, (sca_maps, p('bkg_mosaic.png')),
                              dict(superpixel=args.bkg_superpixel,
                                   title=f'{exp_title} — background mosaic')))
+
+        # Full focal-plane fitted background mosaic at fine resolution
+        mosaic_tasks.append((make_bkg_mosaic_png, (sca_maps_full, p('bkg_mosaic_full.png')),
+                             dict(superpixel=args.bkg_superpixel_full,
+                                  stretch_mode='percentile',
+                                  title=f'{exp_title} — background mosaic (full)')))
+
         if tables:
             mosaic_tasks.append((make_source_dot_mosaic_png,
                                  (p('sources.csv'), p('source_mosaic.png')),
