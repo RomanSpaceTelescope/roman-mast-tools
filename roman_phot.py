@@ -37,6 +37,7 @@ Usage
 """
 
 import argparse
+import configparser
 import os
 import sys
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -56,26 +57,26 @@ _ROMAN_SCA_FULL_SIZE  = 4096      # full detector size before reference-pixel re
 _ROMAN_REF_PIX        = 4         # reference pixels removed from each edge
 
 # Focal-plane layout: SCA number → (x_center_mm, y_center_mm, rotation_deg)
-# Coordinates are focal-plane mm; rotation 180° means the SCA is flipped
+# Coordinates are focal-plane mm; rotation is all zero since no flipping is needed
 # relative to the focal-plane axes.  Source: MPA_SCA_info ECSV (width=40.88 mm).
 _WFI_SCA_LAYOUT = {
-     1: (  -22.14,   12.15, 180.0),
-     2: (  -22.29,  -37.03, 180.0),
+     1: (  -22.14,   12.15, 0.0),
+     2: (  -22.29,  -37.03, 0.0),
      3: (  -22.44,  -82.06,   0.0),
-     4: (  -66.42,   20.90, 180.0),
-     5: (  -66.92,  -28.28, 180.0),
+     4: (  -66.42,   20.90, 0.0),
+     5: (  -66.92,  -28.28, 0.0),
      6: (  -67.42,  -73.06,   0.0),
-     7: ( -110.70,   42.20, 180.0),
-     8: ( -111.48,   -6.98, 180.0),
+     7: ( -110.70,   42.20, 0.0),
+     8: ( -111.48,   -6.98, 0.0),
      9: ( -112.64,  -51.06,   0.0),
-    10: (   22.14,   12.15, 180.0),
-    11: (   22.29,  -37.03, 180.0),
+    10: (   22.14,   12.15, 0.0),
+    11: (   22.29,  -37.03, 0.0),
     12: (   22.44,  -82.06,   0.0),
-    13: (   66.42,   20.90, 180.0),
-    14: (   66.92,  -28.28, 180.0),
+    13: (   66.42,   20.90, 0.0),
+    14: (   66.92,  -28.28, 0.0),
     15: (   67.42,  -73.06,   0.0),
-    16: (  110.70,   42.20, 180.0),
-    17: (  111.48,   -6.98, 180.0),
+    16: (  110.70,   42.20, 0.0),
+    17: (  111.48,   -6.98, 0.0),
     18: (  112.64,  -51.06,   0.0),
 }
 
@@ -102,6 +103,53 @@ def parse_filename(filename):
         'filter': filter_str,
     }
 
+
+def load_config():
+    """Load configuration from config file.
+    
+    Searches in order:
+    1. Path specified by --config argument
+    2. ~/config.ini
+    3. ./config.ini (current directory)
+    4. Falls back to current directory if no config found
+    
+    Returns
+    -------
+    str : Output root directory path
+    """
+    import configparser
+    from pathlib import Path
+    
+    config = configparser.ConfigParser()
+    
+    # Default search paths
+    search_paths = [
+        Path.home() / 'config.ini',
+        Path('./config.ini'),
+    ]
+    
+    config_path = None
+    for path in search_paths:
+        if path.exists():
+            config_path = path
+            break
+    
+    if config_path:
+        config.read(config_path)
+        if 'paths' in config and 'output_root' in config['paths']:
+            output_root = config['paths']['output_root']
+            # Expand ~ and environment variables
+            output_root = os.path.expanduser(output_root)
+            output_root = os.path.expandvars(output_root)
+            print(f'[roman_phot] Using output_root from {config_path}: {output_root}',
+                  file=sys.stderr)
+            return output_root
+    
+    # Fallback to current directory
+    fallback = os.getcwd()
+    print(f'[roman_phot] No config file found; using current directory: {fallback}',
+          file=sys.stderr)
+    return fallback
 
 # ---------------------------------------------------------------------------
 # Per-SCA photometry
@@ -1226,6 +1274,13 @@ def main():
         help='Maximum parallel streaming threads (default: 8)',
     )
 
+    ap.add_argument(
+        '--config', metavar='PATH',
+        help='Path to configuration file (default: search ~/config.ini, '
+             'then ./config.ini)',
+    )
+
+
     # Photometry tuning (mirrors roman_view_sca)
     ap.add_argument('--fwhm',          type=float, default=1.5,  metavar='N',
                     help='Source FWHM in pixels (default: 1.5)')
@@ -1342,7 +1397,16 @@ def main():
             exp_title  = (f'WFI {exp.visit_id}  '
                           f'Exp: {exp.exposure:04d}  '
                           f'{exp.optical_element or "?"}')
-            out_dir = exp_label
+            if getattr(args, 'config', None):
+                config = configparser.ConfigParser()
+                config.read(args.config)
+                output_root = config['paths']['output_root']
+                output_root = os.path.expanduser(output_root)
+                output_root = os.path.expandvars(output_root)
+            else:
+                output_root = load_config()
+
+            out_dir = os.path.join(output_root, exp_label)
             os.makedirs(out_dir, exist_ok=True)
             print(f'[roman_phot] output directory: {out_dir}/', file=sys.stderr)
 
@@ -1413,7 +1477,15 @@ def main():
     exp_title = (f'WFI {first_meta["visit_id"]}  '
                  f'Exp: {first_meta["exposure_num"]}  '
                  f'{first_meta["filter"]}')
-    out_dir = exp_label
+    if getattr(args, 'config', None):
+        config = configparser.ConfigParser()
+        config.read(args.config)
+        output_root = config['paths']['output_root']
+        output_root = os.path.expanduser(output_root)
+        output_root = os.path.expandvars(output_root)
+    else:
+        output_root = load_config()
+    out_dir = os.path.join(output_root, exp_label)
     os.makedirs(out_dir, exist_ok=True)
     print(f'[roman_phot] output directory: {out_dir}/', file=sys.stderr)
 
