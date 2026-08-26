@@ -490,9 +490,8 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--dpi", type=int, default=120)
     args = p.parse_args(argv)
 
-    # Load data using the same helper as roman_telem
-    from mast_eng_db_query import load_edb_data
-    df = load_edb_data(args.input)
+    # Load data
+    df = pd.read_csv(args.input) if args.input.endswith('.csv') else pd.read_pickle(args.input)
 
     selected = None
     if args.select_groups:
