@@ -3,7 +3,6 @@ Only read files I specify, and if you feel you need to read another file ALWAYS 
 ## Orientation skill and command
 
 - `.claude/skills/roman-mast-tools.md` — detailed orientation skill covering `roman_mast.py`/`roman_fits.py`/`roman_metadata.py`/`roman_view_sca.py`/`roman_phot.py` architecture, the two MAST filter axes, streaming traps (60s pre-signed URL expiry, AsdfFile gc-on-close), conda env + SSL cert hook, and working conventions. Load it before working on anything in that module set — it does NOT currently cover `roman_telem.py`/`roman_telem_plot.py`.
-- `.claude/commands/roman-mast-tools.md` — slash command that loads the above skill for orientation.
 
 ## File map
 
