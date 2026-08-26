@@ -40,4 +40,4 @@ roman-telem = "roman_telem:main"
 
 
 [tool.setuptools]
-py-modules = ["roman_mast", "roman_fits", "roman_metadata", "roman_view_sca", "roman_phot", "roman_telem", "roman_telem_plot", "mast_eng_db_query", "photometry"]
+py-modules = ["roman_mast", "roman_fits", "roman_metadata", "roman_view_sca", "roman_phot", "roman_telem", "roman_telem_plot", "photometry"]
