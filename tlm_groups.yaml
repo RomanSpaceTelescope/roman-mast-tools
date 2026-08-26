@@ -1,0 +1,7 @@
+groups:
+  rcs_pd:
+    label: "RCS photodiodes"
+    y_label: "Voltage (V)"
+    mnemonics:
+      - WFI_MCE_SRCS_PD1_V
+      - WFI_MCE_SRCS_PD2_V
