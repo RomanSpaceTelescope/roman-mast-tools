@@ -27,6 +27,8 @@ This installs the following command-line tools:
 - `roman-metadata` — extract and display metadata from ASDF files
 - `roman-view-sca` — stream and visualize a single SCA with photometry
 - `roman-phot` — batch photometry across all SCAs of an exposure
+- `roman-telem` — query Roman telemetry mnemonics from the MAST Engineering Database
+- `roman-telem-plot` — plot telemetry data with optional grouping
 
 ---
 
@@ -86,13 +88,27 @@ res.to_ds9('r0011401057001001001_0001')
 
 ### Authentication
 
-MAST authentication is only required for private programs. All public data
-(including the tutorial dataset) can be accessed anonymously via S3.
+MAST authentication is only required for private programs and telemetry queries.
+All public observation data (including the tutorial dataset) can be accessed anonymously via S3.
 
+**For MAST observations (roman-mast, roman-fits, roman-view-sca, roman-phot):**
 ```bash
 # Store your MAST API token (one-time setup)
 export MAST_API_TOKEN=your_token_here
 ```
+
+**For telemetry queries (roman-telem, roman-telem-plot):**
+```bash
+# MAST Engineering Database requires a token
+export MAST_API_TOKEN=your_token_here      # for production (mast.stsci.edu)
+export MAST_API_TOKEN_INT=your_token_int   # for internal testing (mastint.stsci.edu)
+```
+
+To obtain an API token:
+1. Visit [MAST Portal](https://mast.stsci.edu)
+2. Sign in with your STScI account
+3. Go to Settings → API Tokens
+4. Generate a new token and save it securely
 
 ---
 
@@ -234,10 +250,168 @@ exposure time, detector, WCS reference, etc.
 
 ---
 
+## `roman-telem` — Query Roman Telemetry from MAST Engineering DB
+
+Query Roman Space Telescope telemetry (mnemonics) from the MAST Engineering Database,
+with optional plotting and grouping by plot-group configurations.
+
+### Command Line
+
+```bash
+# Query a single mnemonic
+roman-telem RWT_FPGA_0_MODE \
+  --start "2025-01-01T00:00:00" --end "2025-01-02T00:00:00" \
+  --output data.csv
+
+# Query multiple mnemonics from a file
+roman-telem --input mnemonics.txt \
+  --start "2025-01-01" --end "2025-01-02" \
+  --output data.parquet
+
+# List available plot groups
+roman-telem --list-groups --plot-groups tlm_groups.yaml
+
+# Query and plot specific groups
+roman-telem --select-groups "thermal,power" \
+  --plot-groups tlm_groups.yaml \
+  --start "2025-01-01" --end "2025-01-02"
+```
+
+### Options
+
+- **Input:**
+  - `--mnemonic`, positional args — individual mnemonics (e.g. `RWT_FPGA_0_MODE`)
+  - `--input FILE` — read mnemonics from text file (one per line)
+  - `--plot-groups FILE.yaml` — load mnemonic groups from config
+
+- **Time range:**
+  - `--start`, `--end` — ISO format strings (e.g. `2025-01-01T12:30:00`)
+
+- **Filtering:**
+  - `--select-groups "group1,group2"` — only query these groups
+  - `--list-groups` — show available groups and exit
+
+- **Output:**
+  - `--output FILE` — save to CSV, Parquet, HDF5, or Pickle (format detected by extension)
+  - `--format csv|parquet|hdf5|pickle` — override format
+
+- **Server:**
+  - `--server mast` — production (default)
+  - `--server int` — internal testing server
+
+### Plot Groups
+
+Plot groups are defined in YAML config files (e.g. `tlm_groups.yaml`):
+
+```yaml
+groups:
+  thermal:
+    label: "Thermal Control System"
+    y_label: "Temperature (°C)"
+    mnemonics:
+      - THERMAL_FPGA_0_TEMP
+      - THERMAL_HEATER_0_PWR
+  power:
+    label: "Power Subsystem"
+    y_label: "Power (W)"
+    mnemonics:
+      - PSU_OUTPUT_12V
+      - PSU_OUTPUT_28V
+```
+
+### Python API
+
+```python
+from roman_telem import MASTEngDBQuery
+
+# Create a query object
+query = MASTEngDBQuery(api_token="your_token", server="mast")
+
+# Query a single mnemonic
+df = query.query_mnemonic(
+    "RWT_FPGA_0_MODE",
+    start_time="2025-01-01",
+    end_time="2025-01-02"
+)
+
+# Query multiple mnemonics (with automatic retry logic)
+dfs = query.query_multiple_mnemonics(
+    ["RWT_FPGA_0_MODE", "THERMAL_FPGA_0_TEMP"],
+    start_time="2025-01-01",
+    end_time="2025-01-02",
+    combine=True
+)
+```
+
+---
+
+## `roman-telem-plot` — Plot Telemetry Data
+
+Interactive plotting for telemetry data exported by `roman-telem`.
+
+### Command Line
+
+```bash
+# Plot all mnemonics from a CSV file
+roman-telem-plot data.csv
+
+# Plot only selected groups with custom title
+roman-telem-plot data.csv \
+  --select-groups "thermal,power" \
+  --plot-groups tlm_groups.yaml \
+  --suptitle "Thermal & Power Trending" \
+  --layout vertical
+
+# Save to PNG file
+roman-telem-plot data.csv \
+  --output trending.png \
+  --dpi 300 \
+  --layout horizontal
+```
+
+### Options
+
+- **Input:**
+  - `INPUT` — path to CSV, Parquet, HDF5, or Pickle file from `roman-telem`
+  - `--plot-groups FILE.yaml` — load mnemonic groups from config
+
+- **Filtering:**
+  - `--mnemonics "MNE1,MNE2"` — plot only these mnemonics
+  - `--select-groups "group1,group2"` — plot only these groups
+
+- **Display:**
+  - `--layout vertical|horizontal|grid` — subplot arrangement (default: vertical)
+  - `--suptitle "Title"` — add main title
+  - `--output FILE` — save to PNG/PDF (default: show interactively)
+  - `--dpi N` — output resolution (default: 120)
+
+### Python API
+
+```python
+from roman_telem_plot import plot_telemetry
+import pandas as pd
+
+# Load telemetry data
+df = pd.read_csv("data.csv")
+
+# Plot with grouping
+plot_telemetry(
+    df,
+    groups_config="tlm_groups.yaml",
+    selected_groups=["thermal", "power"],
+    layout="horizontal",
+    output="trending.png",
+    show=False
+)
+```
+
+---
+
 ## Architecture
 
 ### Module Hierarchy
 
+**Science data pipeline:**
 ```
 roman_mast.py       ← foundation: MAST auth, product search, S3 streaming
 roman_fits.py       ← output layer: ASDF → FITS/DS9, SIP WCS, catalog overlays
@@ -246,8 +420,14 @@ roman_view_sca.py   ← interactive single-SCA viewer
 roman_phot.py       ← batch photometry across all 18 SCAs
 ```
 
-Every tool builds on `roman_mast` primitives — streaming is never
-re-implemented elsewhere.
+**Telemetry pipeline:**
+```
+roman_telem.py      ← MAST EDB queries: mnemonic search, retry logic, I/O
+roman_telem_plot.py ← telemetry plotting with grouping and layout control
+```
+
+Every science tool builds on `roman_mast` primitives. Every telemetry tool builds on
+`roman_telem`'s query and I/O logic.
 
 ### Streaming Pipeline
 
@@ -326,6 +506,14 @@ A: Yes. Use `--display mpl` for matplotlib output. DS9 display requires a runnin
 **Q: What does the "source mask" percentage mean in background maps?**
 
 A: The fraction of pixels masked during background fitting (bright sources, bad pixels, etc.). Values of 15–20% are typical for science data.
+
+**Q: Do I need a MAST token for telemetry queries?**
+
+A: Yes. The MAST Engineering Database requires authentication. Obtain a token from the MAST Portal (Settings → API Tokens) and store it in `MAST_API_TOKEN` (production) or `MAST_API_TOKEN_INT` (testing).
+
+**Q: How do I use plot groups for telemetry?**
+
+A: Define groups in a YAML config file (e.g. `tlm_groups.yaml`), then pass it to `roman-telem` with `--plot-groups` and filter with `--select-groups` or `--list-groups`.
 
 ---
 
