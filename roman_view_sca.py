@@ -56,10 +56,10 @@ from astropy.io import fits
 from astropy.wcs import WCS
 
 # ---------------------------------------------------------------------------
-# Focal-plane rotation table (from MPA_SCA_info).
-# SCAs 3, 6, 9, 12, 15, 18 are not rotated (r=0); all others are r=180.
+# Focal-plane rotation table. All SCAs are already correctly oriented in
+# MAST data, so no rotation is applied during display.
 # ---------------------------------------------------------------------------
-_SCA_ROTATION = {n: (0 if n % 3 == 0 else 180) for n in range(1, 19)}
+_SCA_ROTATION = {n: 0 for n in range(1, 19)}
 
 
 # ---------------------------------------------------------------------------
