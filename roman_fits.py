@@ -1786,5 +1786,7 @@ Examples:
             close_streams(dm_dict)
 
 
+main = _cli
+
 if __name__ == '__main__':
     _cli()
