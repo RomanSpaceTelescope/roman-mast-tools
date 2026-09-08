@@ -40,6 +40,7 @@ import argparse
 import configparser
 import os
 import sys
+from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
 import matplotlib
@@ -104,6 +105,16 @@ def parse_filename(filename):
     }
 
 
+def _is_writable_root(path):
+    """Return True if path (or its nearest existing ancestor) is writable."""
+    p = Path(path)
+    while p != p.parent:
+        if p.exists():
+            return os.access(p, os.W_OK)
+        p = p.parent
+    return False
+
+
 def load_config():
     """Load configuration from config file.
     
@@ -117,9 +128,6 @@ def load_config():
     -------
     str : Output root directory path
     """
-    import configparser
-    from pathlib import Path
-    
     config = configparser.ConfigParser()
     
     # Default search paths
@@ -141,13 +149,19 @@ def load_config():
             # Expand ~ and environment variables
             output_root = os.path.expanduser(output_root)
             output_root = os.path.expandvars(output_root)
-            print(f'[roman_phot] Using output_root from {config_path}: {output_root}',
+            # Verify the resolved path is actually writable on this system
+            if _is_writable_root(output_root):
+                print(f'[roman_phot] Using output_root from {config_path}: {output_root}',
+                      file=sys.stderr)
+                return output_root
+            print(f'[roman_phot] output_root from {config_path} ({output_root}) is not '
+                  f'writable on this system; falling back to current directory',
                   file=sys.stderr)
-            return output_root
-    
+
     # Fallback to current directory
     fallback = os.getcwd()
-    print(f'[roman_phot] No config file found; using current directory: {fallback}',
+    print(f'[roman_phot] No config file found or config not usable; '
+          f'using current directory: {fallback}',
           file=sys.stderr)
     return fallback
 
@@ -1558,9 +1572,17 @@ def main():
             if getattr(args, 'config', None):
                 config = configparser.ConfigParser()
                 config.read(args.config)
-                output_root = config['paths']['output_root']
-                output_root = os.path.expanduser(output_root)
-                output_root = os.path.expandvars(output_root)
+                output_root = (config.get('paths', 'output_root', fallback=None)
+                               if 'paths' in config else None)
+                if output_root:
+                    output_root = os.path.expanduser(output_root)
+                    output_root = os.path.expandvars(output_root)
+                if not output_root or not _is_writable_root(output_root):
+                    if output_root:
+                        print(f'[roman_phot] output_root from {args.config} ({output_root}) '
+                              f'is not writable on this system; falling back to current directory',
+                              file=sys.stderr)
+                    output_root = os.getcwd()
             else:
                 output_root = load_config()
 
