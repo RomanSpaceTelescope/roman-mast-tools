@@ -1321,6 +1321,9 @@ Examples:
     print_summary(res, max_rows=args.max_rows, show_files=args.show_files)
 
 
+main = _cli
+
+
 if __name__ == '__main__':
     warnings.filterwarnings('ignore')
     _cli()
