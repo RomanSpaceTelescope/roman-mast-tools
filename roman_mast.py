@@ -437,7 +437,13 @@ class DataResults:
         Mosaic / coadd rows (no per-SCA structure) are skipped.
         """
         if self._exposures_cache is None:
-            self._exposures_cache = _group_exposures(self.results, self.data_level)
+            # Pass filtered only when it comes from MAST's authoritative
+            # product list (enumerate_products=True); the fast-path synthetic
+            # list assumes all files exist so we don't filter against it.
+            authoritative = self.filtered if self.products is not None else None
+            self._exposures_cache = _group_exposures(
+                self.results, self.data_level, filtered=authoritative,
+            )
         return self._exposures_cache
 
     @property
@@ -523,12 +529,21 @@ class DataResults:
             close_streams(af_dict)
 
 
-def _group_exposures(results, data_level):
-    """Group a metadata results Table into a list of Exposure objects."""
+def _group_exposures(results, data_level, filtered=None):
+    """Group a metadata results Table into a list of Exposure objects.
+
+    When ``filtered`` is provided (a Table with a 'filename' column from
+    MAST's authoritative product list), only SCAs whose synthesized filename
+    appears in that set are included. This drops exposures that have metadata
+    rows but no actual files (e.g. not yet processed).
+    """
     if results is None or len(results) == 0:
         return []
 
     suffix, ext = DATA_LEVEL_FILE.get(data_level, ('_cal', '.asdf'))
+    # Build allowlist from the authoritative filtered set when available.
+    allowed = (set(filtered['filename']) if filtered is not None
+               and len(filtered) > 0 else None)
 
     def _get(row, col, default=None):
         if col not in results.colnames:
@@ -556,6 +571,11 @@ def _group_exposures(results, data_level):
         exp_num  = int(m.group('exposure'))
         sca      = int(m.group('sca'))
         key = (visit_id, exp_num)
+        filename = f'{fsn}{suffix}{ext}'
+
+        # When we have an authoritative file list, skip SCAs not in it.
+        if allowed is not None and filename not in allowed:
+            continue
 
         if key not in exposures:
             exposures[key] = Exposure(
@@ -569,7 +589,7 @@ def _group_exposures(results, data_level):
         if sca not in exp.scas:
             exp.scas.append(sca)
             exp.scas.sort()
-            exp.filenames.append(f'{fsn}{suffix}{ext}')
+            exp.filenames.append(filename)
 
     return sorted(exposures.values(), key=lambda e: (e.visit_id, e.exposure))
 
@@ -966,12 +986,23 @@ def print_summary(res: DataResults, max_rows: int = 50, show_files: bool = False
     print(f"  Criteria      : {res.search or '(none — matching everything)'}")
     print(f"  Data level    : {res.data_level!r}  "
           f"(suffix filter: {DATA_LEVEL_SUFFIX.get(res.data_level, 'none')})")
-    print(f"  Result rows   : {res.n_results}")
+    fast_path = res.products is None and res.n_results > 0
+    print(f"  Result rows   : {res.n_results}"
+          + ("  (files inferred — add --enumerate-products to verify)" if fast_path else ""))
     print(f"  Products kept : {res.n_products}")
     print(f"  Exposures     : {res.n_exposures}")
 
     if res.n_products == 0:
-        print("\n  (no products match)")
+        if res.n_results > 0:
+            suffix = DATA_LEVEL_SUFFIX.get(res.data_level, '')
+            hint = (f" (data_level={res.data_level!r} → suffix {suffix!r})"
+                    if res.data_level is not None else '')
+            print(f"\n  {res.n_results} row(s) returned by MAST but none have "
+                  f"a matching L2 file{hint}.\n"
+                  f"  The observation may not have been processed yet, or the "
+                  f"files may be under a different data level.")
+        else:
+            print("\n  (no products match)")
         return
 
     if res.n_exposures:

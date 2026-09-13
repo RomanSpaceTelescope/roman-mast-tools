@@ -46,6 +46,60 @@ import roman_datamodels as rdm
 from roman_mast import Exposure, _log, close_streams
 
 
+# DQ bit flags sourced from roman_datamodels.dqflags.pixel — populated lazily
+# so import-time failure in the flags module (rare) doesn't break the rest
+# of roman_fits.
+def _dq_flag_map() -> dict:
+    """Return {flag_name: bit_value} from roman_datamodels.dqflags.pixel."""
+    from roman_datamodels.dqflags import pixel
+    return {f.name: int(f.value) for f in pixel if int(f.value) != 0}
+
+
+# Default palette for --dq-flags: the four bits worth calling out visually.
+# Order matters — first is drawn first (bottom of the stack).
+_DQ_DEFAULT_PALETTE = [
+    ('DO_NOT_USE',       'red'),
+    ('SATURATED',        'orange'),
+    ('JUMP_DET',         'green'),
+    ('GW_AFFECTED_DATA', 'cyan'),
+    ('HOT',              'magenta'),
+]
+
+
+def _parse_dq_flags_spec(spec: str) -> list:
+    """Parse a --dq-flags spec into [(name, bit, color), ...].
+
+    Accepted forms:
+        'FLAG,FLAG,FLAG'                 → uses colors from _DQ_DEFAULT_PALETTE
+        'FLAG:color,FLAG:color'          → explicit color per flag
+        'default'                        → the full _DQ_DEFAULT_PALETTE
+
+    Unknown flag names raise ValueError with the full valid list.
+    """
+    if spec is None or spec.strip().lower() == 'default':
+        entries = list(_DQ_DEFAULT_PALETTE)
+    else:
+        entries = []
+        default_colors = [c for _, c in _DQ_DEFAULT_PALETTE] + ['magenta', 'green', 'blue', 'white']
+        for i, token in enumerate([t.strip() for t in spec.split(',') if t.strip()]):
+            if ':' in token:
+                name, color = token.split(':', 1)
+                entries.append((name.strip(), color.strip()))
+            else:
+                color = default_colors[i] if i < len(default_colors) else 'white'
+                entries.append((token, color))
+
+    valid = _dq_flag_map()
+    out = []
+    for name, color in entries:
+        if name not in valid:
+            raise ValueError(
+                f"Unknown DQ flag {name!r}. Valid flags: {', '.join(sorted(valid))}"
+            )
+        out.append((name, valid[name], color))
+    return out
+
+
 # Which array attributes we pre-fetch off the datamodel. Kept to the two
 # arrays the current sinks actually consume:
 #   - `data` → FITS ImageHDU pixels, DS9 science mosaic, CSV data stats
@@ -384,6 +438,7 @@ def to_ds9_coadd(
     *,
     sip_degree: int = 4,
     dq_overlay: bool = True,
+    dq_flags: Optional[list] = None,
     ds9_target: Optional[str] = None,
 ):
     """Pipe coadd mosaic tiles into DS9 as a WCS mosaic via XPA.
@@ -426,9 +481,10 @@ def to_ds9_coadd(
          f"({len(dm_dict)} tile(s), sip_degree={sip_degree})")
 
     data_hdulist = fits.HDUList([fits.PrimaryHDU()])
-    dq_hdulist   = fits.HDUList([fits.PrimaryHDU()])
+    # Cache raw dq arrays keyed by tile index so we can render one mask
+    # layer per selected flag after dispatch (same pattern as to_ds9).
+    dq_cache: list = []  # list of (tile_index, dq_array, header_copy)
     n_data = 0
-    n_dq   = 0
 
     for i, (filename, dm) in enumerate(dm_dict.items()):
         if dm is None:
@@ -447,16 +503,7 @@ def to_ds9_coadd(
 
         if dq_overlay:
             try:
-                dq = np.asarray(dm.dq[...])
-                dq_mask = (dq != 0).astype(np.uint8)
-                dq_hdr = hdr.copy()
-                dq_hdr['BUNIT']   = 'flag'
-                dq_hdr['CONTENT'] = ('DQ_MASK', 'Non-zero = bad pixel (any DQ bit set)')
-                dq_hdulist.append(
-                    fits.ImageHDU(data=dq_mask, header=dq_hdr,
-                                  name=f'DQ{i:02d}')
-                )
-                n_dq += 1
+                dq_cache.append((i, np.asarray(dm.dq[...]), hdr.copy()))
             except (AttributeError, KeyError):
                 pass
 
@@ -475,23 +522,60 @@ def to_ds9_coadd(
     d.set('frame new')
     d.set('fits mosaicimage wcs', data_bytes)
 
-    if dq_overlay and n_dq > 0:
-        dq_buf = io.BytesIO()
-        dq_hdulist.writeto(dq_buf)
-        dq_bytes = dq_buf.getvalue()
+    if not dq_flags:
+        d.set('cmap viridis')
+        d.set('scale mode 99.5')
 
-        _log(f"Piping {len(dq_bytes)/1e6:.1f} MB DQ mask MEF into DS9 as overlay")
-        d.set('mask clear')
-        d.set('mask color red')
-        d.set('mask transparency 50')
-        d.set('mask mark nonzero')
-        d.set('fits mask mosaicimage wcs', dq_bytes)
+    # --- DQ overlay(s) — multi-layer via repeated `fits mask mosaicimage wcs`.
+    n_dq = 0
+    dq_layers_loaded = []
+    if dq_overlay and dq_cache:
+        if dq_flags:
+            layers = list(dq_flags)
+        else:
+            layers = [('ANY_DQ', None, 'red')]
+
+        # DO_NOT_USE last → painted on top; other layers stay at 50% transparent.
+        layers = [l for l in layers if l[0] != 'DO_NOT_USE'] + \
+                 [l for l in layers if l[0] == 'DO_NOT_USE']
+
+        for li, (name, bit, color) in enumerate(layers):
+            mask_hdulist = fits.HDUList([fits.PrimaryHDU()])
+            per_layer_pix = 0
+            for tile_i, dq, hdr in dq_cache:
+                if bit is None:
+                    mask = (dq != 0).astype(np.uint8)
+                else:
+                    mask = ((dq & bit) != 0).astype(np.uint8)
+                per_layer_pix += int(mask.sum())
+                mhdr = hdr.copy()
+                mhdr['BUNIT']   = 'flag'
+                mhdr['CONTENT'] = ('DQ_MASK', f'{name} (bit={bit})')
+                mask_hdulist.append(
+                    fits.ImageHDU(data=mask, header=mhdr, name=f'DQ{tile_i:02d}')
+                )
+
+            mbuf = io.BytesIO()
+            mask_hdulist.writeto(mbuf)
+            mbytes = mbuf.getvalue()
+
+            transparency = 0 if name == 'DO_NOT_USE' else 50
+            _log(f"Piping DQ layer {name} ({color}, transp={transparency}, "
+                 f"{per_layer_pix:,} pixels) into DS9 as mask overlay")
+            if li == 0:
+                d.set('mask clear')
+            d.set(f'mask color {color}')
+            d.set(f'mask transparency {transparency}')
+            d.set('mask mark nonzero')
+            d.set('fits mask mosaicimage wcs', mbytes)
+            n_dq += 1
+            dq_layers_loaded.append(f"{name}={color}")
 
     d.set('zoom to fit')
 
     extras = []
     if n_dq:
-        extras.append(f"DQ overlay ({n_dq} tiles)")
+        extras.append(f"DQ overlay [{', '.join(dq_layers_loaded)}]")
     extras_str = f" + {' + '.join(extras)}" if extras else ""
     _log(f"Loaded {n_data} coadd tile(s) into DS9{extras_str}")
 
@@ -877,6 +961,7 @@ def to_ds9(
     *,
     sip_degree: int = 4,
     dq_overlay: bool = True,
+    dq_flags: Optional[list] = None,
     catalog_paths: Optional[dict] = None,
     catalog_radius_arcsec: float = 0.4,
     catalog_color: str = 'green',
@@ -900,8 +985,10 @@ def to_ds9(
     sip_degree : int
         SIP polynomial degree for the gwcs → FITS approximation. Default 4.
     dq_overlay : bool
-        If True (default), send DQ (dq != 0) as a mask overlay on top of the
-        data frame. Silently skipped for products without a DQ array.
+        If True (default), send a DQ mask overlay on top of the data frame.
+        By default every pixel with any DQ bit set (dq != 0) is highlighted
+        in red. Use dq_flags to render specific bits as separate layers.
+        Silently skipped for products without a DQ array.
     catalog_paths : dict, optional
         ``{sca: path_to_cat_sca.parquet or None}`` — typically what
         `download_catalogs()` returns. When provided, DS9 draws one circle
@@ -954,10 +1041,12 @@ def to_ds9(
          f"exp={exposure.exposure}, sip_degree={sip_degree})")
 
     data_hdulist = fits.HDUList([fits.PrimaryHDU()])
-    dq_hdulist   = fits.HDUList([fits.PrimaryHDU()])
+
+    # Cache per-SCA (dq array, header) so we can build one mask MEF per
+    # selected DQ flag after the science mosaic is dispatched.
+    dq_cache: dict = {}
 
     n_data = 0
-    n_dq   = 0
 
     for scanum in sorted(af_dict):
         af = af_dict[scanum]
@@ -976,15 +1065,7 @@ def to_ds9(
 
         if dq_overlay:
             try:
-                dq = np.asarray(dm.dq[...])
-                dq_mask = (dq != 0).astype(np.uint8)
-                dq_hdr = hdr.copy()
-                dq_hdr['BUNIT']   = 'flag'
-                dq_hdr['CONTENT'] = ('DQ_MASK', 'Non-zero = bad pixel (any DQ bit set)')
-                dq_hdulist.append(
-                    fits.ImageHDU(data=dq_mask, header=dq_hdr, name=f'DQ{scanum:02d}')
-                )
-                n_dq += 1
+                dq_cache[scanum] = (np.asarray(dm.dq[...]), hdr.copy())
             except AttributeError:
                 pass  # L1 uncal has no DQ layer yet — fine.
 
@@ -1003,18 +1084,65 @@ def to_ds9(
     d.set('frame new')
     d.set('fits mosaicimage wcs', data_bytes)
 
-    # --- DQ overlay -------------------------------------------------------
-    if dq_overlay and n_dq > 0:
-        dq_buf = io.BytesIO()
-        dq_hdulist.writeto(dq_buf)
-        dq_bytes = dq_buf.getvalue()
+    if not dq_flags:
+        d.set('cmap viridis')
+        d.set('scale mode 99.5')
 
-        _log(f"Piping {len(dq_bytes)/1e6:.1f} MB DQ mask MEF into DS9 as overlay")
-        d.set('mask clear')
-        d.set('mask color red')
-        d.set('mask transparency 50')
-        d.set('mask mark nonzero')
-        d.set('fits mask mosaicimage wcs', dq_bytes)
+    # --- DQ overlay(s) ----------------------------------------------------
+    # Two modes:
+    #   • dq_flags = [(name, bit, color), ...]  → one mask layer per flag,
+    #     each with its own color. `mask clear` runs before the first layer;
+    #     subsequent `fits mask mosaicimage wcs` calls stack additional
+    #     overlays on top rather than replacing.
+    #   • dq_flags None → single-layer default: DO_NOT_USE (or all bits
+    #     red.
+    n_dq = 0
+    dq_layers_loaded = []
+    if dq_overlay and dq_cache:
+        if dq_flags:
+            layers = list(dq_flags)  # already (name, bit, color) tuples
+        else:
+            layers = [('ANY_DQ', None, 'red')]  # bit=None ⇒ dq != 0
+
+        # DS9 stacks masks in load order — the LAST mask loaded paints on
+        # top. Reorder so DO_NOT_USE is loaded last (visually on top with
+        # 0% transparency, fully occluding lower layers where it sets a
+        # pixel). Other layers stay at 50% so the science image shows through.
+        layers = [l for l in layers if l[0] != 'DO_NOT_USE'] + \
+                 [l for l in layers if l[0] == 'DO_NOT_USE']
+
+        for i, (name, bit, color) in enumerate(layers):
+            mask_hdulist = fits.HDUList([fits.PrimaryHDU()])
+            per_layer_pix = 0
+            for scanum in sorted(dq_cache):
+                dq, hdr = dq_cache[scanum]
+                if bit is None:
+                    mask = (dq != 0).astype(np.uint8)
+                else:
+                    mask = ((dq & bit) != 0).astype(np.uint8)
+                per_layer_pix += int(mask.sum())
+                mhdr = hdr.copy()
+                mhdr['BUNIT']   = 'flag'
+                mhdr['CONTENT'] = ('DQ_MASK', f'{name} (bit={bit})')
+                mask_hdulist.append(
+                    fits.ImageHDU(data=mask, header=mhdr, name=f'DQ{scanum:02d}')
+                )
+
+            mbuf = io.BytesIO()
+            mask_hdulist.writeto(mbuf)
+            mbytes = mbuf.getvalue()
+
+            transparency = 0 if name == 'DO_NOT_USE' else 50
+            _log(f"Piping DQ layer {name} ({color}, transp={transparency}, "
+                 f"{per_layer_pix:,} pixels) into DS9 as mask overlay")
+            if i == 0:
+                d.set('mask clear')
+            d.set(f'mask color {color}')
+            d.set(f'mask transparency {transparency}')
+            d.set('mask mark nonzero')
+            d.set('fits mask mosaicimage wcs', mbytes)
+            n_dq += 1
+            dq_layers_loaded.append(f"{name}={color}")
 
     # --- L4 catalog source overlay ---------------------------------------
     # DS9 evaluates fk5 regions against the mosaic's WCS, so one region
@@ -1050,7 +1178,7 @@ def to_ds9(
 
     extras = []
     if n_dq:
-        extras.append(f"DQ overlay ({n_dq} SCAs)")
+        extras.append(f"DQ overlay [{', '.join(dq_layers_loaded)}]")
     if n_cat:
         extras.append(f"L4 catalog ({n_cat} SCAs)")
     extras_str = f" + {' + '.join(extras)}" if extras else ""
@@ -1555,6 +1683,21 @@ Examples:
                    help='SIP polynomial degree for gwcs → FITS (default 4)')
     p.add_argument('--no-dq-overlay', action='store_true',
                    help='Skip the DQ (bad-pixel) mask overlay in ds9 mode')
+    p.add_argument('--dq-flags', default=None,
+                   help=("Render multiple DQ bit masks as separate colored layers "
+                         "in DS9. Examples: 'default' (DO_NOT_USE=red, "
+                         "SATURATED=orange, JUMP_DET=green, GW_AFFECTED_DATA=cyan, HOT=magenta); "
+                         "'DO_NOT_USE,SATURATED' (default palette colors); "
+                         "'DO_NOT_USE:red,HOT:magenta' (explicit colors). "
+                         "Valid flag names: "
+                         "DO_NOT_USE(bit 0), SATURATED(1), JUMP_DET(2), DROPOUT(3), "
+                         "GW_AFFECTED_DATA(4), PERSISTENCE(5), AD_FLOOR(6), OUTLIER(7), "
+                         "UNRELIABLE_ERROR(8), NON_SCIENCE(9), DEAD(10), HOT(11), "
+                         "WARM(12), LOW_QE(13), TELEGRAPH(15), NONLINEAR(16), "
+                         "BAD_REF_PIXEL(17), NO_FLAT_FIELD(18), NO_GAIN_VALUE(19), "
+                         "NO_LIN_CORR(20), NO_SAT_CHECK(21), UNRELIABLE_BIAS(22), "
+                         "UNRELIABLE_DARK(23), UNRELIABLE_SLOPE(24), UNRELIABLE_FLAT(25), "
+                         "UNRELIABLE_RESET(28), OTHER_BAD_PIXEL(30), REFERENCE_PIXEL(31)."))
     p.add_argument('--no-catalog', action='store_true',
                    help='Skip the L4 per-SCA catalog (cat_sca) source overlay '
                         'in ds9 mode. By default, if a catalog exists on MAST '
@@ -1613,6 +1756,15 @@ Examples:
 
     args = p.parse_args()
 
+    # Parse --dq-flags into (name, bit, color) tuples up front so any bad
+    # flag name errors before we hit the network.
+    dq_flags_parsed = None
+    if getattr(args, 'dq_flags', None):
+        try:
+            dq_flags_parsed = _parse_dq_flags_spec(args.dq_flags)
+        except ValueError as e:
+            p.error(str(e))
+
     # Propagate --coadd into the kinds/product-type before the MAST query.
     if getattr(args, 'coadd', False) and not getattr(args, 'kinds', None):
         args.kinds = 'coadd'
@@ -1647,6 +1799,7 @@ Examples:
                     dm_dict,
                     sip_degree=args.sip_degree,
                     dq_overlay=not args.no_dq_overlay,
+                    dq_flags=dq_flags_parsed,
                     ds9_target=args.ds9_target,
                 )
         finally:
@@ -1773,6 +1926,7 @@ Examples:
                     dm_dict, exp,
                     sip_degree=args.sip_degree,
                     dq_overlay=not args.no_dq_overlay,
+                    dq_flags=dq_flags_parsed,
                     catalog_paths=catalog_paths,
                     catalog_radius_arcsec=args.catalog_radius,
                     catalog_color=args.catalog_color,

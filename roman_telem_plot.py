@@ -49,7 +49,7 @@ _TIME_COL_CANDIDATES = (
     "sample_time", "t",
 )
 _VALUE_COL_CANDIDATES = (
-    "value", "val", "eng_value", "engineering_value",
+    "euvalue", "value", "val", "eng_value", "engineering_value",
     "raw_value", "data", "y",
 )
 
@@ -178,8 +178,13 @@ def _plot_mnemonics_on_axes(
             continue
         # Sort by time so lines don't zig-zag
         sub = sub.sort_values(tcol)
-        # Coerce value to numeric where possible
-        yvals = pd.to_numeric(sub[vcol], errors="coerce")
+        # Map known discrete string states to numeric, then coerce the rest
+        _STATE_MAP = {"DIS": 0, "ENA": 1, "OFF": 0, "ON": 1,
+                      "FALSE": 0, "TRUE": 1, "LOW": 0, "HIGH": 1}
+        yvals = sub[vcol].map(
+            lambda v: _STATE_MAP.get(str(v).strip().upper(), v)
+        )
+        yvals = pd.to_numeric(yvals, errors="coerce")
         ax.plot(
             sub[tcol], yvals,
             marker=marker, linestyle=linestyle,
@@ -459,6 +464,107 @@ def _ensure_parent_dir(path: str) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     if parent and not os.path.isdir(parent):
         os.makedirs(parent, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Public API: one subplot per mnemonic
+# ---------------------------------------------------------------------------
+
+def plot_per_mnemonic(
+    df: pd.DataFrame,
+    mnemonics: Optional[Sequence[str]] = None,
+    *,
+    layout: str = "vertical",
+    time_col: Optional[str] = None,
+    value_col: Optional[str] = None,
+    output: Optional[str] = None,
+    figsize: Optional[Tuple[float, float]] = None,
+    dpi: int = 120,
+    suptitle: Optional[str] = None,
+    show: bool = False,
+    sharex: bool = True,
+):
+    """Produce one subplot per mnemonic in a single figure.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Long-form telemetry DataFrame with a 'mnemonic' column.
+    mnemonics : list of str, optional
+        Mnemonics to plot. If None, all mnemonics present in `df` are used.
+    layout : {'vertical', 'horizontal', 'grid'}
+        Subplot arrangement.
+    output : str, optional
+        If given, save the figure to this path.
+    """
+    import matplotlib.pyplot as plt
+
+    if df is None or (hasattr(df, "empty") and df.empty):
+        raise ValueError("plot_per_mnemonic(): input DataFrame is empty.")
+
+    if "mnemonic" not in df.columns:
+        raise ValueError("DataFrame must contain a 'mnemonic' column.")
+
+    if mnemonics is None:
+        mnemonics = sorted(df["mnemonic"].dropna().unique().tolist())
+
+    mnemonics = list(mnemonics)
+    if not mnemonics:
+        raise ValueError("plot_per_mnemonic(): no mnemonics to plot.")
+
+    n = len(mnemonics)
+    nrows, ncols = _layout_grid(n, layout)
+
+    if figsize is None:
+        base_w = 12.0
+        base_h_per_row = 3.2
+        figsize = (base_w * (ncols / max(1, min(ncols, 2))),
+                   base_h_per_row * nrows)
+
+    fig, axes = plt.subplots(
+        nrows=nrows, ncols=ncols,
+        figsize=figsize, dpi=dpi,
+        sharex=sharex, squeeze=False,
+    )
+
+    axes_flat = [axes[r][c] for r in range(nrows) for c in range(ncols)]
+
+    tcol = time_col or _find_time_column(df)
+    vcol = value_col or _find_value_column(df, tcol)
+
+    total_plotted = 0
+    total_missing = 0
+
+    for i, m in enumerate(mnemonics):
+        ax = axes_flat[i]
+        plotted, missing = _plot_mnemonics_on_axes(
+            ax, df, [m],
+            time_col=tcol, value_col=vcol,
+            title=m,
+            x_label="Time" if (not sharex or i >= (nrows - 1) * ncols) else None,
+            show_legend=False,
+        )
+        total_plotted += plotted
+        total_missing += missing
+
+    for j in range(n, nrows * ncols):
+        axes_flat[j].set_visible(False)
+
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=13)
+
+    fig.autofmt_xdate()
+    fig.tight_layout(rect=(0, 0, 1, 0.97 if suptitle else 1.0))
+
+    if output:
+        _ensure_parent_dir(output)
+        fig.savefig(output, dpi=dpi, bbox_inches="tight")
+        print(f"Saved plot to {output} "
+              f"({total_plotted} traces, {total_missing} missing)")
+    if show:
+        plt.show()
+
+    return fig
 
 
 # ---------------------------------------------------------------------------

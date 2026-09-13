@@ -494,6 +494,9 @@ Examples:
     export_csv(res, indices, scas=scas, output=args.output, max_workers=args.workers)
 
 
+main = _cli
+
+
 if __name__ == '__main__':
     warnings.filterwarnings('ignore')
     _cli()

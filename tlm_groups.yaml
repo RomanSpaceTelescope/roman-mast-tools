@@ -5,3 +5,23 @@ groups:
     mnemonics:
       - WFI_MCE_SRCS_PD1_V
       - WFI_MCE_SRCS_PD2_V
+
+  bank1_leds:
+    label: "RCS LED Bank 1"
+    mnemonics:
+      - WFI_MCE_SRCS_BANK1SEL_LED1
+      - WFI_MCE_SRCS_BANK1SEL_LED2
+      - WFI_MCE_SRCS_BANK1SEL_LED3
+      - WFI_MCE_SRCS_BANK1SEL_LED4
+      - WFI_MCE_SRCS_BANK1SEL_LED5
+      - WFI_MCE_SRCS_BANK1SEL_LED6
+
+  bank2_leds:
+    label: "RCS LED Bank 2"
+    mnemonics:
+      - WFI_MCE_SRCS_BANK2SEL_LED1
+      - WFI_MCE_SRCS_BANK2SEL_LED2
+      - WFI_MCE_SRCS_BANK2SEL_LED3
+      - WFI_MCE_SRCS_BANK2SEL_LED4
+      - WFI_MCE_SRCS_BANK2SEL_LED5
+      - WFI_MCE_SRCS_BANK2SEL_LED6

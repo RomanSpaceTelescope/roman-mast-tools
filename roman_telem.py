@@ -7,10 +7,16 @@ Command-line and Python API for retrieving Roman Space Telescope telemetry
 `roman_telem_plot`.
 
 Wraps `mast_eng_db_query.MASTEngDBQuery` and adds:
-    * Mnemonic input from CLI, text file, or YAML "plot groups" config
+    * Positional group names as the shortest query form:
+          roman-telem rcs_pd
+          roman-telem bank1_leds bank2_leds --days 7
+      Group names are looked up in tlm_groups.yaml (cwd) or $ROMAN_TELEM_GROUPS.
+    * Mnemonic input via -m, --mnemonics-file, or --plot-groups YAML config
     * Group filtering (--select-groups) and discovery (--list-groups)
-    * CSV/Parquet/HDF5/Pickle output
-    * Optional trending plots via roman_telem_plot.plot_telemetry
+    * Time range via -s/-e or --days (default: last 1 day)
+    * CSV/Parquet/HDF5/Pickle output via --output
+    * Trending plots via --plot-output / --show, with --plot-per-mnemonic
+      for one subplot per mnemonic
 """
 
 from __future__ import annotations
@@ -445,40 +451,75 @@ def query_telemetry(
 _EPILOG = """\
 Examples
 --------
-# 1. Query a few mnemonics directly
-roman-telem --mnemonics WFI_MCE_SRCS_PD1_V WFI_MCE_SRCS_PD2_V \\
+# Quickest form — group name(s) from tlm_groups.yaml, last 24 h, interactive plot
+roman-telem rcs_pd
+roman-telem bank1_leds bank2_leds
+roman-telem rcs_pd --days 7
+
+# Save to CSV instead of plotting
+roman-telem rcs_pd --output rcs_pd.csv
+roman-telem rcs_pd --days 3 --output rcs_pd_3d.csv
+
+# Query specific mnemonics, explicit time range
+roman-telem -m WFI_MCE_SRCS_PD1_V WFI_MCE_SRCS_PD2_V \\
             -s "2026-05-01" -e "2026-07-02" --server int \\
             --output data.csv
 
-# 2. Discover available groups in a YAML plot-groups config
-roman-telem --plot-groups wfi_itps_groups.yaml --list-groups
+# One subplot per mnemonic, interactive
+roman-telem -m WFI_MCE_SRCS_PD1_V WFI_MCE_SRCS_PD2_V \\
+            -s "2026-09-11" -e "2026-09-14" \\
+            --plot-per-mnemonic --show
 
-# 3. Query a subset of groups (much faster than "all")
-roman-telem --plot-groups wfi_itps_groups.yaml \\
-            --select-groups "fps_mcu_currents,icdh_voltages" \\
-            -s "2026-05-01" -e "2026-07-02" --server int
+# Discover available groups
+roman-telem --list-groups
+roman-telem --plot-groups wfi_mce_srcs.yaml --list-groups
 
-# 4. Query, save data, and produce a trending plot
-roman-telem --plot-groups wfi_itps_groups.yaml \\
-            --select-groups "fps_mcu_currents,icdh_voltages" \\
-            -s "2026-05-01" -e "2026-07-02" --server int \\
-            --output selected_data.csv \\
-            --plot-output selected_trending.png
+# Use a custom groups file
+roman-telem --plot-groups wfi_mce_srcs.yaml --select-groups pd1,pd2 \\
+            -s "2026-05-01" -e "2026-07-02" --plot-output pd_trending.png
 """
 
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="roman-telem",
-        description="Query (and optionally plot) Roman telemetry from MAST EDB.",
+        description=(
+            "Query Roman telemetry from MAST EDB. "
+            "Quickest usage: roman-telem <group> [group2 ...] "
+            "(looks up groups in tlm_groups.yaml, plots last 24 h interactively). "
+            "Use -m for individual mnemonics, --output to save data, "
+            "--days to change the look-back window."
+        ),
         epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
+    # Positional group names (most convenient shorthand)
+    p.add_argument(
+        "groups",
+        nargs="*",
+        default=None,
+        metavar="GROUP",
+        help="One or more group names from the default groups file "
+             "(tlm_groups.yaml in cwd, or $ROMAN_TELEM_GROUPS). "
+             "Equivalent to --plot-groups <file> --select-groups <group> --show.",
+    )
+
+    # Shorthand: --plot <group> [group2 ...]
+    p.add_argument(
+        "--plot",
+        nargs="+",
+        dest="plot_shorthand",
+        default=None,
+        metavar="GROUP",
+        help="Alias for positional GROUP arguments.",
+    )
+
     # Mnemonic sources (any combination is allowed)
     p.add_argument(
-        "--mnemonics", "-m",
+        "-m",
         nargs="+",
+        dest="mnemonics",
         default=None,
         help="One or more mnemonic names (space-separated).",
     )
@@ -503,14 +544,20 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--list-groups",
         action="store_true",
-        help="List available groups in --plot-groups and exit.",
+        help="List available groups in --plot-groups (or the default groups file) "
+             "and exit.",
     )
 
     # Time range
     p.add_argument("-s", "--start", default=None,
-                   help="Start time (e.g. '2026-05-01' or ISO datetime).")
+                   help="Start time (e.g. '2026-05-01' or ISO datetime). "
+                        "If omitted, derived from --days before now.")
     p.add_argument("-e", "--end", default=None,
-                   help="End time (e.g. '2026-07-02' or ISO datetime).")
+                   help="End time (e.g. '2026-07-02' or ISO datetime). "
+                        "If omitted, defaults to now.")
+    p.add_argument("--days", type=float, default=1.0,
+                   help="Number of past days to retrieve when -s/--start is not "
+                        "specified (default: 1).")
 
     # Server / auth
     p.add_argument("--server", choices=["mast", "int"], default="mast",
@@ -545,6 +592,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--plot-layout", default="vertical",
                    choices=["vertical", "horizontal", "grid"],
                    help="Plot layout when using --plot-groups (default: vertical).")
+    p.add_argument("--plot-per-mnemonic", action="store_true",
+                   help="Produce one subplot per mnemonic (ignores --plot-groups grouping). "
+                        "Requires --plot-output or --show.")
     p.add_argument("--show", action="store_true",
                    help="Display the plot live in a matplotlib window.")
 
@@ -623,20 +673,64 @@ def _collect_mnemonics_from_args(args: argparse.Namespace,
     return mnemonics
 
 
+def _resolve_default_groups_file() -> Optional[str]:
+    """Return the default groups YAML path ($ROMAN_TELEM_GROUPS or tlm_groups.yaml in cwd)."""
+    env = os.environ.get("ROMAN_TELEM_GROUPS")
+    if env and os.path.isfile(env):
+        return env
+    local = os.path.join(os.getcwd(), "tlm_groups.yaml")
+    if os.path.isfile(local):
+        return local
+    return None
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     verbose = not args.quiet
 
+    # --- Resolve default groups file when --select-groups used without --plot-groups ---
+    if args.select_groups and not args.plot_groups and not args.plot_shorthand:
+        args.plot_groups = _resolve_default_groups_file()
+        if not args.plot_groups:
+            parser.error(
+                "--select-groups requires --plot-groups or a default tlm_groups.yaml "
+                "in the current directory (or $ROMAN_TELEM_GROUPS)."
+            )
+
+    # --- Expand positional groups / --plot shorthand ---
+    _group_shorthand = args.plot_shorthand or args.groups or None
+    if _group_shorthand:
+        if not args.plot_groups:
+            args.plot_groups = _resolve_default_groups_file()
+        if not args.plot_groups:
+            parser.error(
+                "Group shorthand requires a groups file. Place tlm_groups.yaml in the "
+                "current directory or set $ROMAN_TELEM_GROUPS."
+            )
+        args.select_groups = ",".join(_group_shorthand)
+        args.show = True
+
     # --- Handle --list-groups (does not require start/end) ---
     if args.list_groups:
-        if not args.plot_groups:
-            parser.error("--list-groups requires --plot-groups")
-        return _handle_list_groups(args.plot_groups)
+        groups_file = args.plot_groups or _resolve_default_groups_file()
+        if not groups_file:
+            parser.error(
+                "--list-groups requires --plot-groups or a default tlm_groups.yaml "
+                "in the current directory (or $ROMAN_TELEM_GROUPS)."
+            )
+        return _handle_list_groups(groups_file)
 
-    # --- Require start/end for actual queries ---
-    if not args.start or not args.end:
-        parser.error("--start/-s and --end/-e are required (unless using --list-groups)")
+    # --- Resolve time range ---
+    from datetime import timezone
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    if not args.end:
+        args.end = now.strftime("%Y-%m-%dT%H:%M:%S")
+    if not args.start:
+        args.start = (now - pd.Timedelta(days=args.days)).strftime("%Y-%m-%dT%H:%M:%S")
+        if verbose:
+            print(f"No start time specified — retrieving last {args.days:g} day(s): "
+                  f"{args.start} to {args.end} UTC")
 
     # --- Resolve mnemonic list ---
     try:
@@ -737,7 +831,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # --- Optional plotting ---
     if args.plot_output or args.show:
         try:
-            from roman_telem_plot import plot_telemetry  # lazy import
+            from roman_telem_plot import plot_telemetry, plot_per_mnemonic  # lazy import
         except ImportError as e:
             print(f"ERROR: unable to import roman_telem_plot: {e}", file=sys.stderr)
             return 1
@@ -746,7 +840,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.select_groups:
             selected = [s.strip() for s in args.select_groups.split(",") if s.strip()]
 
-        try:
+        if plot_df.empty:
+            print("WARNING: no data returned — skipping plot.", file=sys.stderr)
+        elif args.plot_per_mnemonic:
+            plot_per_mnemonic(
+                plot_df,
+                mnemonics=mnemonics,
+                layout=args.plot_layout,
+                output=args.plot_output,
+                show=args.show,
+            )
+        else:
             plot_telemetry(
                 plot_df,
                 groups_config=args.plot_groups,
@@ -755,10 +859,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 output=args.plot_output,
                 show=args.show,
             )
-        except TypeError:
-            # If the installed roman_telem_plot has a different signature, retry
-            # with a minimal call so we degrade gracefully.
-            plot_telemetry(plot_df, output=args.plot_output, show=args.show)
 
         if verbose and args.plot_output:
             print(f"Wrote plot to {args.plot_output}")
