@@ -10,19 +10,30 @@ downloaded first (though a local cache is supported for fast iteration).
 
 ## Installation
 
-Create and activate the conda environment before using any of the tools. The
-environment installs all dependencies (including an unreleased astroquery
-build that adds Roman MAST streaming support) and the package itself.
+Create and activate the conda environment:
 
 ```bash
-conda env create -f environment.yml
-conda activate roman-mast-tools
+mamba env create -f environment.yml
+mamba activate roman-mast-tools
 ```
 
 If the environment already exists and you need to update it:
 
 ```bash
-conda env update -f environment.yml --prune
+mamba env update -f environment.yml --prune
+```
+
+Verify the install:
+
+```bash
+python -c "
+import roman_datamodels, romancal, astroquery, fsspec, matplotlib
+from astroquery.mast import MastMissions
+print('roman_datamodels', roman_datamodels.__version__)
+print('romancal        ', romancal.__version__)
+print('astroquery      ', astroquery.__version__)
+print('OK')
+"
 ```
 
 All commands below assume the `roman-mast-tools` environment is active.
@@ -70,32 +81,20 @@ export MAST_API_TOKEN=your_token_here
 
 ---
 
-## Quick Start: Tutorial Data
-
-### Optional — cache tutorial SCAs locally (~3.4 GB)
-
-```bash
-bash download_all_scas.sh
-```
-
-Creates a `cache/` directory with all 18 tutorial SCAs for fast offline
-work. All tools also stream directly from S3, so caching is optional.
-
-### End-to-End: list → view → batch photometry
+## Quick Start
 
 ```bash
 # 1. List available exposures
-roman-mast --program 1039 --execution-plan 2 --pass 4 --observation 7 --sca-only --list
+roman-mast --program 1039
 
-# 2. View a single SCA
-roman-view-sca --display mpl --bkg --phot \
+# 2. Stream exposure 1 to FITS files
+# First you need to run "ds9&" in your terminal
+roman-fits --program 1039 --execution-plan 2 --pass 4 --observation 7 \
+    --exposures 1 --to ds9
+
+# 3. View a single SCA using matplotlib
+roman-view-sca --display mpl \
     --program 1039 --execution-plan 2 --pass 4 --observation 7 --exposure 1 --sca 11
-
-# 3a. Run batch photometry directly from MAST (18 SCAs, no local files)
-roman-phot --program 1039 --execution-plan 2 --pass 4 --observation 7 --exposures 1 --bkg-mosaic
-
-# 3b. Or, if you already have a text file of S3 / local URIs:
-roman-phot --uri-file my_exposure.txt --bkg-mosaic
 ```
 
 ---
@@ -109,7 +108,7 @@ its streaming primitives.
 
 ```bash
 # List all exposures for a program/pass
-roman-mast --program 1039 --execution-plan 2 --pass 4 --observation 7 --list
+roman-mast --program 1039 --execution-plan 2 --pass 4 --observation 7
 
 # List only the per-SCA L2 cal files for a specific detector
 roman-mast --program 1039 --execution-plan 2 --pass 4 --observation 7 --detector wfi04 --sca-only --list
@@ -743,46 +742,7 @@ Background mosaics, DS9 displays, and matplotlib plots respect this layout.
 - `h5py` / `tables` — HDF5 output for `roman-telem`
 - `tqdm` — progress bars where available
 
-**Install**
-
-```bash
-# Using conda (recommended — pulls DS9-compatible builds)
-conda env create -f environment.yml
-conda activate roman-mast-tools
-```
-
-## Dependencies
-
-**Core**
-- `numpy`, `astropy` — array math, WCS, FITS I/O, tables
-- `roman_datamodels`, `romancal`, `rad` — Roman-specific ASDF schemas and datamodels
-- `asdf` — ASDF file parsing
-- `gwcs` — generalized WCS (Roman ships gwcs per SCA; approximated to SIP)
-- `photutils` — source detection, aperture photometry, background estimation
-- `matplotlib` — visualization
-- `s3fs`, `fsspec` — anonymous S3 streaming
-- `astroquery` — MAST authenticated queries (`MastMissions`)
-- `pandas`, `pyarrow` — telemetry DataFrames, Parquet I/O
-- `pyyaml` — plot-group config parsing
-- `requests` — MAST Engineering DB REST client
-- `keyring`, `python-dotenv` — credential handling
-
-**Optional**
-- **DS9 + XPA** — required for `--display ds9` and `roman-fits --ds9`
-  (local installation, DS9 must be running before the tool is invoked)
-- `h5py` / `tables` — HDF5 output for `roman-telem`
-- `tqdm` — progress bars where available
-
-**Install**
-
-```bash
-# Using conda (recommended — pulls DS9-compatible builds)
-conda env create -f environment.yml
-conda activate roman-mast-tools
-
-# Or pip
-pip install -r requirements.txt
-```
+See [Installation](#installation) above.
 
 ---
 
