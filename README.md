@@ -95,16 +95,15 @@ work. All tools also stream directly from S3, so caching is optional.
 ### End-to-End: list → view → batch photometry
 
 ```bash
-# 1. List available exposures (public S3 — no auth needed to view metadata)
-roman-mast --program 114 --pass 57 --sca-only --list
+# 1. List available exposures
+roman-mast --program 1039 --execution-plan 2 --pass 4 --observation 7 --sca-only --list
 
-# 2. View a single SCA from public S3
+# 2. View a single SCA
 roman-view-sca --display mpl --bkg --phot \
-    s3://stpubdata/roman/nexus/soc_simulations/tutorial_data/roman-2026.2/ \
-    r0003201001001001004_0001_wfi11_f106_cal.asdf
+    --program 1039 --execution-plan 2 --pass 4 --observation 7 --exposure 1 --sca 11
 
 # 3a. Run batch photometry directly from MAST (18 SCAs, no local files)
-roman-phot --program 114 --pass 57 --exposures 1 --bkg-mosaic
+roman-phot --program 1039 --execution-plan 2 --pass 4 --observation 7 --exposures 1 --bkg-mosaic
 
 # 3b. Or, if you already have a text file of S3 / local URIs:
 roman-phot --uri-file my_exposure.txt --bkg-mosaic
@@ -121,16 +120,16 @@ its streaming primitives.
 
 ```bash
 # List all exposures for a program/pass
-roman-mast --program 114 --pass 57 --list
+roman-mast --program 1039 --execution-plan 2 --pass 4 --observation 7 --list
 
 # List only the per-SCA L2 cal files for a specific detector
-roman-mast --program 114 --pass 57 --detector wfi04 --sca-only --list
+roman-mast --program 1039 --execution-plan 2 --pass 4 --observation 7 --detector wfi04 --sca-only --list
 
 # See every supported product kind (cal, uncal, cat, cat_sca, coadd, gw, ...)
 roman-mast --list-kinds
 
 # Fetch a specific set of product kinds
-roman-mast --program 114 --pass 57 --kinds cal,cat_sca --list
+roman-mast --program 1039 --execution-plan 2 --pass 4 --observation 7 --kinds cal,cat_sca --list
 ```
 
 ### Python API
@@ -139,12 +138,12 @@ roman-mast --program 114 --pass 57 --kinds cal,cat_sca --list
 from roman_mast import list_data, print_summary
 
 # All filters are optional
-res = list_data(program=114, pass_=57, sca_only=True)
+res = list_data(program=1039, execution_plan=2, pass_=4, observation=7, sca_only=True)
 print_summary(res)
 
 # Stream one exposure into memory — key is a 1-based index or (visit_id, exposure) tuple
 af_dict = res.stream(1)                       # 1-based index from print_summary
-# af_dict = res.stream(('0011401057001001001', 1))   # or tuple form
+# af_dict = res.stream(('0103900004001001007', 1))   # or tuple form
 
 # One-liner: stream → FITS files on disk
 res.to_fits(1, out_dir='output/')
@@ -167,7 +166,7 @@ res.to_ds9(1)
 | `observation` | int | Observation within the segment |
 | `visit` | int | Visit within the observation |
 | `detector` | str/int | `'WFI04'`, `'wfi04'`, or `4` |
-| `visit_id` | str | Full 19-digit ID or wildcard, e.g. `'0011401057*'` |
+| `visit_id` | str | Full 19-digit ID or wildcard, e.g. `'0103900004*'` |
 | `exposure` | int | Matches last 4 digits of `observation_id` |
 | `optical_element` | str | e.g. `'F062'`, `'F129'` |
 | `exposure_type` | str | e.g. `'WFI_IMAGE'`, `'WFI_DARK'` |
@@ -201,31 +200,31 @@ output.
 
 ```bash
 # See what's available (no output yet)
-roman-fits --program 114 --pass 57 --sca-only --list
+roman-fits --program 1039 --execution-plan 2 --pass 4 --observation 7 --sca-only --list
 
 # Write one exposure to disk as 18 FITS files under /tmp/wfi/v..._exp01/
-roman-fits --program 114 --pass 57 --sca-only \
+roman-fits --program 1039 --execution-plan 2 --pass 4 --observation 7 --sca-only \
     --exposures 1 --to fits --out-dir /tmp/wfi
 
 # RICE compressed
-roman-fits --program 114 --pass 57 --sca-only \
+roman-fits --program 1039 --execution-plan 2 --pass 4 --observation 7 --sca-only \
     --exposures 1 --to fits --compress
 
 # Multiple exposures — one v..._expNN/ folder each under --out-dir
-roman-fits --program 114 --pass 57 --sca-only \
+roman-fits --program 1039 --execution-plan 2 --pass 4 --observation 7 --sca-only \
     --exposures 1-4 --to fits --out-dir /tmp/wfi
 
 # Stream to DS9 (DS9 + pyds9 required, `ds9 &` running). Catalog parquet
 # files + a combined .reg land in <cwd>/v..._exp01/catalog/
-roman-fits --program 114 --pass 57 --sca-only \
+roman-fits --program 1039 --execution-plan 2 --pass 4 --observation 7 --sca-only \
     --exposures 1 --to ds9
 
 # Only a subset of SCAs
-roman-fits --program 114 --pass 57 --sca-only \
+roman-fits --program 1039 --execution-plan 2 --pass 4 --observation 7 --sca-only \
     --exposures 1 --scas 1-6 --to fits
 
 # Coadd tiles (product_type=p_visit_coadd) instead of per-SCA exposures
-roman-fits --program 114 --pass 57 --coadd --exposures 1 --to fits
+roman-fits --program 1039 --execution-plan 2 --pass 4 --observation 7 --coadd --exposures 1 --to fits
 ```
 
 ### Output layout
@@ -261,7 +260,7 @@ Each run drops **one folder per exposure** under `--out-dir` (default cwd):
 from roman_fits import to_fits_files, to_ds9, download_catalogs
 from roman_mast import list_data
 
-res = list_data(program=114, pass_=57, sca_only=True)
+res = list_data(program=1039, execution_plan=2, pass_=4, observation=7, sca_only=True)
 exposure = res.exposures[0]
 
 # Stream materialized data models {sca: DataModel}
@@ -326,11 +325,11 @@ roman-view-sca --display mpl --bkg --phot \
     s3://stpubdata/roman/nexus/soc_simulations/tutorial_data/roman-2026.2/ \
     r0003201001001001004_0001_wfi11_f106_cal.asdf
 
-# MAST query mode — pick SCA 4 of exposure 1 in program 114 / pass 57
-roman-view-sca --program 114 --pass 57 --exposure 1 --sca 4 --display ds9
+# MAST query mode — pick SCA 4 of exposure 1
+roman-view-sca --program 1039 --execution-plan 2 --pass 4 --observation 7 --exposure 1 --sca 4 --display ds9
 
 # Connect to a specific DS9 by XPA target name
-roman-view-sca --program 114 --pass 57 --exposure 1 --sca 1 --ds9 myds9
+roman-view-sca --program 1039 --execution-plan 2 --pass 4 --observation 7 --exposure 1 --sca 1 --ds9 myds9
 
 # Save a matplotlib PNG (headless)
 roman-view-sca --display mpl --phot-out phot.csv \
@@ -375,13 +374,13 @@ density + image thumbnails).
 
 ```bash
 # One line per S3 URI:
-#   s3://stpubdata/roman/.../r0003201001001001004_0001_wfi01_f106_cal.asdf
-#   s3://stpubdata/roman/.../r0003201001001001004_0001_wfi02_f106_cal.asdf
+#   s3://stpubdata/roman/.../r0103900004001001007_0001_wfi01_f106_cal.asdf
+#   s3://stpubdata/roman/.../r0103900004001001007_0001_wfi02_f106_cal.asdf
 #   ...
 roman-phot --uri-file my_exposure.txt
 
 # Or query MAST directly (no URI file needed)
-roman-phot --program 114 --pass 57 --exposures 1
+roman-phot --program 1039 --execution-plan 2 --pass 4 --observation 7 --exposures 1
 
 # Photometry tuning
 roman-phot --uri-file my_exposure.txt \
@@ -394,7 +393,7 @@ roman-phot --uri-file my_exposure.txt --per-sca
 roman-phot --uri-file my_exposure.txt --bkg-mosaic --image-mosaic
 
 # Re-render mosaics from a saved .npz (no re-run of photometry)
-roman-phot --remake-mosaics r0003201001001001004_0001/mosaic_data.npz
+roman-phot --remake-mosaics r0103900004001001007_0001/mosaic_data.npz
 ```
 
 ### Outputs
@@ -440,21 +439,21 @@ unless `--no-metadata` is passed.
 
 ```bash
 # List matching exposures without writing anything
-roman-metadata --program 114 --pass 57 --list
+roman-metadata --program 1039 --execution-plan 2 --pass 4 --observation 7 --list
 
 # Export metadata for exposure 1 (default: --no-list needed to actually write)
-roman-metadata --program 114 --pass 57 --exposures 1 --no-list
+roman-metadata --program 1039 --execution-plan 2 --pass 4 --observation 7 --exposures 1 --no-list
 
 # Only some SCAs across a range of exposures
-roman-metadata --program 114 --pass 57 \
+roman-metadata --program 1039 --execution-plan 2 --pass 4 --observation 7 \
     --exposures 1-3 --scas 1-6 --no-list
 
 # Level-1 (uncal) metadata for one visit
-roman-metadata --visit-id 0011401057001001001 \
+roman-metadata --visit-id 0103900004001001007 \
     --data-level 1 --exposures all --no-list
 
 # Custom output path
-roman-metadata --program 114 --pass 57 --exposures 1 \
+roman-metadata --program 1039 --execution-plan 2 --pass 4 --observation 7 --exposures 1 \
     --no-list --output /tmp/meta.csv
 ```
 
@@ -476,7 +475,7 @@ and a warning is emitted if fewer exposures are exported than
 from roman_mast import list_data
 from roman_metadata import export_csv, extract_rows, write_metadata_csv
 
-res = list_data(program=114, pass_=57, sca_only=True)
+res = list_data(program=1039, execution_plan=2, pass_=4, observation=7, sca_only=True)
 
 # One-shot for a range of exposures
 export_csv(res, indices=[1, 2, 3], scas=None, output='meta.csv')

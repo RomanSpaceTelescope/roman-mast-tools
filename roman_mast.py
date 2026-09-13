@@ -24,14 +24,14 @@ product MAST knows about (be prepared for it to be large / slow).
 
 Filter reference
 ----------------
-    program         : int             — APT program ID (e.g. 114)
-    execution_plan  : int             — execution plan within the program
-    pass_           : int             — pass within the execution plan (e.g. 57)
+    program         : int             — APT program ID (e.g. 1039)
+    execution_plan  : int             — execution plan within the program (e.g. 2)
+    pass_           : int             — pass within the execution plan (e.g. 4)
     segment         : int             — segment within the pass
     observation     : int             — observation within the segment
     visit           : int             — visit within the observation
     detector        : str | int       — 'WFI04' / 'wfi04' / 4  → 'WFI04'
-    visit_id        : str             — full ID or wildcard, e.g. '0011401057*'
+    visit_id        : str             — full ID or wildcard, e.g. '0103900004*'
     exposure        : int             — matches last 4 digits of observation_id
     optical_element : str             — e.g. 'F062', 'F129'
     exposure_type   : str             — e.g. 'WFI_IMAGE', 'WFI_DARK'
@@ -49,10 +49,10 @@ Filter reference
 Example — reproducing the comm_streaming_example.ipynb search
 -------------------------------------------------------------
     >>> from roman_mast import list_data, print_summary
-    >>> res = list_data(program=114, pass_=57, detector='WFI04')
+    >>> res = list_data(program=1039, execution_plan=2, pass_=4, observation=7, detector='WFI04')
     >>> print_summary(res)
     >>> res.filenames[:3]
-    ['r0011401057001001001_0001_wfi04_f062_cal.asdf', ...]
+    ['r0103900004001001007_0001_wfi04_f106_cal.asdf', ...]
 """
 
 # Null keyring so headless envs don't hit DBus/SecretService.
@@ -1184,7 +1184,7 @@ def add_list_data_args(parser):
     Keeps flag names / help text in one place.
     """
     parser.add_argument('--program',         type=int, default=None,
-                        help='APT program ID, e.g. 114')
+                        help='APT program ID, e.g. 1039')
     parser.add_argument('--execution-plan',  dest='execution_plan',
                         type=int, default=None,
                         help='Execution plan number within the program')
@@ -1199,7 +1199,7 @@ def add_list_data_args(parser):
     parser.add_argument('--detector',        default=None,
                         help="Detector — 'WFI04', 'wfi04', or 4")
     parser.add_argument('--visit-id',        default=None,
-                        help='Full 19-digit visit ID or wildcard, e.g. 0011401057*')
+                        help='Full 19-digit visit ID or wildcard, e.g. 0103900004*')
     parser.add_argument('--exposure',        type=int, default=None,
                         help='Exposure number (last 4 digits of observation_id)')
     parser.add_argument('--optical-element', default=None,
@@ -1316,20 +1316,20 @@ def _cli():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 Examples:
-  # The comm_streaming_example.ipynb search
-  python roman_mast.py --program 114 --pass 57 --detector WFI04
+  # Basic query
+  python roman_mast.py --program 1039 --execution-plan 2 --pass 4 --observation 7 --detector WFI04
 
   # Everything MAST has for one visit
-  python roman_mast.py --visit-id 0011401057001001001
+  python roman_mast.py --visit-id 0103900004001001007
 
   # Level-1 (uncal) files for a program
-  python roman_mast.py --program 114 --data-level 1
+  python roman_mast.py --program 1039 --data-level 1
 
   # Raw per-SCA exposures only (drop the p_visit_coadd mosaic tiles)
-  python roman_mast.py --program 114 --pass 57 --sca-only
+  python roman_mast.py --program 1039 --execution-plan 2 --pass 4 --observation 7 --sca-only
 
   # Show every product kind (cal / uncal / cat / wcs / segm / ...)
-  python roman_mast.py --visit-id 0011401057* --data-level none
+  python roman_mast.py --visit-id 0103900004* --data-level none
 
   # No filters at all — every Roman product on MAST (may be huge)
   python roman_mast.py

@@ -427,22 +427,22 @@ to pick which to include.
 
 Examples:
   # See what's available first (list only, no export)
-  python roman_metadata.py --program 114 --pass 57 --list
+  python roman_metadata.py --program 1039 --execution-plan 2 --pass 4 --observation 7 --list
 
   # Export every SCA of exposure 1 to a CSV
-  python roman_metadata.py --program 114 --pass 57 \\
+  python roman_metadata.py --program 1039 --execution-plan 2 --pass 4 --observation 7 \\
       --exposures 1 --no-list --output exp1_meta.csv
 
   # Every exposure in a visit, all SCAs
-  python roman_metadata.py --visit-id 0011401057001001001 \\
+  python roman_metadata.py --visit-id 0103900004001001007 \\
       --exposures all --no-list
 
   # Only some SCAs of a range of exposures
-  python roman_metadata.py --program 114 --pass 57 \\
+  python roman_metadata.py --program 1039 --execution-plan 2 --pass 4 --observation 7 \\
       --exposures 1-3 --scas 1-6 --no-list
 
   # Level-1 (uncal) metadata for one visit
-  python roman_metadata.py --visit-id 0011401057001001001 \\
+  python roman_metadata.py --visit-id 0103900004001001007 \\
       --data-level 1 --exposures all --no-list
 """,
     )

@@ -1633,27 +1633,27 @@ Every run drops one folder per exposure under --out-dir (default cwd):
 
 Examples:
   # See what's available (no output yet)
-  python roman_fits.py --program 114 --pass 57 --sca-only --list
+  python roman_fits.py --program 1039 --execution-plan 2 --pass 4 --observation 7 --sca-only --list
 
   # Write one exposure to disk as 18 FITS files under /tmp/wfi/v..._exp01/
-  python roman_fits.py --program 114 --pass 57 --sca-only \\
+  python roman_fits.py --program 1039 --execution-plan 2 --pass 4 --observation 7 --sca-only \\
       --exposures 1 --to fits --out-dir /tmp/wfi
 
   # Same, RICE compressed (folder in cwd)
-  python roman_fits.py --program 114 --pass 57 --sca-only \\
+  python roman_fits.py --program 1039 --execution-plan 2 --pass 4 --observation 7 --sca-only \\
       --exposures 1 --to fits --compress
 
   # Multiple exposures — one v..._expNN/ folder each under --out-dir
-  python roman_fits.py --program 114 --pass 57 --sca-only \\
+  python roman_fits.py --program 1039 --execution-plan 2 --pass 4 --observation 7 --sca-only \\
       --exposures 1-4 --to fits --out-dir /tmp/wfi
 
   # Stream to DS9 (needs `ds9 &` running and pyds9 installed); catalog
   # parquets + .reg land in <cwd>/v..._exp01/catalog/
-  python roman_fits.py --program 114 --pass 57 --sca-only \\
+  python roman_fits.py --program 1039 --execution-plan 2 --pass 4 --observation 7 --sca-only \\
       --exposures 1 --to ds9
 
   # Only some SCAs
-  python roman_fits.py --program 114 --pass 57 --sca-only \\
+  python roman_fits.py --program 1039 --execution-plan 2 --pass 4 --observation 7 --sca-only \\
       --exposures 1 --scas 1-6 --to fits
 """,
     )

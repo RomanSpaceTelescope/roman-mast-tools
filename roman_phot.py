@@ -7,20 +7,20 @@ parallel, and writes a combined per-source CSV and a per-SCA summary CSV.
 Usage
 -----
     # Build a URI file (one S3 path per line, blank lines / # comments OK):
-    #   s3://stpubdata/roman/.../r0003201001001001004_0001_wfi01_f106_cal.asdf
-    #   s3://stpubdata/roman/.../r0003201001001001004_0001_wfi02_f106_cal.asdf
+    #   s3://stpubdata/roman/.../r0103900004001001007_0001_wfi01_f106_cal.asdf
+    #   s3://stpubdata/roman/.../r0103900004001001007_0001_wfi02_f106_cal.asdf
     #   ...
 
     python roman_phot.py --uri-file my_exposure.txt
 
     # All outputs land in {visit_id}_{exposure_num}/ e.g.:
-    #   r0003201001001001004_0001/sources.csv
-    #   r0003201001001001004_0001/summary.csv
-    #   r0003201001001001004_0001/histograms.png
-    #   r0003201001001001004_0001/bkg_mosaic.png       (with --bkg-mosaic)
-    #   r0003201001001001004_0001/source_mosaic.png    (with --bkg-mosaic)
-    #   r0003201001001001004_0001/mosaic_data.npz      (with --bkg-mosaic)
-    #   r0003201001001001004_0001/sca{NN}.csv          (with --per-sca)
+    #   r0103900004001001007_0001/sources.csv
+    #   r0103900004001001007_0001/summary.csv
+    #   r0103900004001001007_0001/histograms.png
+    #   r0103900004001001007_0001/bkg_mosaic.png       (with --bkg-mosaic)
+    #   r0103900004001001007_0001/source_mosaic.png    (with --bkg-mosaic)
+    #   r0103900004001001007_0001/mosaic_data.npz      (with --bkg-mosaic)
+    #   r0103900004001001007_0001/sca{NN}.csv          (with --per-sca)
 
     # Photometry tuning:
     python roman_phot.py --uri-file my_exposure.txt \\
@@ -33,7 +33,7 @@ Usage
     python roman_phot.py --uri-file my_exposure.txt --bkg-mosaic
 
     # Re-render mosaics from a previous run (no photometry re-run):
-    python roman_phot.py --remake-mosaics r0003201001001001004_0001/mosaic_data.npz
+    python roman_phot.py --remake-mosaics r0103900004001001007_0001/mosaic_data.npz
 """
 
 import argparse

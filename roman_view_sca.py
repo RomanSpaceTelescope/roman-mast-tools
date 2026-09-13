@@ -9,14 +9,14 @@ Usage
 -----
     # Via roman_mast query (requires MAST auth token):
     # List matching exposures:
-    conda run -n roman-mast-tools python roman_view_sca.py --program 114 --pass 57 --list
+    conda run -n roman-mast-tools python roman_view_sca.py --program 1039 --execution-plan 2 --pass 4 --observation 7 --list
 
     # View SCA 1 from first matching exposure in DS9:
-    conda run -n roman-mast-tools python roman_view_sca.py --program 114 --pass 57 --sca 1
+    conda run -n roman-mast-tools python roman_view_sca.py --program 1039 --execution-plan 2 --pass 4 --observation 7 --sca 1
 
-    # View SCA 11 from 2nd matching exposure with photometry:
+    # View SCA 11 from exposure 1 with photometry:
     conda run -n roman-mast-tools python roman_view_sca.py \\
-        --program 114 --pass 57 --exposure 2 --sca 11 --phot --phot-out phot.csv
+        --program 1039 --execution-plan 2 --pass 4 --observation 7 --exposure 1 --sca 11 --phot --phot-out phot.csv
 
     # Direct S3 streaming (anonymous access):
     python roman_view_sca.py \\
@@ -32,7 +32,7 @@ Usage
     python roman_view_sca.py s3://... r0003...asdf --no-channels
 
     # Connect to a named DS9 instance:
-    python roman_view_sca.py --program 114 --pass 57 --sca 1 --ds9 myds9
+    python roman_view_sca.py --program 1039 --execution-plan 2 --pass 4 --observation 7 --sca 1 --ds9 myds9
 
     # Background subtraction only (no photometry) — shows model + residuals figure:
     python roman_view_sca.py --display mpl --bkg \\
@@ -640,9 +640,9 @@ def main():
 
     # Roman MAST filters (when not using uri + filename)
     ap.add_argument('--program', type=int, default=None, metavar='N',
-                    help='APT program ID (e.g. 114)')
+                    help='APT program ID (e.g. 1039)')
     ap.add_argument('--pass', type=int, default=None, metavar='N', dest='pass_',
-                    help='Pass within the program (e.g. 57)')
+                    help='Pass within the execution plan (e.g. 4)')
     ap.add_argument('--execution-plan', type=int, default=None, metavar='N',
                     help='Execution plan within the program')
     ap.add_argument('--segment', type=int, default=None, metavar='N',
