@@ -55,15 +55,10 @@ export MAST_API_TOKEN=your_token_here
 
 ### Telemetry (`roman-telem`)
 
-The MAST Engineering Database requires a token. `roman-telem --server`
-selects which token/URL pair is used:
+The MAST Engineering Database requires a token:
 
 ```bash
-# Production EDB (mast.stsci.edu) — reads MAST_API_TOKEN
 export MAST_API_TOKEN=your_token_here
-
-# Internal / I&T EDB (mastint.stsci.edu) — reads MAST_API_TOKEN_INT
-export MAST_API_TOKEN_INT=your_token_int
 ```
 
 ### Getting a token
@@ -72,12 +67,6 @@ export MAST_API_TOKEN_INT=your_token_int
 2. Sign in with your STScI account
 3. Go to **Settings → API Tokens**
 4. Generate a new token and save it securely
-
-> **Note on the `--server` flag.** For `roman-mast`, `roman-fits`,
-> `roman-metadata`, `roman-view-sca`, and `roman-phot`, `--server` takes a
-> **full URL** (e.g. `--server https://mastint.stsci.edu`).
-> For `roman-telem`, `--server` takes a **keyword**: `mast` (default) or
-> `int`. This asymmetry is a known wart.
 
 ---
 
@@ -181,7 +170,7 @@ res.to_ds9(1)
 - `--kinds cal,cat_sca` / `--kinds all` — request specific product kinds
 - `--list-kinds` — show every supported product kind
 - `--enumerate-products` — hit MAST for the authoritative product list (slow; usually unnecessary)
-- `--server URL` — override MAST server (e.g. `--server https://mastint.stsci.edu`)
+- `--server URL` — override MAST server URL
 - `--quiet`, `--color {auto,always,never}`, `--no-color`
 
 ---
@@ -495,14 +484,9 @@ and optional trending plots via `roman_telem_plot`.
 ### Command line
 
 ```bash
-# Query a few mnemonics directly (production EDB)
+# Query a few mnemonics directly
 roman-telem --mnemonics WFI_MCE_SRCS_PD1_V WFI_MCE_SRCS_PD2_V \
     -s "2026-05-01" -e "2026-07-02" \
-    --output data.csv
-
-# Same, on the internal / I&T EDB
-roman-telem --mnemonics WFI_MCE_SRCS_PD1_V WFI_MCE_SRCS_PD2_V \
-    -s "2026-05-01" -e "2026-07-02" --server int \
     --output data.csv
 
 # Query mnemonics listed in a text file (whitespace, newlines, commas OK; # comments OK)
@@ -516,12 +500,12 @@ roman-telem --plot-groups tlm_groups.yaml --list-groups
 # Query a subset of groups (much faster than "all")
 roman-telem --plot-groups tlm_groups.yaml \
     --select-groups "rcs_pd" \
-    -s "2026-05-01" -e "2026-07-02" --server int
+    -s "2026-05-01" -e "2026-07-02"
 
 # Query, save data, AND produce a trending plot in one shot
 roman-telem --plot-groups tlm_groups.yaml \
     --select-groups "rcs_pd" \
-    -s "2026-05-01" -e "2026-07-02" --server int \
+    -s "2026-05-01" -e "2026-07-02" \
     --output rcs_pd.csv \
     --plot-output rcs_pd_trend.png \
     --plot-layout vertical
@@ -548,7 +532,6 @@ roman-telem --plot-groups tlm_groups.yaml \
 - `--no-combine` — write one file per mnemonic (`base_MNEMONIC.ext`) instead of a combined DataFrame
 
 **Server**:
-- `--server {mast,int}` (default `mast`) — production (`mast.stsci.edu`) or I&T (`mastint.stsci.edu`)
 - `--api-token TOKEN` — override the env-var token
 
 **Retry / verbosity**:
@@ -615,7 +598,7 @@ df = query_telemetry(
     selected_groups=["rcs_pd"],
     start_time="2026-05-01",
     end_time="2026-05-02",
-    server="int",
+
     combine=True,
 )
 ```
@@ -829,8 +812,7 @@ Environment variables (`~`, `$HOME`, etc.) are expanded.
 
 | Variable | Purpose |
 |---|---|
-| `MAST_API_TOKEN` | MAST auth token (production: `mast.stsci.edu`) |
-| `MAST_API_TOKEN_INT` | MAST auth token for I&T (`mastint.stsci.edu`) |
+| `MAST_API_TOKEN` | MAST auth token (`mast.stsci.edu`) |
 | `AWS_PROFILE` | Optional; anonymous S3 works without any AWS credentials |
 
 Tokens can also be passed explicitly via `--api-token` on the CLI or the
@@ -901,7 +883,7 @@ for science data.
 **Q: Do I need a MAST token for telemetry queries?**
 A: Yes. The MAST Engineering Database requires authentication. Obtain a
 token from the MAST Portal (Settings → API Tokens) and store it in
-`MAST_API_TOKEN` (production) or `MAST_API_TOKEN_INT` (I&T).
+`MAST_API_TOKEN`.
 
 **Q: How do I use plot groups for telemetry?**
 A: Define groups in a YAML config file (e.g. `tlm_groups.yaml`), then
