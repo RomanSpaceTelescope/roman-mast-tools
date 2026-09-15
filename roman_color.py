@@ -43,7 +43,12 @@ INT_KEYS = {'program', 'pass', 'pass_', 'execution_plan', 'segment',
 
 
 def parse_spec(spec: str) -> dict:
-    """Parse `key=val,key=val,...` into a dict, coercing ints where sensible."""
+    """Parse `key=val,key=val,...` into a dict, coercing ints where sensible.
+
+    Accepts `filter=Fxxx` as a shortcut for `optical_element=Fxxx`. When
+    filter is set and observation is not, roman-color picks the first
+    exposure returned by list_data that matches the filter + exposure.
+    """
     out = {}
     for part in spec.split(','):
         part = part.strip()
@@ -55,7 +60,9 @@ def parse_spec(spec: str) -> dict:
         k = k.strip()
         v = v.strip()
         if k == 'pass':
-            k = 'pass_'  # match list_data kwarg
+            k = 'pass_'
+        if k == 'filter':
+            k = 'optical_element'
         if k in INT_KEYS or (k == 'pass_'):
             v = int(v)
         out[k] = v
@@ -74,16 +81,18 @@ def fetch_sca(spec: dict, sca: int):
     if res.n_exposures == 0:
         raise RuntimeError(f'No exposures returned for {filters}')
 
-    exp = None
-    for candidate in res.exposures:
-        if int(candidate.exposure) == exposure_number:
-            exp = candidate
-            break
-    if exp is None:
+    matches = [c for c in res.exposures if int(c.exposure) == exposure_number]
+    if not matches:
         avail = sorted({int(e.exposure) for e in res.exposures})
         raise RuntimeError(
             f'{filters}: no exposure {exposure_number}; available: {avail}'
         )
+    if len(matches) > 1:
+        print(f'[rgb] WARNING: {filters} exposure={exposure_number} matches '
+              f'{len(matches)} exposures; picking the first '
+              f'(observation={getattr(matches[0], "observation", "?")})',
+              file=sys.stderr)
+    exp = matches[0]
 
     print(f'[rgb] {filters}  exposure={exposure_number}  '
           f'filter={exp.optical_element}  visit_id={exp.visit_id}',
