@@ -21,6 +21,9 @@ dependencies = [
     "fsspec[s3]",
     "s3fs",
     "photutils",
+    "reproject",
+    "scikit-image",
+    "astroalign",
 ]
 
 [project.optional-dependencies]
@@ -36,8 +39,9 @@ roman-metadata = "roman_metadata:main"
 roman-view-sca = "roman_view_sca:main"
 roman-phot     = "roman_phot:main"
 roman-telem = "roman_telem:main"
+roman-color = "roman_color:main"
 
 
 
 [tool.setuptools]
-py-modules = ["roman_mast", "roman_fits", "roman_metadata", "roman_view_sca", "roman_phot", "roman_telem", "roman_telem_plot", "photometry"]
+py-modules = ["roman_mast", "roman_fits", "roman_metadata", "roman_view_sca", "roman_phot", "roman_telem", "roman_telem_plot", "photometry", "roman_color"]

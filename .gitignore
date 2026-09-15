@@ -25,3 +25,4 @@ v0012001013001001001_exp01/sca_01.fits
 profile.txt
 .gitignore
 photometry.prof
+*.fits
