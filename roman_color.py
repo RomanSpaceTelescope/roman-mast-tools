@@ -179,9 +179,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument('--sca', type=int, required=True, help='SCA number (1-18)')
+    ap.add_argument('--program', type=int, default=None,
+                    help='Global program ID inherited by all three layers '
+                         '(override per-layer via the spec).')
+    ap.add_argument('--pass', dest='pass_', type=int, default=None,
+                    help='Global pass number inherited by all three layers '
+                         '(override per-layer via the spec).')
     ap.add_argument('--red', required=True,
                     help='Red-layer spec, e.g. '
-                         'program=1047,pass=1,observation=9,exposure=2')
+                         'observation=9,exposure=2  or  filter=F184,exposure=2')
     ap.add_argument('--green', required=True, help='Green-layer spec')
     ap.add_argument('--blue', required=True, help='Blue-layer spec')
     ap.add_argument('--out-dir', default=None,
@@ -196,9 +202,20 @@ def main():
     out_dir = os.path.abspath(args.out_dir or f'rgb_sca{sca:02d}')
     os.makedirs(out_dir, exist_ok=True)
 
-    specs = {'blue': parse_spec(args.blue),
-             'green': parse_spec(args.green),
-             'red': parse_spec(args.red)}
+    globals_ = {}
+    if args.program is not None:
+        globals_['program'] = args.program
+    if args.pass_ is not None:
+        globals_['pass_'] = args.pass_
+
+    def _merge(spec_str):
+        spec = parse_spec(spec_str)
+        # Per-layer values override the globals.
+        return {**globals_, **spec}
+
+    specs = {'blue': _merge(args.blue),
+             'green': _merge(args.green),
+             'red': _merge(args.red)}
 
     layers = {}
 

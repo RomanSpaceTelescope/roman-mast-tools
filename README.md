@@ -47,6 +47,7 @@ This installs the following command-line tools:
 | `roman-metadata` | Export per-SCA ASDF metadata to CSV |
 | `roman-view-sca` | Stream and visualize a single SCA (DS9 or matplotlib) |
 | `roman-phot` | Batch aperture photometry across all SCAs of an exposure |
+| `roman-color` | Build an RGB composite of one SCA from three filters and display it in DS9 |
 | `roman-telem` | Query Roman telemetry mnemonics from the MAST Engineering DB |
 | `roman-telem-plot` | Plot telemetry CSV/Parquet with optional grouping |
 
@@ -472,6 +473,116 @@ export_csv(res, indices=[1, 2, 3], scas=None, output='meta.csv')
 af_dict = res.stream(1)
 rows = extract_rows(af_dict, res.select(1))
 ```
+
+---
+
+## `roman-color` — RGB Composite of One SCA in DS9
+
+Builds an RGB composite from three exposures (one per filter) of the same
+SCA, aligns them in pixel space, writes the aligned FITS files to disk,
+and pushes the trio into DS9 as an RGB frame with auto-computed asinh
+limits per channel.
+
+Because Roman commissioning WCS isn't fully calibrated yet, alignment is
+done in **raw pixel space** (not WCS reprojection): the three exposures
+of the same SCA share a 4088×4088 pixel grid, and any small dither shows
+up as an integer-ish (dy, dx) shift measured directly by FFT
+cross-correlation.
+
+### Command line
+
+Each layer takes a `key=val,...` spec with any `roman_mast.list_data`
+filter (`program`, `pass`, `execution_plan`, `observation`, `visit`,
+`optical_element` / `filter` shortcut, `detector`, ...) plus a required
+`exposure=N` selecting which exposure inside that query. `--program` and
+`--pass` at the top level are inherited by all three layers unless a
+layer's own spec overrides them.
+
+```bash
+# Select each channel by filter name — program/pass shared globally.
+roman-color --sca 3 --program 1047 --pass 1 \
+    --blue  filter=F087,exposure=2 \
+    --green filter=F129,exposure=2 \
+    --red   filter=F184,exposure=2
+
+# Or by observation number, still inheriting the global program/pass.
+roman-color --sca 7 --program 1047 --pass 1 \
+    --blue  observation=12,exposure=2 \
+    --green observation=5,exposure=2 \
+    --red   observation=9,exposure=2
+
+# Any layer can override the globals — mix programs/passes across layers.
+roman-color --sca 3 --program 1047 --pass 1 \
+    --blue  filter=F087,exposure=2 \
+    --green filter=F129,exposure=2 \
+    --red   program=1052,pass=3,filter=F184,exposure=1
+
+# Reload from the cached aligned FITS in --out-dir without re-streaming
+# (great for iterating on stretch / band ratios).
+roman-color --sca 3 --program 1047 --pass 1 \
+    --blue  filter=F087,exposure=2 \
+    --green filter=F129,exposure=2 \
+    --red   filter=F184,exposure=2 \
+    --from-cache
+```
+
+### What it does, step by step
+
+1. **Parse the three channel specs.** Each of `--red/--green/--blue` is a
+   `key=val,...` string; keys map to `roman_mast.list_data` filters, plus
+   a required `exposure=N`.  `--program` and `--pass` at the top level
+   inherit into every layer that doesn't already set them.
+2. **Query MAST per channel.** For each, calls `list_data(**filters)`
+   and picks the exposure whose `exposure` field matches. Warns if
+   multiple observations match; add `observation=N` in the spec to
+   disambiguate.
+3. **Stream one SCA per channel.** Uses
+   `roman_fits.stream_materialized(exposure, missions, scas=[sca])` to
+   read the ASDF from S3 and materialize the `data` array into memory
+   while the pre-signed URL is fresh, then closes the AsdfFile.
+4. **Extract data + WCS header.** Pulls `dm.data` (float32) and a SIP
+   FITS header from `dm.meta.wcs.to_fits_sip(degree=4)`. WCS goes into
+   the FITS output but is **not** used for alignment.
+5. **Blue is the alignment pivot.** Blue's raw data is used unchanged as
+   the reference; green and red are aligned to it.
+6. **Bounded FFT cross-correlation.** For green and red, subtracts the
+   sigma-clipped median, zero-fills NaN pixels, computes a full 2D
+   `fftconvolve`-based correlation, and picks the peak within a **±10
+   px** search window around zero shift. Small window because real
+   dither residuals should be sub-pixel to a few px; anything larger is
+   spurious lock-on to cross-filter source-density differences.
+7. **Apply the (dy, dx) shift.** Zero-fills NaN → `scipy.ndimage.shift`
+   with `order=3` → re-NaNs the outside-frame footprint via a
+   nearest-neighbour-shifted finite mask (avoids cubic-spline NaN
+   smearing across the whole image).
+8. **Write per-SCA aligned FITS.** Three files
+   (`{channel}_obs{OO}_exp{NN}_{filter}_sca{SS}.fits`) in `--out-dir`
+   (default `rgb_sca{NN}/`), all sharing blue's WCS header. These are
+   the artifacts you keep for offline band-ratio experiments.
+9. **Push to DS9 via pyds9.** `frame new rgb`, then for each channel
+   pipes the in-memory FITS bytes to `rgb channel <c>` + `fits`, and
+   sets an auto-computed asinh stretch:
+   `limits = [median − 1σ, median + gain·σ]` where
+   `gain = {blue: 30, green: 25, red: 20}` — F184 gets pushed harder to
+   compensate for its lower throughput and keep the composite from
+   going blue-dominated.
+
+`--from-cache` skips steps 2–8 entirely: reads the three FITS from disk
+(glob-matches by channel + SCA if the exact filename doesn't hit) and
+jumps to the DS9 push. The alignment was baked in at cache-write time.
+
+### Tuning the stretch
+
+Per-channel σ-gains live at the top of `_run_ds9` in `roman_color.py`:
+
+```python
+GAIN_SIGMA = {'blue': 30.0, 'green': 25.0, 'red': 20.0}
+LOW_SIGMA = 1.0
+```
+
+Bump a channel's gain up if that color is too weak in the composite,
+down if it's saturating. `LOW_SIGMA` controls the low cutoff (kills sky
+background); raise for a darker sky, lower for more shot noise showing.
 
 ---
 
