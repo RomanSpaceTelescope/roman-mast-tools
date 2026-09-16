@@ -1202,8 +1202,10 @@ def add_list_data_args(parser):
                         help='Full 19-digit visit ID or wildcard, e.g. 0103900004*')
     parser.add_argument('--exposure',        type=int, default=None,
                         help='Exposure number (last 4 digits of observation_id)')
-    parser.add_argument('--optical-element', default=None,
-                        help='Optical element, e.g. F062')
+    parser.add_argument('--optical-element', '--filter', dest='optical_element',
+                        default=None,
+                        help='Optical element, e.g. F062, F129, F184. '
+                             '`--filter` is an alias.')
     parser.add_argument('--exposure-type',   default=None,
                         help='Exposure type, e.g. WFI_IMAGE')
     parser.add_argument('--product-type',    default=None,
