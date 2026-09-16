@@ -114,6 +114,7 @@ DEFAULT_COLUMNS = [
     'optical_element', 'exposure_type', 'instrument_name', 'detector',
     'productLevel', 'product_type',
     'exposure_time', 'exposure_start_time', 'exposure_end_time',
+    'ra', 'dec',  # per-exposure boresight (degrees, ICRS)
 ]
 
 # Every Roman WFI product kind we know how to build a filename for. A "kind"
@@ -361,6 +362,8 @@ class Exposure:
     optical_element: Optional[str]      # e.g. 'F062'
     exposure_start_time: Any = None
     exposure_time: Any = None
+    ra: Optional[float] = None          # boresight RA (deg, ICRS)
+    dec: Optional[float] = None         # boresight Dec (deg, ICRS)
     scas: list = field(default_factory=list)         # sorted list of SCA ints
     filenames: list = field(default_factory=list)    # filenames for this exposure
 
@@ -578,12 +581,19 @@ def _group_exposures(results, data_level, filtered=None):
             continue
 
         if key not in exposures:
+            def _as_float(v):
+                try:
+                    return float(v) if v is not None and v != '' else None
+                except (TypeError, ValueError):
+                    return None
             exposures[key] = Exposure(
                 visit_id=visit_id,
                 exposure=exp_num,
                 optical_element=_get(row, 'optical_element'),
                 exposure_start_time=_get(row, 'exposure_start_time'),
                 exposure_time=_get(row, 'exposure_time'),
+                ra=_as_float(_get(row, 'ra')),
+                dec=_as_float(_get(row, 'dec')),
             )
         exp = exposures[key]
         if sca not in exp.scas:
@@ -1034,12 +1044,15 @@ def print_summary(res: DataResults, max_rows: int = 50, show_files: bool = False
             _ansi(f"{'Exp':>4}",   '1'),
             _ansi(f"{'Filter':<7}",'1'),
             _ansi(f"{'SCAs':>5}",  '1'),
+            _ansi(f"{'RA':>10}",   '1'),
+            _ansi(f"{'Dec':>10}",  '1'),
             _ansi("Start time",    '1'),
         ]
         print("  " + header_bits[0] + "  " + header_bits[1] + " "
               + " ".join(header_bits[2:8]) + "  "
               + header_bits[8] + " " + header_bits[9] + " " + header_bits[10]
-              + "  " + header_bits[11])
+              + "  " + header_bits[11] + " " + header_bits[12]
+              + "  " + header_bits[13])
         print(_ansi("  " + "-" * 100, '2'))
 
         prev = None
@@ -1075,6 +1088,10 @@ def print_summary(res: DataResults, max_rows: int = 50, show_files: bool = False
             row += _fmt_int(exp.exposure,       4, changed['exposure']) + " "
             row += f"{filt:<7} "
             row += _fmt_scas(exp.n_scas) + "  "
+            row += (f"{exp.ra:>10.5f} " if exp.ra is not None
+                    else f"{'—':>10} ")
+            row += (f"{exp.dec:>+10.5f}  " if exp.dec is not None
+                    else f"{'—':>10}  ")
             row += start
             print(row)
 
