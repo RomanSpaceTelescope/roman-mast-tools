@@ -24,6 +24,7 @@ import numpy as np
 import pyds9
 from astropy.io import fits
 from astropy.stats import sigma_clipped_stats
+from astropy.wcs import WCS
 from scipy.ndimage import shift as ndi_shift
 from scipy.signal import fftconvolve
 
