@@ -1407,9 +1407,9 @@ def main():
     add_list_data_args(ap)
     ap.add_argument(
         '--exposures', default='1', metavar='SPEC',
-        help="Which exposure(s) from the MAST result to process, 1-based "
-             "(e.g. '1', '1-4', '1,3', 'all').  Default: '1'.  Ignored when "
-             "--uri-file is used.",
+        help="Which exposure(s) to process, by **filename number** (the "
+             "4-digit '_NNNN_' field). '1', '1-4', '1,3', or 'all'. "
+             "Default: '1'. Ignored when --uri-file is used.",
     )
     ap.add_argument(
         '--scas', default=None, metavar='SPEC',
@@ -1551,13 +1551,25 @@ def main():
             print_summary(res)
             sys.exit('[roman_phot] ERROR: no exposures found for the given MAST filters')
 
-        # Parse --exposures spec (1-based indices into res.exposures)
+        # Parse --exposures spec — values are **filename exposure numbers**
+        # (the 4-digit '_NNNN_' field), NOT positions in res.exposures.
         from roman_mast import parse_int_spec as _parse_int
         exp_spec = getattr(args, 'exposures', '1') or '1'
         if str(exp_spec).strip().lower() in ('all', '*', ''):
             exp_indices = list(range(1, res.n_exposures + 1))
         else:
-            exp_indices = _parse_int(exp_spec)
+            wanted = set(_parse_int(exp_spec))
+            exp_indices = []
+            matched = set()
+            for i, e in enumerate(res.exposures, start=1):
+                if int(e.exposure) in wanted:
+                    exp_indices.append(i)
+                    matched.add(int(e.exposure))
+            missing = wanted - matched
+            if missing:
+                avail = sorted({int(e.exposure) for e in res.exposures})
+                sys.exit(f'[roman_phot] ERROR: no exposures with filename '
+                         f'number(s) {sorted(missing)}; available: {avail}')
 
         scas = None
         if getattr(args, 'scas', None):

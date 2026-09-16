@@ -398,16 +398,29 @@ def export_csv(
 # ---------------------------------------------------------------------------
 
 def _resolve_exposure_keys(res: DataResults, spec):
-    """Turn --exposures spec (int / 'a,b' / 'a-b' / 'all') into 1-based indices."""
+    """Turn --exposures spec (int / 'a,b' / 'a-b' / 'all') into 1-based
+    indices into res.exposures.
+
+    Spec values are **filename exposure numbers** (the 4-digit '_NNNN_'
+    field), NOT positions in the returned list. So `--exposures 2`
+    selects every exposure whose filename shows `_0002_`.
+    """
     if spec is None or str(spec).strip().lower() in ('', 'all', '*'):
         return list(range(1, res.n_exposures + 1))
-    indices = parse_int_spec(spec)
-    for i in indices:
-        if i < 1 or i > res.n_exposures:
-            raise IndexError(
-                f"Exposure index {i} out of range 1..{res.n_exposures} "
-                f"(query returned {res.n_exposures} exposure(s))"
-            )
+    wanted = set(parse_int_spec(spec))
+    indices = []
+    matched = set()
+    for i, exp in enumerate(res.exposures, start=1):
+        if int(exp.exposure) in wanted:
+            indices.append(i)
+            matched.add(int(exp.exposure))
+    missing = wanted - matched
+    if missing:
+        avail = sorted({int(e.exposure) for e in res.exposures})
+        raise ValueError(
+            f"No exposures with filename number(s) {sorted(missing)}; "
+            f"available: {avail}"
+        )
     return indices
 
 
@@ -453,9 +466,9 @@ Examples:
     p.set_defaults(product_type='l2')
 
     p.add_argument('--exposures', default='all',
-                   help="Which exposure(s) to export (1-based index into the "
-                        "listed exposures). '1', '1,3,5', '1-4', or 'all'. "
-                        "Default: 'all'.")
+                   help="Which exposure(s) to export, by **filename number** "
+                        "(the 4-digit '_NNNN_' field). '1', '1,3,5', '1-4', "
+                        "or 'all'. Default: 'all'.")
     p.add_argument('--scas', default=None,
                    help="Restrict to a subset of SCAs, e.g. '4' or '1-6' or "
                         "'1,3,5'. Default: every SCA the exposure has.")

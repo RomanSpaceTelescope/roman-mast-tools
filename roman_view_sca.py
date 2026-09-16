@@ -652,7 +652,8 @@ def main():
     ap.add_argument('--visit', type=int, default=None, metavar='N',
                     help='Visit within the observation')
     ap.add_argument('--exposure', type=int, default=1, metavar='N',
-                    help='Exposure index (1-based, matching --list order; default: 1)')
+                    help='Exposure number by **filename** (the 4-digit '
+                         '"_NNNN_" field in Roman filenames). Default: 1.')
     ap.add_argument('--sca', type=int, required=False, metavar='N',
                     help='SCA number to view (1-18). Required when using roman_mast query mode.')
     ap.add_argument('--optical-element', default=None, metavar='ELEM',
@@ -741,15 +742,22 @@ def main():
             print_summary(res)
             return
 
-        # Select exposure (1-based index)
-        try:
-            exp = res.exposures[args.exposure - 1]
-        except IndexError:
-            sys.exit(f'[view_sca] Exposure index {args.exposure} out of range '
-                     f'(found {len(res.exposures)} exposure(s); use --list to see them)')
-
-        print(f'[view_sca] Selected exposure {args.exposure}/{len(res.exposures)}: '
-              f'{exp.visit_id} exp {exp.exposure}', file=sys.stderr)
+        # Select exposure by its filename number (the '_NNNN_' field), not
+        # by list position.
+        matches = [e for e in res.exposures
+                   if int(e.exposure) == int(args.exposure)]
+        if not matches:
+            avail = sorted({int(e.exposure) for e in res.exposures})
+            sys.exit(f'[view_sca] No exposure with filename number '
+                     f'{args.exposure}; available: {avail} '
+                     f'(use --list to inspect)')
+        if len(matches) > 1:
+            print(f'[view_sca] WARNING: {len(matches)} exposures share '
+                  f'filename number {args.exposure}; picking the first '
+                  f'(visit_id={matches[0].visit_id})', file=sys.stderr)
+        exp = matches[0]
+        print(f'[view_sca] Selected exposure {exp.visit_id} exp '
+              f'{exp.exposure}', file=sys.stderr)
 
         # Validate SCA
         if args.sca is None:

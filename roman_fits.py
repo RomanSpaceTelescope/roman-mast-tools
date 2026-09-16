@@ -1586,22 +1586,37 @@ def _push_catalog_markers_to_imviz(
 # ---------------------------------------------------------------------------
 
 def _resolve_exposure_keys(res, spec):
-    """Turn --exposures spec (int / 'a,b' / 'a-b' / 'all') into ordered indices.
+    """Turn --exposures spec (int / 'a,b' / 'a-b' / 'all') into 1-based
+    indices into res.exposures.
 
-    Returns 1-based indices into res.exposures. Raises IndexError on bad values.
+    The spec values are **filename exposure numbers** — the 4-digit
+    ``_NNNN_`` field in Roman filenames — NOT positions in the returned
+    list. So `--exposures 2` selects every exposure whose filename shows
+    `_0002_`, regardless of where it lands in the sorted list.
+
+    Returns the 1-based res.exposures indices for downstream consumers
+    that still key on list position. Raises ValueError if any requested
+    number has no matching exposure.
     """
     from roman_mast import parse_int_spec
 
     if spec is None or str(spec).strip().lower() in ('', 'all', '*'):
         return list(range(1, res.n_exposures + 1))
 
-    indices = parse_int_spec(spec)
-    for i in indices:
-        if i < 1 or i > res.n_exposures:
-            raise IndexError(
-                f"Exposure index {i} out of range 1..{res.n_exposures} "
-                f"(query returned {res.n_exposures} exposure(s))"
-            )
+    wanted = set(parse_int_spec(spec))
+    indices = []
+    matched = set()
+    for i, exp in enumerate(res.exposures, start=1):
+        if int(exp.exposure) in wanted:
+            indices.append(i)
+            matched.add(int(exp.exposure))
+    missing = wanted - matched
+    if missing:
+        avail = sorted({int(e.exposure) for e in res.exposures})
+        raise ValueError(
+            f"No exposures with filename number(s) {sorted(missing)}; "
+            f"available: {avail}"
+        )
     return indices
 
 
@@ -1661,9 +1676,10 @@ Examples:
     add_list_data_args(p)
 
     p.add_argument('--exposures', default='1',
-                   help="Which exposure(s) to output (1-based index into the "
-                        "listed exposures). '1', '1,3,5', '1-4', or 'all'. "
-                        "Default: '1'.")
+                   help="Which exposure(s) to output, by **filename number** "
+                        "(the 4-digit '_NNNN_' field). '1', '1,3,5', '1-4', "
+                        "or 'all'. Default: '1'. Errors if a requested "
+                        "number isn't present in the query result.")
     p.add_argument('--scas', default=None,
                    help="Restrict to a subset of SCAs, e.g. '4' or '1-6' or "
                         "'1,3,5'. Default: every SCA the exposure has.")
