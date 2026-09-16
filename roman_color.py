@@ -289,39 +289,68 @@ def _stretch_per_channel(all_arrays_by_channel):
     return limits
 
 
-def _run_ds9_mosaic(sca_layers, limits, ref_hdrs):
-    """Push 18 RGB frames into DS9, one per SCA, WCS-locked.
+def _build_channel_mef(sca_layers, ref_hdrs, channel: str,
+                       out_path: str | None = None) -> bytes:
+    """Build a multi-extension FITS (one ImageHDU per SCA) for one RGB channel.
 
-    sca_layers : {sca: {channel: aligned_ndarray}}
-    limits     : {channel: (lo, hi)} — shared across SCAs for uniform stretch.
-    ref_hdrs   : {sca: blue_wcs_header}
+    Every SCA extension carries its own SIP WCS in the header, so DS9's
+    `fits mosaicimage wcs` command stitches them into a single WCS-aligned
+    view. Returns the serialized MEF as bytes; also writes to disk if
+    `out_path` is provided.
+    """
+    hdul = fits.HDUList([fits.PrimaryHDU()])
+    for sca in sorted(sca_layers):
+        arr = sca_layers[sca].get(channel)
+        if arr is None:
+            continue
+        hdr = ref_hdrs[sca].copy()
+        hdr['EXTNAME'] = f'SCA{sca:02d}'
+        hdr['SCANUM'] = (sca, 'SCA number (1-18)')
+        hdr['CHANNEL'] = (channel, 'RGB channel')
+        hdul.append(fits.ImageHDU(data=arr.astype(np.float32),
+                                  header=hdr, name=f'SCA{sca:02d}'))
+    buf = io.BytesIO()
+    hdul.writeto(buf)
+    data = buf.getvalue()
+    if out_path is not None:
+        with open(out_path, 'wb') as f:
+            f.write(data)
+        print(f'[rgb] wrote {out_path} ({len(data)/1e6:.0f} MB, '
+              f'{len(hdul)-1} SCAs)', file=sys.stderr)
+    return data
+
+
+def _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=None):
+    """Push a single WCS-stitched RGB mosaic into DS9.
+
+    Builds three MEFs (one per channel, each holding all 18 SCAs as
+    extensions with SIP WCS headers) and pipes each into DS9's
+    `fits mosaicimage wcs` command on the matching rgb channel of one
+    RGB frame. Every channel of the frame becomes a full-focal-plane
+    mosaic, and DS9 combines the three into a single color view.
+
+    Optionally also writes the three MEFs to `out_dir/mosaic_{rgb}.fits`
+    so downstream tools can inspect them.
     """
     print(f'[rgb] connecting to DS9 via pyds9', file=sys.stderr)
     d = pyds9.DS9(target=DS9_TARGET) if DS9_TARGET else pyds9.DS9()
     d.set('frame delete all')
+    d.set('frame new rgb')
 
-    for sca in sorted(sca_layers):
-        layers = sca_layers[sca]
-        hdr = ref_hdrs[sca]
-        print(f'[rgb] mosaic SCA {sca:02d}: pushing RGB frame', file=sys.stderr)
-        d.set('frame new rgb')
-        for channel in ('red', 'green', 'blue'):
-            arr = layers.get(channel)
-            if arr is None:
-                continue
-            d.set(f'rgb channel {channel}')
-            d.set('fits', _fits_bytes(arr, hdr))
-            lo, hi = limits[channel]
-            d.set(f'scale limits {lo} {hi}')
-            d.set('scale asinh')
-        d.set('rgb channel red')
+    for channel in ('red', 'green', 'blue'):
+        out_path = (os.path.join(out_dir, f'mosaic_{channel}.fits')
+                    if out_dir else None)
+        mef = _build_channel_mef(sca_layers, ref_hdrs, channel,
+                                 out_path=out_path)
+        print(f'[rgb] piping {channel} mosaic ({len(mef)/1e6:.0f} MB) into DS9',
+              file=sys.stderr)
+        d.set(f'rgb channel {channel}')
+        d.set('fits mosaicimage wcs', mef)
+        lo, hi = limits[channel]
+        d.set(f'scale limits {lo} {hi}')
+        d.set('scale asinh')
 
-    # Lock all frames together by WCS so pan/zoom act on the whole mosaic.
-    d.set('lock frame wcs')
-    d.set('lock scale yes')
-    d.set('lock colorbar yes')
-    d.set('tile yes')
-    d.set('tile mode grid')
+    d.set('rgb channel red')
     d.set('zoom to fit')
 
 
@@ -363,7 +392,7 @@ def run_mosaic(specs, out_dir, *, workers=8, from_cache=False):
                 f'--from-cache --mosaic: no aligned FITS found in {out_dir}'
             )
         limits = _stretch_per_channel(pool)
-        _run_ds9_mosaic(sca_layers, limits, ref_hdrs)
+        _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=out_dir)
         print(f'[rgb] done (mosaic cache).', file=sys.stderr)
         return
 

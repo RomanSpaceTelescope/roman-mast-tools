@@ -602,9 +602,13 @@ jumps to the DS9 push. The alignment was baked in at cache-write time.
    sigma-clipped stats across all 18 SCAs — so every RGB frame in the
    mosaic gets the same asinh scale, and colors are consistent across
    the focal plane.
-5. Pushes **18 RGB frames** into DS9, locks them by WCS
-   (`lock frame wcs`), locks scale/colorbar, tiles them in a grid, and
-   zooms-to-fit.
+5. Builds **three multi-extension FITS** (one per RGB channel, each
+   holding all 18 SCAs as extensions with SIP WCS headers) and writes
+   them to `out_dir/mosaic_{red,green,blue}.fits`.
+6. Pushes the three MEFs into **a single DS9 RGB frame** via
+   `fits mosaicimage wcs` on the matching rgb channel — DS9 stitches the
+   18 SCAs per channel by WCS and combines the three channels into one
+   focal-plane color view.
 
 `--mosaic --from-cache` reloads the 54 FITS from `--out-dir` and jumps
 straight to step 5 — fastest way to iterate on the stretch after the
