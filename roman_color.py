@@ -365,7 +365,61 @@ def _build_channel_mef(sca_layers, ref_hdrs, channel: str,
     return data
 
 
-def _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=None):
+def _headless_mosaic_png(sca_layers, limits, ref_hdrs, png_path: str):
+    """Render an RGB PNG of the focal-plane mosaic without DS9.
+
+    Uses reproject.mosaicking to reproject the 18 per-SCA aligned arrays
+    of each channel onto a single common celestial WCS, applies the same
+    asinh + per-channel limits used in DS9, stacks R/G/B, and saves via
+    matplotlib.
+    """
+    from reproject import reproject_interp
+    from reproject.mosaicking import (
+        find_optimal_celestial_wcs, reproject_and_coadd,
+    )
+    import matplotlib.pyplot as plt
+
+    def _asinh_scale(arr, lo, hi):
+        # Match DS9's asinh: normalize to [0, 1] then apply asinh stretch.
+        x = (arr - lo) / max(hi - lo, 1e-12)
+        x = np.clip(x, 0.0, 1.0)
+        return np.arcsinh(10.0 * x) / np.arcsinh(10.0)
+
+    # Common WCS built from blue's per-SCA WCS headers.
+    inputs_blue = [(sca_layers[sca]['blue'], WCS(ref_hdrs[sca]))
+                   for sca in sorted(sca_layers)
+                   if 'blue' in sca_layers[sca]]
+    common_wcs, common_shape = find_optimal_celestial_wcs(inputs_blue)
+    print(f'[rgb] headless mosaic grid: shape={common_shape} '
+          f'CRVAL={common_wcs.wcs.crval}', file=sys.stderr)
+
+    rgb = np.zeros((common_shape[0], common_shape[1], 3), dtype=np.float32)
+    for idx, channel in enumerate(('red', 'green', 'blue')):
+        inputs = [(sca_layers[sca][channel], WCS(ref_hdrs[sca]))
+                  for sca in sorted(sca_layers)
+                  if channel in sca_layers[sca]]
+        mosaic, _ = reproject_and_coadd(
+            inputs, common_wcs, shape_out=common_shape,
+            reproject_function=reproject_interp,
+            combine_function='mean',
+        )
+        lo, hi = limits[channel]
+        rgb[:, :, idx] = _asinh_scale(mosaic, lo, hi)
+
+    # Matplotlib expects sky-north-up. Astropy WCS puts DEC increasing in
+    # array Y; flip vertically so the PNG looks like DS9's default view.
+    rgb = np.flipud(rgb)
+    fig, ax = plt.subplots(figsize=(12, 12), dpi=150)
+    ax.imshow(rgb, origin='upper')
+    ax.set_axis_off()
+    fig.savefig(png_path, bbox_inches='tight', pad_inches=0,
+                facecolor='black')
+    plt.close(fig)
+    print(f'[rgb] wrote headless PNG {png_path}', file=sys.stderr)
+
+
+def _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=None,
+                    save_png=None):
     """Push a single WCS-stitched RGB mosaic into DS9.
 
     Builds three MEFs (one per channel, each holding all 18 SCAs as
@@ -398,8 +452,17 @@ def _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=None):
     d.set('rgb channel red')
     d.set('zoom to fit')
 
+    if save_png:
+        # DS9's 'export png' takes the on-disk path; DS9 must be able to
+        # write there. Absolute paths only, per XPA behaviour.
+        abs_path = os.path.abspath(save_png)
+        os.makedirs(os.path.dirname(abs_path) or '.', exist_ok=True)
+        d.set(f'export png {abs_path}')
+        print(f'[rgb] wrote DS9 PNG {abs_path}', file=sys.stderr)
 
-def run_mosaic(specs, out_dir, *, workers=8, from_cache=False):
+
+def run_mosaic(specs, out_dir, *, workers=8, from_cache=False,
+               save_png=None, headless_png=None):
     """Stream all 18 SCAs for each of the three channels, align per-SCA, push
     to DS9 as one RGB frame per SCA."""
     import glob as _glob
@@ -437,7 +500,10 @@ def run_mosaic(specs, out_dir, *, workers=8, from_cache=False):
                 f'--from-cache --mosaic: no aligned FITS found in {out_dir}'
             )
         limits = _stretch_per_channel(pool)
-        _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=out_dir)
+        _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=out_dir,
+                        save_png=save_png)
+        if headless_png:
+            _headless_mosaic_png(sca_layers, limits, ref_hdrs, headless_png)
         print(f'[rgb] done (mosaic cache).', file=sys.stderr)
         return
 
@@ -505,7 +571,10 @@ def run_mosaic(specs, out_dir, *, workers=8, from_cache=False):
 
     # One stretch shared across all SCAs so the mosaic looks uniform.
     limits = _stretch_per_channel(pool)
-    _run_ds9_mosaic(sca_layers, limits, ref_hdrs)
+    _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=out_dir,
+                    save_png=save_png)
+    if headless_png:
+        _headless_mosaic_png(sca_layers, limits, ref_hdrs, headless_png)
     print(f'[rgb] mosaic done. FITS in {out_dir}', file=sys.stderr)
 
 
@@ -540,7 +609,20 @@ def main():
     ap.add_argument('--from-cache', action='store_true',
                     help='Skip MAST streaming + alignment; load the aligned '
                          'FITS files from --out-dir and push to DS9.')
+    ap.add_argument('--save-png', default=None,
+                    help='After loading in DS9, export the current view to '
+                         'PNG via DS9 (WYSIWYG of the DS9 display). Path is '
+                         'either absolute or relative to --out-dir.')
+    ap.add_argument('--headless-png', default=None,
+                    help='Render a PNG without DS9 via matplotlib. Uses the '
+                         'same asinh + per-channel limits as the DS9 push. '
+                         'Path is absolute or relative to --out-dir.')
     args = ap.parse_args()
+
+    def _resolve_png_path(p, base):
+        if p is None:
+            return None
+        return p if os.path.isabs(p) else os.path.join(base, p)
 
     if not args.mosaic and args.sca is None:
         ap.error('either --sca N or --mosaic is required')
@@ -565,8 +647,12 @@ def main():
                    else _default_out_dir(_spec_dir_name(specs) + '_mosaic'))
         os.makedirs(out_dir, exist_ok=True)
         print(f'[rgb] output dir: {out_dir}', file=sys.stderr)
-        run_mosaic(specs, out_dir, workers=args.workers,
-                   from_cache=args.from_cache)
+        run_mosaic(
+            specs, out_dir, workers=args.workers,
+            from_cache=args.from_cache,
+            save_png=_resolve_png_path(args.save_png, out_dir),
+            headless_png=_resolve_png_path(args.headless_png, out_dir),
+        )
         return
 
     sca = args.sca
