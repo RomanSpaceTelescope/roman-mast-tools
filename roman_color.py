@@ -464,12 +464,20 @@ def _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=None,
     d.set('zoom to fit')
 
     if save_png:
-        # DS9's 'export png' takes the on-disk path; DS9 must be able to
-        # write there. Absolute paths only, per XPA behaviour.
+        # DS9 supports two save commands. `saveimage png <path>` captures
+        # the current view as displayed (colors, stretch, zoom). `export`
+        # exists but its behaviour varies across DS9 builds and often
+        # errors out. Absolute paths only.
         abs_path = os.path.abspath(save_png)
         os.makedirs(os.path.dirname(abs_path) or '.', exist_ok=True)
-        d.set(f'export png {abs_path}')
-        print(f'[rgb] wrote DS9 PNG {abs_path}', file=sys.stderr)
+        try:
+            d.set(f'saveimage png {abs_path}')
+            print(f'[rgb] wrote DS9 PNG {abs_path}', file=sys.stderr)
+        except Exception as e:
+            print(f'[rgb] WARNING: DS9 saveimage png failed '
+                  f'({type(e).__name__}: {e}); '
+                  f'try --headless-png for a matplotlib render instead.',
+                  file=sys.stderr)
 
 
 def run_mosaic(specs, out_dir, *, workers=8, from_cache=False,
