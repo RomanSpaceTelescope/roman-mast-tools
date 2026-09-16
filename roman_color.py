@@ -66,9 +66,6 @@ def _spec_dir_name(specs: dict, *, sca: int | None = None) -> str:
         return None  # differ across channels — omit
 
     parts = []
-    prog = _shared('program')
-    if prog is not None:
-        parts.append(f'p{int(prog):05d}')
     pass_ = _shared('pass_')
     if pass_ is not None:
         parts.append(f'pass{int(pass_):03d}')
@@ -84,7 +81,13 @@ def _spec_dir_name(specs: dict, *, sca: int | None = None) -> str:
     if sca is not None:
         parts.append(f'sca{sca:02d}')
 
-    return '_'.join(parts) if parts else 'rgb'
+    leaf = '_'.join(parts) if parts else 'rgb'
+
+    # Nest under a program-level parent folder when program is shared.
+    prog = _shared('program')
+    if prog is not None:
+        return os.path.join(f'{int(prog):05d}', leaf)
+    return leaf
 
 # roman_mast.list_data filter keys we accept in --red/--green/--blue specs.
 # `pass` is a Python keyword → mapped to `pass_` when passed to list_data.
