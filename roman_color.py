@@ -239,12 +239,37 @@ def write_fits(path: str, data: np.ndarray, wcs_hdr: fits.Header):
     print(f'[rgb] wrote {path}', file=sys.stderr)
 
 
+def _hdulist_bytes(hdulist: fits.HDUList) -> bytes:
+    """Serialize an HDUList to bytes robustly.
+
+    On some kernels/mount configurations astropy's writeto(BytesIO) hits
+    'OSError: Bad file descriptor' when the internal flush call closes
+    the wrapped fd unexpectedly. Round-trip through a real tempfile
+    instead — slightly slower, but bulletproof.
+    """
+    import tempfile
+    try:
+        buf = io.BytesIO()
+        hdulist.writeto(buf)
+        return buf.getvalue()
+    except OSError:
+        with tempfile.NamedTemporaryFile(suffix='.fits', delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            hdulist.writeto(tmp_path, overwrite=True)
+            with open(tmp_path, 'rb') as f:
+                return f.read()
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 def _fits_bytes(data: np.ndarray, hdr: fits.Header) -> bytes:
     hdulist = fits.HDUList([fits.PrimaryHDU(data=data.astype(np.float32),
                                             header=hdr)])
-    buf = io.BytesIO()
-    hdulist.writeto(buf)
-    return buf.getvalue()
+    return _hdulist_bytes(hdulist)
 
 
 def _clean_for_xcorr(img, saturate_sigma: float = 10.0):
@@ -392,14 +417,19 @@ def _build_channel_mef(sca_layers, ref_hdrs, channel: str,
         hdr['CHANNEL'] = (channel, 'RGB channel')
         hdul.append(fits.ImageHDU(data=arr.astype(np.float32),
                                   header=hdr, name=f'SCA{sca:02d}'))
-    buf = io.BytesIO()
-    hdul.writeto(buf)
-    data = buf.getvalue()
+    # Write directly to disk when we have a target path (avoids the
+    # BytesIO -> bytes -> disk round trip and dodges the Bad-file-
+    # descriptor issue on some server kernels), then read back for the
+    # DS9 pipe. When there's no target path, fall back to _hdulist_bytes
+    # which itself has a tempfile fallback.
     if out_path is not None:
-        with open(out_path, 'wb') as f:
-            f.write(data)
+        hdul.writeto(out_path, overwrite=True)
+        with open(out_path, 'rb') as f:
+            data = f.read()
         print(f'[rgb] wrote {out_path} ({len(data)/1e6:.0f} MB, '
               f'{len(hdul)-1} SCAs)', file=sys.stderr)
+    else:
+        data = _hdulist_bytes(hdul)
     return data
 
 
