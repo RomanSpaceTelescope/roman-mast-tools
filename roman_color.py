@@ -71,8 +71,8 @@ def parse_spec(spec: str) -> dict:
     return out
 
 
-def fetch_sca(spec: dict, sca: int):
-    """Return (data, wcs_header, filter_name, obs, expn, visit_id)."""
+def _resolve_exposure(spec: dict):
+    """Query MAST and return (exposure, missions, filters_used)."""
     exposure_number = int(spec['exposure'])
     filters = {k: v for k, v in spec.items()
                if k != 'exposure' and (k in FILTER_KEYS or k == 'pass_')}
@@ -93,16 +93,20 @@ def fetch_sca(spec: dict, sca: int):
               f'(observation={getattr(matches[0], "observation", "?")})',
               file=sys.stderr)
     exp = matches[0]
-
     print(f'[rgb] {filters}  exposure={exposure_number}  '
           f'filter={exp.optical_element}  visit_id={exp.visit_id}',
           file=sys.stderr)
+    return exp, res.missions, filters
 
-    dm_dict = stream_materialized(exp, res.missions, scas=[sca], max_workers=1)
+
+def fetch_sca(spec: dict, sca: int):
+    """Return (data, wcs_header, filter_name, obs, expn, visit_id)."""
+    exp, missions, _ = _resolve_exposure(spec)
+    exposure_number = int(spec['exposure'])
+    dm_dict = stream_materialized(exp, missions, scas=[sca], max_workers=1)
     dm = dm_dict.get(sca)
     if dm is None:
-        raise RuntimeError(f'SCA {sca} missing for {filters} '
-                           f'exp={exposure_number}')
+        raise RuntimeError(f'SCA {sca} missing for exp={exposure_number}')
     try:
         data = np.asarray(dm.data[...], dtype=np.float32)
         gwcs = dm.meta.wcs
@@ -112,6 +116,38 @@ def fetch_sca(spec: dict, sca: int):
         close_streams(dm_dict)
     obs = int(getattr(exp, 'observation', 0) or 0)
     return data, wcs_hdr, filt, obs, exposure_number, exp.visit_id
+
+
+def fetch_exposure(spec: dict, scas, max_workers: int = 8):
+    """Stream all requested SCAs of one exposure in parallel.
+
+    Returns a dict keyed by SCA number:
+        {sca: {'data': ndarray, 'hdr': fits.Header}}
+    plus a metadata dict with filter/obs/exp/visit_id (identical across SCAs).
+    """
+    exp, missions, _ = _resolve_exposure(spec)
+    dm_dict = stream_materialized(exp, missions, scas=scas,
+                                  max_workers=max_workers)
+    per_sca = {}
+    try:
+        for sca, dm in dm_dict.items():
+            if dm is None:
+                print(f'[rgb] WARNING: SCA {sca} stream returned None',
+                      file=sys.stderr)
+                continue
+            data = np.asarray(dm.data[...], dtype=np.float32)
+            gwcs = dm.meta.wcs
+            hdr = gwcs.to_fits_sip(bounding_box=gwcs.bounding_box, degree=4)
+            per_sca[sca] = {'data': data, 'hdr': hdr}
+    finally:
+        close_streams(dm_dict)
+    meta = {
+        'filter': str(exp.optical_element),
+        'obs': int(getattr(exp, 'observation', 0) or 0),
+        'exp': int(exp.exposure),
+        'visit_id': exp.visit_id,
+    }
+    return per_sca, meta
 
 
 def cache_name(channel: str, meta: dict, sca: int) -> str:
@@ -141,6 +177,43 @@ def _clean_for_xcorr(img):
     else:
         med = 0.0
     return np.where(finite, arr - med, 0.0)
+
+
+SEARCH_RADIUS_PX = 10
+
+
+def _bounded_shift(ref_full, mov_full, search_radius=SEARCH_RADIUS_PX):
+    """Bounded FFT cross-correlation. Returns (dy, dx, peak)."""
+    ref = _clean_for_xcorr(ref_full)
+    mov = _clean_for_xcorr(mov_full)
+    corr = fftconvolve(ref, mov[::-1, ::-1], mode='same')
+    cy, cx = corr.shape[0] // 2, corr.shape[1] // 2
+    y0, y1 = cy - search_radius, cy + search_radius + 1
+    x0, x1 = cx - search_radius, cx + search_radius + 1
+    window = corr[y0:y1, x0:x1]
+    py, px = np.unravel_index(np.argmax(window), window.shape)
+    dy = (py + y0) - cy
+    dx = (px + x0) - cx
+    return float(dy), float(dx), float(window.max())
+
+
+def align_to_ref(raw: np.ndarray, ref_aligned: np.ndarray, *,
+                 label: str = ''):
+    """Shift `raw` to match `ref_aligned` using bounded FFT correlation."""
+    finite_in = np.isfinite(raw)
+    dy, dx, peak = _bounded_shift(ref_aligned, raw)
+    if label:
+        print(f'[rgb] {label} shift (dy, dx) = ({dy:+.1f}, {dx:+.1f}) px  '
+              f'peak={peak:.3g}', file=sys.stderr)
+    clean = np.where(finite_in, raw, 0.0)
+    shifted = ndi_shift(clean, shift=(dy, dx), order=3,
+                        mode='constant', cval=np.nan)
+    finite_shifted = ndi_shift(
+        finite_in.astype(np.float32), shift=(dy, dx), order=0,
+        mode='constant', cval=0.0,
+    ) > 0.5
+    shifted[~finite_shifted] = np.nan
+    return shifted.astype(np.float32)
 
 
 def _run_ds9(layers, blue):
@@ -173,12 +246,179 @@ def _run_ds9(layers, blue):
     d.set('zoom to fit')
 
 
+ALL_SCAS = list(range(1, 19))
+
+
+def _stretch_per_channel(all_arrays_by_channel):
+    """Compute one (lo, hi) per channel from pooled sigma-clipped stats.
+
+    all_arrays_by_channel : {channel: [aligned_ndarray, ...]}
+        Concatenated across SCAs, so the mosaic gets a uniform stretch.
+    """
+    GAIN_SIGMA = {'blue': 30.0, 'green': 25.0, 'red': 20.0}
+    LOW_SIGMA = 1.0
+    limits = {}
+    for channel, arrays in all_arrays_by_channel.items():
+        # Sample from every SCA — full stack would be huge. Use every 8th px.
+        samples = []
+        for arr in arrays:
+            f = np.isfinite(arr)
+            if f.any():
+                samples.append(arr[f][::8])
+        if samples:
+            pool = np.concatenate(samples)
+            _, med, std = sigma_clipped_stats(pool)
+        else:
+            med, std = 0.0, 1.0
+        limits[channel] = (float(med - LOW_SIGMA * std),
+                           float(med + GAIN_SIGMA[channel] * std))
+        print(f'[rgb] mosaic {channel}: bkg={med:.4g}  rms={std:.4g}  '
+              f'limits={limits[channel]}', file=sys.stderr)
+    return limits
+
+
+def _run_ds9_mosaic(sca_layers, limits, ref_hdrs):
+    """Push 18 RGB frames into DS9, one per SCA, WCS-locked.
+
+    sca_layers : {sca: {channel: aligned_ndarray}}
+    limits     : {channel: (lo, hi)} — shared across SCAs for uniform stretch.
+    ref_hdrs   : {sca: blue_wcs_header}
+    """
+    print(f'[rgb] connecting to DS9 via pyds9', file=sys.stderr)
+    d = pyds9.DS9(target=DS9_TARGET) if DS9_TARGET else pyds9.DS9()
+    d.set('frame delete all')
+
+    for sca in sorted(sca_layers):
+        layers = sca_layers[sca]
+        hdr = ref_hdrs[sca]
+        print(f'[rgb] mosaic SCA {sca:02d}: pushing RGB frame', file=sys.stderr)
+        d.set('frame new rgb')
+        for channel in ('red', 'green', 'blue'):
+            arr = layers.get(channel)
+            if arr is None:
+                continue
+            d.set(f'rgb channel {channel}')
+            d.set('fits', _fits_bytes(arr, hdr))
+            lo, hi = limits[channel]
+            d.set(f'scale limits {lo} {hi}')
+            d.set('scale asinh')
+        d.set('rgb channel red')
+
+    # Lock all frames together by WCS so pan/zoom act on the whole mosaic.
+    d.set('lock frame wcs')
+    d.set('lock scale yes')
+    d.set('lock colorbar yes')
+    d.set('tile yes')
+    d.set('tile mode grid')
+    d.set('zoom to fit')
+
+
+def run_mosaic(specs, out_dir, *, workers=8, from_cache=False):
+    """Stream all 18 SCAs for each of the three channels, align per-SCA, push
+    to DS9 as one RGB frame per SCA."""
+    import glob as _glob
+
+    if from_cache:
+        # Load 18×3 aligned FITS from disk.
+        sca_layers = {}
+        ref_hdrs = {}
+        pool = {'red': [], 'green': [], 'blue': []}
+        for sca in ALL_SCAS:
+            layers_sca = {}
+            hdr_ref = None
+            for channel in ('red', 'green', 'blue'):
+                pattern = os.path.join(
+                    out_dir, f'{channel}_*_sca{sca:02d}.fits',
+                )
+                matches = sorted(_glob.glob(pattern))
+                if not matches:
+                    print(f'[rgb] mosaic --from-cache: no {channel} FITS for '
+                          f'SCA {sca:02d}', file=sys.stderr)
+                    continue
+                with fits.open(matches[0]) as hdul:
+                    layers_sca[channel] = np.asarray(hdul[0].data,
+                                                     dtype=np.float32)
+                    hdr = hdul[0].header
+                if channel == 'blue':
+                    hdr_ref = hdr
+                pool[channel].append(layers_sca[channel])
+            if layers_sca:
+                sca_layers[sca] = layers_sca
+                if hdr_ref is not None:
+                    ref_hdrs[sca] = hdr_ref
+        if not sca_layers:
+            raise FileNotFoundError(
+                f'--from-cache --mosaic: no aligned FITS found in {out_dir}'
+            )
+        limits = _stretch_per_channel(pool)
+        _run_ds9_mosaic(sca_layers, limits, ref_hdrs)
+        print(f'[rgb] done (mosaic cache).', file=sys.stderr)
+        return
+
+    # Stream: one call per filter, each pulling all 18 SCAs in parallel.
+    channel_data = {}
+    channel_meta = {}
+    for channel, spec in specs.items():
+        print(f'[rgb] mosaic: streaming {channel} '
+              f'(18 SCAs, {workers} workers)', file=sys.stderr)
+        per_sca, meta = fetch_exposure(spec, ALL_SCAS, max_workers=workers)
+        channel_data[channel] = per_sca
+        channel_meta[channel] = meta
+
+    # Per-SCA alignment (blue is pivot).
+    sca_layers = {}
+    ref_hdrs = {}
+    pool = {'red': [], 'green': [], 'blue': []}
+    for sca in ALL_SCAS:
+        blue = channel_data['blue'].get(sca)
+        if blue is None:
+            print(f'[rgb] mosaic: SCA {sca:02d} missing in blue; skipping',
+                  file=sys.stderr)
+            continue
+        layers_sca = {'blue': blue['data'].astype(np.float32)}
+        ref_hdrs[sca] = blue['hdr']
+        for channel in ('green', 'red'):
+            src = channel_data[channel].get(sca)
+            if src is None:
+                print(f'[rgb] mosaic: SCA {sca:02d} missing in {channel}',
+                      file=sys.stderr)
+                continue
+            aligned = align_to_ref(src['data'], layers_sca['blue'],
+                                   label=f'SCA{sca:02d} {channel}')
+            layers_sca[channel] = aligned
+        sca_layers[sca] = layers_sca
+        for channel, arr in layers_sca.items():
+            pool[channel].append(arr)
+
+        # Write aligned FITS to disk (all share blue's WCS for this SCA).
+        for channel, arr in layers_sca.items():
+            name = cache_name(channel, {
+                'obs': channel_meta[channel]['obs'],
+                'exp': channel_meta[channel]['exp'],
+                'filter': channel_meta[channel]['filter'],
+            }, sca)
+            write_fits(os.path.join(out_dir, name), arr, blue['hdr'])
+
+    # One stretch shared across all SCAs so the mosaic looks uniform.
+    limits = _stretch_per_channel(pool)
+    _run_ds9_mosaic(sca_layers, limits, ref_hdrs)
+    print(f'[rgb] mosaic done. FITS in {out_dir}', file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument('--sca', type=int, required=True, help='SCA number (1-18)')
+    ap.add_argument('--sca', type=int, default=None,
+                    help='SCA number (1-18). Required unless --mosaic is set.')
+    ap.add_argument('--mosaic', action='store_true',
+                    help='Build the full 18-SCA color mosaic. Streams every '
+                         'SCA in each of the three filters, aligns each SCA '
+                         'independently (blue as pivot), and loads 18 RGB '
+                         'frames into DS9 locked by WCS.')
+    ap.add_argument('--workers', type=int, default=8,
+                    help='Concurrent SCA streams per filter (default 8).')
     ap.add_argument('--program', type=int, default=None,
                     help='Global program ID inherited by all three layers '
                          '(override per-layer via the spec).')
@@ -198,9 +438,8 @@ def main():
                          'FITS files from --out-dir and push to DS9.')
     args = ap.parse_args()
 
-    sca = args.sca
-    out_dir = os.path.abspath(args.out_dir or f'rgb_sca{sca:02d}')
-    os.makedirs(out_dir, exist_ok=True)
+    if not args.mosaic and args.sca is None:
+        ap.error('either --sca N or --mosaic is required')
 
     globals_ = {}
     if args.program is not None:
@@ -216,6 +455,17 @@ def main():
     specs = {'blue': _merge(args.blue),
              'green': _merge(args.green),
              'red': _merge(args.red)}
+
+    if args.mosaic:
+        out_dir = os.path.abspath(args.out_dir or 'rgb_mosaic')
+        os.makedirs(out_dir, exist_ok=True)
+        run_mosaic(specs, out_dir, workers=args.workers,
+                   from_cache=args.from_cache)
+        return
+
+    sca = args.sca
+    out_dir = os.path.abspath(args.out_dir or f'rgb_sca{sca:02d}')
+    os.makedirs(out_dir, exist_ok=True)
 
     layers = {}
 
@@ -271,59 +521,10 @@ def main():
     blue = layers['blue']
     blue['aligned'] = blue['data']
 
-    # Bounded-search cross-correlation. Real dithers between these visits are
-    # sub-arcminute (small tens of px), so we compute the full FFT-based
-    # cross-correlation and look for the peak within a ±SEARCH_RADIUS window
-    # around zero. This avoids unbounded phase_cross_correlation locking
-    # onto spurious peaks 1000+ px away when the sky content differs
-    # strongly across filters.
-    SEARCH_RADIUS_PX = 10
-
-    def _bounded_shift(ref_full, mov_full, search_radius=SEARCH_RADIUS_PX):
-        ref = _clean_for_xcorr(ref_full)
-        mov = _clean_for_xcorr(mov_full)
-        # Normalized cross-correlation via FFT.
-        corr = fftconvolve(ref, mov[::-1, ::-1], mode='same')
-        cy, cx = corr.shape[0] // 2, corr.shape[1] // 2
-        # Restrict to the ±search_radius window around zero shift.
-        y0, y1 = cy - search_radius, cy + search_radius + 1
-        x0, x1 = cx - search_radius, cx + search_radius + 1
-        window = corr[y0:y1, x0:x1]
-        py, px = np.unravel_index(np.argmax(window), window.shape)
-        dy = (py + y0) - cy
-        dx = (px + x0) - cx
-        return float(dy), float(dx), float(window.max())
-
     for channel in ('green', 'red'):
         lyr = layers[channel]
-        raw = lyr['data']
-        finite_in = np.isfinite(raw)
-        print(f'[rgb] {channel} raw: finite={finite_in.sum()}/{raw.size} '
-              f'({100.0*finite_in.mean():.1f}%)', file=sys.stderr)
-        dy, dx, peak = _bounded_shift(blue['aligned'], raw)
-        print(f'[rgb] {channel} shift (dy, dx) = ({dy:+.1f}, {dx:+.1f}) px  '
-              f'peak={peak:.3g}  (searched ±{SEARCH_RADIUS_PX} px)',
-              file=sys.stderr)
-        # ndi_shift order>=1 with NaN input propagates NaN across a wide
-        # region via spline interpolation. Zero-fill the NaN pixels first,
-        # then apply the shift, then re-NaN the outside-frame footprint.
-        clean = np.where(finite_in, raw, 0.0)
-        shifted = ndi_shift(
-            clean, shift=(dy, dx), order=3,
-            mode='constant', cval=np.nan,
-        )
-        # Also shift the finite mask (nearest-neighbour) so we can restore
-        # NaN in what came from outside the source frame.
-        finite_shifted = ndi_shift(
-            finite_in.astype(np.float32), shift=(dy, dx), order=0,
-            mode='constant', cval=0.0,
-        ) > 0.5
-        shifted[~finite_shifted] = np.nan
-        lyr['aligned'] = shifted.astype(np.float32)
-        print(f'[rgb] {channel} aligned: finite='
-              f'{int(np.isfinite(shifted).sum())}/{shifted.size} '
-              f'({100.0*np.isfinite(shifted).mean():.1f}%)',
-              file=sys.stderr)
+        lyr['aligned'] = align_to_ref(lyr['data'], blue['aligned'],
+                                      label=channel)
 
     # Write aligned FITS (all share the blue WCS header).
     for channel in ('red', 'green', 'blue'):

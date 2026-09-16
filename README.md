@@ -524,6 +524,21 @@ roman-color --sca 3 --program 1047 --pass 1 \
     --green filter=F129,exposure=2 \
     --red   filter=F184,exposure=2 \
     --from-cache
+
+# Full 18-SCA color mosaic. Streams every SCA in each filter in parallel
+# (--workers per filter, default 8), aligns each SCA independently, writes
+# 54 aligned FITS to --out-dir, and loads 18 RGB frames into DS9 locked by
+# WCS with a shared per-channel asinh stretch.
+roman-color --mosaic --program 1047 --pass 1 --workers 8 \
+    --blue  filter=F087,exposure=2 \
+    --green filter=F129,exposure=2 \
+    --red   filter=F184,exposure=2
+
+# --mosaic --from-cache re-uses the 54 aligned FITS without re-streaming.
+roman-color --mosaic --program 1047 --pass 1 --from-cache \
+    --blue  filter=F087,exposure=2 \
+    --green filter=F129,exposure=2 \
+    --red   filter=F184,exposure=2
 ```
 
 ### What it does, step by step
@@ -570,6 +585,30 @@ roman-color --sca 3 --program 1047 --pass 1 \
 `--from-cache` skips steps 2–8 entirely: reads the three FITS from disk
 (glob-matches by channel + SCA if the exact filename doesn't hit) and
 jumps to the DS9 push. The alignment was baked in at cache-write time.
+
+### `--mosaic` mode
+
+`--mosaic` replaces `--sca N` and does the whole focal plane:
+
+1. Calls `stream_materialized(exp, scas=1..18, max_workers=W)` **three
+   times** (once per filter). Each call already fans out over `W`
+   threads (default 8), so the peak concurrency is 8 streams per filter,
+   running sequentially per filter.
+2. Loops over SCAs 1..18. For each SCA, runs the same bounded-FFT
+   pixel-space alignment used in single-SCA mode (blue as pivot,
+   ±10 px search).
+3. Writes 54 per-SCA aligned FITS to `--out-dir` (default `rgb_mosaic/`).
+4. Computes **one** `(lo, hi)` stretch per channel by pooling
+   sigma-clipped stats across all 18 SCAs — so every RGB frame in the
+   mosaic gets the same asinh scale, and colors are consistent across
+   the focal plane.
+5. Pushes **18 RGB frames** into DS9, locks them by WCS
+   (`lock frame wcs`), locks scale/colorbar, tiles them in a grid, and
+   zooms-to-fit.
+
+`--mosaic --from-cache` reloads the 54 FITS from `--out-dir` and jumps
+straight to step 5 — fastest way to iterate on the stretch after the
+initial run.
 
 ### Tuning the stretch
 
