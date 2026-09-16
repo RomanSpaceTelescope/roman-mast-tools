@@ -232,14 +232,30 @@ def _fits_bytes(data: np.ndarray, hdr: fits.Header) -> bytes:
     return buf.getvalue()
 
 
-def _clean_for_xcorr(img):
+def _clean_for_xcorr(img, saturate_sigma: float = 10.0):
+    """Prep an image for FFT cross-correlation.
+
+    Subtracts the sigma-clipped median, divides by the sigma-clipped std
+    (so each channel contributes similar weight regardless of intensity
+    scale), then clips at ±`saturate_sigma`. The clip is critical: on
+    fields with a few very bright saturated stars, the raw correlation
+    peak parks at (0, 0) because saturated pixels dominate the sum via
+    self-match, drowning out the geometric-shift signal from the fainter
+    star field. Clipping to a few sigma flattens the bright peaks so the
+    correlation is driven by the many fainter sources whose positions
+    actually shift between exposures.
+    """
     arr = np.array(img, dtype=np.float32)
     finite = np.isfinite(arr)
     if finite.any():
-        _, med, _ = sigma_clipped_stats(arr[finite])
+        _, med, std = sigma_clipped_stats(arr[finite])
     else:
-        med = 0.0
-    return np.where(finite, arr - med, 0.0)
+        med, std = 0.0, 1.0
+    std = max(std, 1e-6)
+    out = np.where(finite, (arr - med) / std, 0.0)
+    if saturate_sigma:
+        out = np.clip(out, -saturate_sigma, saturate_sigma)
+    return out.astype(np.float32)
 
 
 SEARCH_RADIUS_PX = 10
