@@ -480,19 +480,39 @@ def _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=None,
     d.set('zoom to fit')
 
     if save_png:
-        # DS9 supports two save commands. `saveimage png <path>` captures
-        # the current view as displayed (colors, stretch, zoom). `export`
-        # exists but its behaviour varies across DS9 builds and often
-        # errors out. Absolute paths only.
+        # Try a few DS9 save variants — behaviour depends on DS9 version
+        # and whether the DS9 window is realized (some builds fail
+        # `saveimage png` on headless / offscreen setups).
+        import time
         abs_path = os.path.abspath(save_png)
         os.makedirs(os.path.dirname(abs_path) or '.', exist_ok=True)
-        try:
-            d.set(f'saveimage png {abs_path}')
-            print(f'[rgb] wrote DS9 PNG {abs_path}', file=sys.stderr)
-        except Exception as e:
-            print(f'[rgb] WARNING: DS9 saveimage png failed '
-                  f'({type(e).__name__}: {e}); '
-                  f'try --headless-png for a matplotlib render instead.',
+        # Give DS9 a moment to finish rendering before we ask for the image.
+        d.set('update now')
+        time.sleep(0.5)
+        variants = [
+            f'saveimage png {abs_path}',
+            f'saveimage {abs_path} png',
+            f'export png {abs_path}',
+            f'export {abs_path} png',
+        ]
+        saved = False
+        for cmd in variants:
+            try:
+                d.set(cmd)
+                if os.path.exists(abs_path) and os.path.getsize(abs_path) > 0:
+                    print(f'[rgb] wrote DS9 PNG via `{cmd}` → {abs_path}',
+                          file=sys.stderr)
+                    saved = True
+                    break
+                else:
+                    print(f'[rgb] DS9 `{cmd}` returned OK but no file at '
+                          f'{abs_path}', file=sys.stderr)
+            except Exception as e:
+                print(f'[rgb] DS9 `{cmd}` failed: '
+                      f'{type(e).__name__}: {e}', file=sys.stderr)
+        if not saved:
+            print('[rgb] WARNING: all DS9 saveimage/export variants failed. '
+                  'Use --headless-png for a matplotlib render instead.',
                   file=sys.stderr)
 
 
