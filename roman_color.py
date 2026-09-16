@@ -162,10 +162,21 @@ def _resolve_exposure(spec: dict):
     return exp, res.missions, filters
 
 
+def _log_filenames(exp, scas, tag: str):
+    """Print the exact _cal.asdf filenames roman-color is about to stream."""
+    wanted = set(scas) if scas is not None else set(exp.scas)
+    print(f'[rgb] {tag}: {len(wanted)} file(s) to stream:', file=sys.stderr)
+    for sca, fname in zip(exp.scas, exp.filenames):
+        if sca in wanted:
+            print(f'[rgb]   SCA{sca:02d}: {fname}', file=sys.stderr)
+
+
 def fetch_sca(spec: dict, sca: int):
     """Return (data, wcs_header, filter_name, obs, expn, visit_id)."""
     exp, missions, _ = _resolve_exposure(spec)
     exposure_number = int(spec['exposure'])
+    _log_filenames(exp, [sca],
+                   tag=f'exp={exposure_number} filter={exp.optical_element}')
     dm_dict = stream_materialized(exp, missions, scas=[sca], max_workers=1)
     dm = dm_dict.get(sca)
     if dm is None:
@@ -189,6 +200,9 @@ def fetch_exposure(spec: dict, scas, max_workers: int = 8):
     plus a metadata dict with filter/obs/exp/visit_id (identical across SCAs).
     """
     exp, missions, _ = _resolve_exposure(spec)
+    _log_filenames(exp, scas,
+                   tag=f'exp={int(exp.exposure)} '
+                       f'filter={exp.optical_element}')
     dm_dict = stream_materialized(exp, missions, scas=scas,
                                   max_workers=max_workers)
     per_sca = {}
@@ -651,8 +665,15 @@ def main():
                     help='Global program ID inherited by all three layers '
                          '(override per-layer via the spec).')
     ap.add_argument('--pass', dest='pass_', type=int, default=None,
-                    help='Global pass number inherited by all three layers '
-                         '(override per-layer via the spec).')
+                    help='Global pass number inherited by all three layers.')
+    ap.add_argument('--execution-plan', type=int, default=None,
+                    help='Global execution-plan number.')
+    ap.add_argument('--segment', type=int, default=None,
+                    help='Global segment number.')
+    ap.add_argument('--observation', type=int, default=None,
+                    help='Global observation number inherited by all layers.')
+    ap.add_argument('--visit', type=int, default=None,
+                    help='Global visit number inherited by all layers.')
     ap.add_argument('--red', required=True,
                     help='Red-layer spec, e.g. '
                          'observation=9,exposure=2  or  filter=F184,exposure=2')
@@ -683,10 +704,13 @@ def main():
         ap.error('either --sca N or --mosaic is required')
 
     globals_ = {}
-    if args.program is not None:
-        globals_['program'] = args.program
-    if args.pass_ is not None:
-        globals_['pass_'] = args.pass_
+    for k, v in (('program', args.program), ('pass_', args.pass_),
+                 ('execution_plan', args.execution_plan),
+                 ('segment', args.segment),
+                 ('observation', args.observation),
+                 ('visit', args.visit)):
+        if v is not None:
+            globals_[k] = v
 
     def _merge(spec_str):
         spec = parse_spec(spec_str)
