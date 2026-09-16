@@ -300,6 +300,7 @@ def _run_ds9(layers, blue):
         d.set(f'scale limits {lo} {hi}')
         d.set('scale asinh')
     d.set('rgb channel red')
+    d.set('wcs align no')  # image-aligned display; WCS not yet trustworthy
     d.set('zoom to fit')
 
 
@@ -450,6 +451,10 @@ def _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=None,
         d.set('scale asinh')
 
     d.set('rgb channel red')
+    # Default alignment: image coords, not WCS. Roman commissioning WCS
+    # isn't calibrated yet, so image-aligned display matches the raw pixel
+    # frames we already aligned by FFT.
+    d.set('wcs align no')
     d.set('zoom to fit')
 
     if save_png:
