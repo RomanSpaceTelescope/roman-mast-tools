@@ -44,6 +44,48 @@ def _default_out_dir(subdir: str) -> str:
         return os.path.join(_PREFERRED_OUT_ROOT, subdir)
     return os.path.abspath(subdir)
 
+
+def _spec_dir_name(specs: dict, *, sca: int | None = None) -> str:
+    """Build a descriptive folder name from the three channel specs.
+
+    Format: p{program}_pass{pass}_exp{exp}_B{filter}-G{filter}-R{filter}[_sca{NN}]
+
+    Fields the specs don't share are collapsed to a placeholder rather
+    than duplicating. Filter names are pulled from `filter=` /
+    `optical_element=` in each spec.
+    """
+    def _flt(spec):
+        return str(spec.get('optical_element',
+                            spec.get('filter', 'UNK'))).upper()
+
+    def _shared(key):
+        vals = {spec.get(key) for spec in specs.values() if key in spec}
+        if len(vals) == 1:
+            v = next(iter(vals))
+            return v if v is not None else None
+        return None  # differ across channels — omit
+
+    parts = []
+    prog = _shared('program')
+    if prog is not None:
+        parts.append(f'p{int(prog):05d}')
+    pass_ = _shared('pass_')
+    if pass_ is not None:
+        parts.append(f'pass{int(pass_):03d}')
+    expn = _shared('exposure')
+    if expn is not None:
+        parts.append(f'exp{int(expn):02d}')
+
+    filters = (f"B{_flt(specs['blue'])}-"
+               f"G{_flt(specs['green'])}-"
+               f"R{_flt(specs['red'])}")
+    parts.append(filters)
+
+    if sca is not None:
+        parts.append(f'sca{sca:02d}')
+
+    return '_'.join(parts) if parts else 'rgb'
+
 # roman_mast.list_data filter keys we accept in --red/--green/--blue specs.
 # `pass` is a Python keyword → mapped to `pass_` when passed to list_data.
 FILTER_KEYS = {
@@ -517,7 +559,7 @@ def main():
 
     if args.mosaic:
         out_dir = (os.path.abspath(args.out_dir) if args.out_dir
-                   else _default_out_dir('rgb_mosaic'))
+                   else _default_out_dir(_spec_dir_name(specs) + '_mosaic'))
         os.makedirs(out_dir, exist_ok=True)
         print(f'[rgb] output dir: {out_dir}', file=sys.stderr)
         run_mosaic(specs, out_dir, workers=args.workers,
@@ -526,7 +568,7 @@ def main():
 
     sca = args.sca
     out_dir = (os.path.abspath(args.out_dir) if args.out_dir
-               else _default_out_dir(f'rgb_sca{sca:02d}'))
+               else _default_out_dir(_spec_dir_name(specs, sca=sca)))
     os.makedirs(out_dir, exist_ok=True)
     print(f'[rgb] output dir: {out_dir}', file=sys.stderr)
 
