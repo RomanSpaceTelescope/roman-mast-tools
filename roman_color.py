@@ -32,17 +32,23 @@ from roman_fits import stream_materialized
 
 DS9_TARGET = None  # None → pyds9 default; else the XPA target name
 
-# Preferred output root: mounted shared storage on server nodes. Falls back
-# to CWD-relative if the mount isn't present (e.g. laptop dev).
-_PREFERRED_OUT_ROOT = '/mnt/roman-science-east-2/mrizzo/'
+# Preferred output layout: mounted shared storage on server nodes. Falls
+# back to CWD-relative if the mount isn't present (e.g. laptop dev).
+_PREFERRED_OUT_MOUNT = '/mnt/roman-science-east-2'
+_PREFERRED_OUT_SUBDIR = 'mrizzo'
 
 
 def _default_out_dir(subdir: str) -> str:
-    """Return an absolute path under the preferred output root if the mount
-    exists, else under the current working directory."""
-    if os.path.isdir(_PREFERRED_OUT_ROOT):
-        return os.path.join(_PREFERRED_OUT_ROOT, subdir)
-    return os.path.abspath(subdir)
+    """Return an absolute path under the preferred output root if the shared
+    mount is present, else under the current working directory. Creates the
+    per-user subdir and any intermediate program/leaf dirs as needed."""
+    if os.path.isdir(_PREFERRED_OUT_MOUNT):
+        base = os.path.join(_PREFERRED_OUT_MOUNT, _PREFERRED_OUT_SUBDIR,
+                            subdir)
+    else:
+        base = os.path.abspath(subdir)
+    os.makedirs(base, exist_ok=True)
+    return base
 
 
 def _spec_dir_name(specs: dict, *, sca: int | None = None) -> str:
