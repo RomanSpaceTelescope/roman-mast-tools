@@ -32,6 +32,18 @@ from roman_fits import stream_materialized
 
 DS9_TARGET = None  # None → pyds9 default; else the XPA target name
 
+# Preferred output root: mounted shared storage on server nodes. Falls back
+# to CWD-relative if the mount isn't present (e.g. laptop dev).
+_PREFERRED_OUT_ROOT = '/mnt/roman-science-east-2/mrizzo/'
+
+
+def _default_out_dir(subdir: str) -> str:
+    """Return an absolute path under the preferred output root if the mount
+    exists, else under the current working directory."""
+    if os.path.isdir(_PREFERRED_OUT_ROOT):
+        return os.path.join(_PREFERRED_OUT_ROOT, subdir)
+    return os.path.abspath(subdir)
+
 # roman_mast.list_data filter keys we accept in --red/--green/--blue specs.
 # `pass` is a Python keyword → mapped to `pass_` when passed to list_data.
 FILTER_KEYS = {
@@ -365,39 +377,57 @@ def run_mosaic(specs, out_dir, *, workers=8, from_cache=False):
         channel_data[channel] = per_sca
         channel_meta[channel] = meta
 
-    # Per-SCA alignment (blue is pivot).
-    sca_layers = {}
-    ref_hdrs = {}
-    pool = {'red': [], 'green': [], 'blue': []}
-    for sca in ALL_SCAS:
+    # Per-SCA alignment (blue is pivot). Parallelized: each SCA's
+    # (green→blue, red→blue) alignment is independent, and scipy's FFT
+    # releases the GIL during the transform, so threads work here without
+    # the pickling overhead of a ProcessPoolExecutor.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _align_one_sca(sca):
         blue = channel_data['blue'].get(sca)
         if blue is None:
-            print(f'[rgb] mosaic: SCA {sca:02d} missing in blue; skipping',
-                  file=sys.stderr)
-            continue
-        layers_sca = {'blue': blue['data'].astype(np.float32)}
-        ref_hdrs[sca] = blue['hdr']
+            return sca, None, None
+        blue_arr = blue['data'].astype(np.float32)
+        out = {'blue': blue_arr}
         for channel in ('green', 'red'):
             src = channel_data[channel].get(sca)
             if src is None:
-                print(f'[rgb] mosaic: SCA {sca:02d} missing in {channel}',
+                continue
+            out[channel] = align_to_ref(src['data'], blue_arr,
+                                        label=f'SCA{sca:02d} {channel}')
+        return sca, out, blue['hdr']
+
+    sca_layers = {}
+    ref_hdrs = {}
+    pool = {'red': [], 'green': [], 'blue': []}
+
+    align_workers = min(workers, len(ALL_SCAS))
+    print(f'[rgb] mosaic: aligning 18 SCAs in parallel '
+          f'(workers={align_workers})', file=sys.stderr)
+    with ThreadPoolExecutor(max_workers=align_workers) as ex:
+        futures = [ex.submit(_align_one_sca, sca) for sca in ALL_SCAS]
+        for fut in as_completed(futures):
+            sca, layers_sca, hdr = fut.result()
+            if layers_sca is None:
+                print(f'[rgb] mosaic: SCA {sca:02d} missing in blue; skipping',
                       file=sys.stderr)
                 continue
-            aligned = align_to_ref(src['data'], layers_sca['blue'],
-                                   label=f'SCA{sca:02d} {channel}')
-            layers_sca[channel] = aligned
-        sca_layers[sca] = layers_sca
-        for channel, arr in layers_sca.items():
-            pool[channel].append(arr)
+            sca_layers[sca] = layers_sca
+            ref_hdrs[sca] = hdr
+            for channel, arr in layers_sca.items():
+                pool[channel].append(arr)
 
-        # Write aligned FITS to disk (all share blue's WCS for this SCA).
+    # Write aligned FITS to disk (serial — I/O bound and cheap next to align).
+    for sca in sorted(sca_layers):
+        layers_sca = sca_layers[sca]
+        hdr = ref_hdrs[sca]
         for channel, arr in layers_sca.items():
             name = cache_name(channel, {
                 'obs': channel_meta[channel]['obs'],
                 'exp': channel_meta[channel]['exp'],
                 'filter': channel_meta[channel]['filter'],
             }, sca)
-            write_fits(os.path.join(out_dir, name), arr, blue['hdr'])
+            write_fits(os.path.join(out_dir, name), arr, hdr)
 
     # One stretch shared across all SCAs so the mosaic looks uniform.
     limits = _stretch_per_channel(pool)
@@ -457,15 +487,19 @@ def main():
              'red': _merge(args.red)}
 
     if args.mosaic:
-        out_dir = os.path.abspath(args.out_dir or 'rgb_mosaic')
+        out_dir = (os.path.abspath(args.out_dir) if args.out_dir
+                   else _default_out_dir('rgb_mosaic'))
         os.makedirs(out_dir, exist_ok=True)
+        print(f'[rgb] output dir: {out_dir}', file=sys.stderr)
         run_mosaic(specs, out_dir, workers=args.workers,
                    from_cache=args.from_cache)
         return
 
     sca = args.sca
-    out_dir = os.path.abspath(args.out_dir or f'rgb_sca{sca:02d}')
+    out_dir = (os.path.abspath(args.out_dir) if args.out_dir
+               else _default_out_dir(f'rgb_sca{sca:02d}'))
     os.makedirs(out_dir, exist_ok=True)
+    print(f'[rgb] output dir: {out_dir}', file=sys.stderr)
 
     layers = {}
 
