@@ -466,9 +466,12 @@ Examples:
     p.set_defaults(product_type='l2')
 
     p.add_argument('--exposures', default='all',
-                   help="Which exposure(s) to export, by **filename number** "
-                        "(the 4-digit '_NNNN_' field). '1', '1,3,5', '1-4', "
-                        "or 'all'. Default: 'all'.")
+                   help="Additional exposure filter, by **filename number** "
+                        "(the 4-digit '_NNNN_' field). Accepts ranges: "
+                        "'1', '1,3,5', '1-4', or 'all'. Default: 'all' — "
+                        "every exposure the query returns. Combine with "
+                        "--exposure N (singular) for a MAST-side single "
+                        "exposure filter.")
     p.add_argument('--scas', default=None,
                    help="Restrict to a subset of SCAs, e.g. '4' or '1-6' or "
                         "'1,3,5'. Default: every SCA the exposure has.")

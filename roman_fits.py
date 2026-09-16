@@ -1675,11 +1675,14 @@ Examples:
 
     add_list_data_args(p)
 
-    p.add_argument('--exposures', default='1',
-                   help="Which exposure(s) to output, by **filename number** "
-                        "(the 4-digit '_NNNN_' field). '1', '1,3,5', '1-4', "
-                        "or 'all'. Default: '1'. Errors if a requested "
-                        "number isn't present in the query result.")
+    p.add_argument('--exposures', default=None,
+                   help="Additional exposure filter, by **filename number** "
+                        "(the 4-digit '_NNNN_' field). Accepts ranges: "
+                        "'1', '1,3,5', '1-4', or 'all'. If omitted, every "
+                        "exposure the query returns is used — combine with "
+                        "--exposure N (singular) to pin one via the MAST "
+                        "server-side filter. Errors if a requested number "
+                        "isn't in the query result.")
     p.add_argument('--scas', default=None,
                    help="Restrict to a subset of SCAs, e.g. '4' or '1-6' or "
                         "'1,3,5'. Default: every SCA the exposure has.")

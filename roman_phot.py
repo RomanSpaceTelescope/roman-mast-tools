@@ -1406,10 +1406,13 @@ def main():
     from roman_mast import add_list_data_args
     add_list_data_args(ap)
     ap.add_argument(
-        '--exposures', default='1', metavar='SPEC',
-        help="Which exposure(s) to process, by **filename number** (the "
-             "4-digit '_NNNN_' field). '1', '1-4', '1,3', or 'all'. "
-             "Default: '1'. Ignored when --uri-file is used.",
+        '--exposures', default=None, metavar='SPEC',
+        help="Additional exposure filter, by **filename number** (the "
+             "4-digit '_NNNN_' field). Accepts ranges: '1', '1-4', "
+             "'1,3', or 'all'. If omitted, every exposure the query "
+             "returns is used — combine with --exposure N (singular) to "
+             "pin one via the MAST server-side filter. Ignored when "
+             "--uri-file is used.",
     )
     ap.add_argument(
         '--scas', default=None, metavar='SPEC',
@@ -1554,8 +1557,8 @@ def main():
         # Parse --exposures spec — values are **filename exposure numbers**
         # (the 4-digit '_NNNN_' field), NOT positions in res.exposures.
         from roman_mast import parse_int_spec as _parse_int
-        exp_spec = getattr(args, 'exposures', '1') or '1'
-        if str(exp_spec).strip().lower() in ('all', '*', ''):
+        exp_spec = getattr(args, 'exposures', None)
+        if not exp_spec or str(exp_spec).strip().lower() in ('all', '*', ''):
             exp_indices = list(range(1, res.n_exposures + 1))
         else:
             wanted = set(_parse_int(exp_spec))
