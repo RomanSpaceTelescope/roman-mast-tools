@@ -1,27 +1,100 @@
 groups:
   rcs_pd:
-    label: "RCS photodiodes"
-    y_label: "Voltage (V)"
+    label: RCS photodiodes
+    y_label: Voltage (V)
     mnemonics:
-      - WFI_MCE_SRCS_PD1_V
-      - WFI_MCE_SRCS_PD2_V
-
+    - WFI_MCE_SRCS_PD1_V
+    - WFI_MCE_SRCS_PD2_V
   bank1_leds:
-    label: "RCS LED Bank 1"
+    label: RCS LED Bank 1
     mnemonics:
-      - WFI_MCE_SRCS_BANK1SEL_LED1
-      - WFI_MCE_SRCS_BANK1SEL_LED2
-      - WFI_MCE_SRCS_BANK1SEL_LED3
-      - WFI_MCE_SRCS_BANK1SEL_LED4
-      - WFI_MCE_SRCS_BANK1SEL_LED5
-      - WFI_MCE_SRCS_BANK1SEL_LED6
-
+    - WFI_MCE_SRCS_BANK1SEL_LED1
+    - WFI_MCE_SRCS_BANK1SEL_LED2
+    - WFI_MCE_SRCS_BANK1SEL_LED3
+    - WFI_MCE_SRCS_BANK1SEL_LED4
+    - WFI_MCE_SRCS_BANK1SEL_LED5
+    - WFI_MCE_SRCS_BANK1SEL_LED6
   bank2_leds:
-    label: "RCS LED Bank 2"
+    label: RCS LED Bank 2
     mnemonics:
-      - WFI_MCE_SRCS_BANK2SEL_LED1
-      - WFI_MCE_SRCS_BANK2SEL_LED2
-      - WFI_MCE_SRCS_BANK2SEL_LED3
-      - WFI_MCE_SRCS_BANK2SEL_LED4
-      - WFI_MCE_SRCS_BANK2SEL_LED5
-      - WFI_MCE_SRCS_BANK2SEL_LED6
+    - WFI_MCE_SRCS_BANK2SEL_LED1
+    - WFI_MCE_SRCS_BANK2SEL_LED2
+    - WFI_MCE_SRCS_BANK2SEL_LED3
+    - WFI_MCE_SRCS_BANK2SEL_LED4
+    - WFI_MCE_SRCS_BANK2SEL_LED5
+    - WFI_MCE_SRCS_BANK2SEL_LED6
+  temp_acm:
+    label: ACM Temperature
+    y_label: Temperature (K)
+    mnemonics:
+    - WFI_MCE_ADC_WTSM13
+    - WFI_MCE_TEMP_ACM_1
+    - WFI_MCE_TEMP_ACM_2
+    - WFI_MCE_TEMP_ACM_3
+    - WFI_MCE_TEMP_ACM_4
+    - WFI_MCE_TEMP_ACM_5
+    - WFI_MCE_TEMP_ACM_6
+  temp_bcr:
+    label: BCR Temperature
+    y_label: Temperature (K)
+    mnemonics:
+    - WFI_MCE_ADC_WTSM12
+    - WFI_MCE_ADC_WTSM20
+    - WFI_MCE_ADC_WTSM21
+    - WFI_MCE_ADC_WTSM22
+    - WFI_MCE_ADC_WTSM23
+  temp_coba:
+    label: COBA Temperature
+    y_label: Temperature (K)
+    mnemonics:
+    - WFI_MCE_ADC_WTSM04
+  temp_cpr:
+    label: CPR Temperature
+    y_label: Temperature (K)
+    mnemonics:
+    - WFI_MCE_ADC_WTSM00
+  temp_ewa:
+    label: EWA Temperature
+    y_label: Temperature (K)
+    mnemonics:
+    - WFI_MCE_ADC_WTSM16
+    - WFI_MCE_ADC_WTSM17
+    - WFI_MCE_ADC_WTSM24
+    - WFI_MCE_TEMP_EWA
+  temp_enclosure:
+    label: Enclosure Temperature
+    y_label: Temperature (K)
+    mnemonics:
+    - WFI_MCE_ADC_WTSM10
+    - WFI_MCE_ADC_WTSM11
+    - WFI_MCE_TEMP_CMU
+  temp_fpe:
+    label: FPE Temperature
+    y_label: Temperature (K)
+    mnemonics:
+    - WFI_MCE_ADC_WTSM14
+    - WFI_MCE_ADC_WTSM15
+  temp_mpr:
+    label: MPR Temperature
+    y_label: Temperature (K)
+    mnemonics:
+    - WFI_MCE_ADC_WTSM02
+  temp_ob:
+    label: OB Temperature
+    y_label: Temperature (K)
+    mnemonics:
+    - WFI_MCE_ADC_WTSM06
+    - WFI_MCE_ADC_WTSM07
+    - WFI_MCE_ADC_WTSM08
+    - WFI_MCE_ADC_WTSM09
+  temp_scea:
+    label: SCEA Temperature
+    y_label: Temperature (K)
+    mnemonics:
+    - WFI_MCE_ADC_WTSM01
+  temp_srcs:
+    label: sRCS Temperature
+    y_label: Temperature (K)
+    mnemonics:
+    - WFI_MCE_ADC_WTSM03
+    - WFI_MCE_ADC_WTSM19
