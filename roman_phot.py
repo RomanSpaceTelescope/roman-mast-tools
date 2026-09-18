@@ -554,10 +554,11 @@ def make_image_mosaic_png(sca_thumbs, out_path, *, title=None):
             facecolor='none',
         )
         ax.add_patch(rect)
-        if not has_data:
-            ax.text(cx_mm, cy_mm, f'{sca_num:02d}',
-                    ha='center', va='center', fontsize=7,
-                    color='#555555', fontweight='bold')
+        # SCA label above the active area
+        ax.text(cx_mm, y1 + 1.5, f'SCA {sca_num:02d}',
+                ha='center', va='bottom', fontsize=7,
+                color='#888888' if has_data else '#555555',
+                fontweight='bold')
 
     ax.set_title(title or 'Roman WFI — image mosaic (::2)',
                  color='white', fontsize=12, pad=10)
@@ -676,8 +677,9 @@ def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
             alpha=0.8 if has_data else 0.4,
         )
         ax.add_patch(rect)
-        ax.text(cx_mm, cy_mm, f'{sca_num:02d}',
-                ha='center', va='center', fontsize=7,
+        # SCA label above the active area
+        ax.text(cx_mm, y1 + 1.5, f'SCA {sca_num:02d}',
+                ha='center', va='bottom', fontsize=7,
                 color='white' if has_data else '#777777',
                 alpha=0.8 if has_data else 0.4,
                 fontweight='bold')
@@ -746,13 +748,14 @@ def make_source_dot_mosaic_png(sources_csv_path, out_path, *, title=None):
     fig_h = fig_w / aspect
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor='#1a1a1a')
     ax.set_facecolor('#1a1a1a')
-    ax.set_xlim(x_lo, x_hi)
+    # Flip horizontal axis: positive RA goes left (East on sky)
+    ax.set_xlim(x_hi, x_lo)
     ax.set_ylim(y_lo, y_hi)
     ax.set_aspect('equal')
     ax.set_xticks([])
     ax.set_yticks([])
 
-    for sca_num, (cx_mm, cy_mm, rot) in _WFI_SCA_LAYOUT.items():
+    for sca_num, (cx_mm, cy_mm, _) in _WFI_SCA_LAYOUT.items():
         mask = np.asarray(sources['sca']) == sca_num
         has_data = np.any(mask)
 
@@ -768,9 +771,10 @@ def make_source_dot_mosaic_png(sources_csv_path, out_path, *, title=None):
             # origin='upper' convention: col 0 → x0, row 0 → y1 (top).
             offset_x = (x_pix + _ROMAN_REF_PIX + 0.5) * _ROMAN_PIXEL_SCALE_MM
             offset_y = (y_pix + _ROMAN_REF_PIX + 0.5) * _ROMAN_PIXEL_SCALE_MM
-            sign = -1 if rot == 180 else 1
-            x_fp = cx_mm + sign * (offset_x - half)
-            y_fp = cy_mm - sign * (offset_y - half)
+            # Note: rotation is now handled by WCS in the image data itself,
+            # so we don't need to apply it to source positions here
+            x_fp = cx_mm + (offset_x - half)
+            y_fp = cy_mm - (offset_y - half)
             ax.scatter(x_fp, y_fp, s=0.5, c='#ffdd88', alpha=0.6,
                        linewidths=0, rasterized=True)
 
@@ -782,8 +786,9 @@ def make_source_dot_mosaic_png(sources_csv_path, out_path, *, title=None):
             alpha=0.8 if has_data else 0.4,
         )
         ax.add_patch(rect)
-        ax.text(cx_mm, cy_mm, f'{sca_num:02d}',
-                ha='center', va='center', fontsize=7,
+        # SCA label above the active area
+        ax.text(cx_mm, y1 + 1.5, f'SCA {sca_num:02d}',
+                ha='center', va='bottom', fontsize=7,
                 color='white' if has_data else '#777777',
                 alpha=0.8 if has_data else 0.4,
                 fontweight='bold')
