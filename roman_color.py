@@ -29,7 +29,7 @@ from scipy.ndimage import shift as ndi_shift
 from scipy.signal import fftconvolve
 
 from roman_mast import list_data, close_streams
-from roman_fits import stream_materialized
+from roman_fits import stream_materialized, _write_hdulist
 
 DS9_TARGET = None  # None → pyds9 default; else the XPA target name
 
@@ -235,17 +235,17 @@ def cache_name(channel: str, meta: dict, sca: int) -> str:
 
 def write_fits(path: str, data: np.ndarray, wcs_hdr: fits.Header):
     hdu = fits.PrimaryHDU(data=data.astype(np.float32), header=wcs_hdr)
-    hdu.writeto(path, overwrite=True)
+    _write_hdulist(fits.HDUList([hdu]), path, overwrite=True)
     print(f'[rgb] wrote {path}', file=sys.stderr)
 
 
 def _hdulist_bytes(hdulist: fits.HDUList) -> bytes:
-    """Serialize an HDUList to bytes robustly.
+    """Serialize an HDUList to bytes.
 
-    On some kernels/mount configurations astropy's writeto(BytesIO) hits
-    'OSError: Bad file descriptor' when the internal flush call closes
-    the wrapped fd unexpectedly. Round-trip through a real tempfile
-    instead — slightly slower, but bulletproof.
+    writeto(BytesIO) never touches a file descriptor, so it cannot raise the
+    'Bad file descriptor' error that on-disk writeto() hits on Mountpoint-S3
+    mounts (see roman_fits._write_hdulist). The tempfile fallback is kept as
+    a belt-and-braces path only.
     """
     import tempfile
     try:
@@ -417,13 +417,13 @@ def _build_channel_mef(sca_layers, ref_hdrs, channel: str,
         hdr['CHANNEL'] = (channel, 'RGB channel')
         hdul.append(fits.ImageHDU(data=arr.astype(np.float32),
                                   header=hdr, name=f'SCA{sca:02d}'))
-    # Write directly to disk when we have a target path (avoids the
-    # BytesIO -> bytes -> disk round trip and dodges the Bad-file-
-    # descriptor issue on some server kernels), then read back for the
-    # DS9 pipe. When there's no target path, fall back to _hdulist_bytes
-    # which itself has a tempfile fallback.
+    # Serialize once in memory; when we have a target path push the bytes out
+    # as a single sequential write (the "Bad file descriptor" seen on the RES
+    # S3 mounts comes from astropy's on-disk writeto dup()/close()-ing the fd
+    # mid-file, which completes the Mountpoint-S3 upload early — see
+    # roman_fits._write_hdulist). The same bytes feed the DS9 pipe.
     if out_path is not None:
-        hdul.writeto(out_path, overwrite=True)
+        _write_hdulist(hdul, out_path, overwrite=True)
         with open(out_path, 'rb') as f:
             data = f.read()
         print(f'[rgb] wrote {out_path} ({len(data)/1e6:.0f} MB, '
