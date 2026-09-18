@@ -54,6 +54,13 @@ _VALUE_COL_CANDIDATES = (
 )
 
 
+def _pretty_label(mnem: str, label_map: Optional[Dict[str, str]]) -> str:
+    if not label_map:
+        return mnem
+    desc = label_map.get(mnem)
+    return f"{mnem} - {desc}" if desc else mnem
+
+
 def _find_time_column(df: pd.DataFrame) -> str:
     lower = {c.lower(): c for c in df.columns}
     for cand in _TIME_COL_CANDIDATES:
@@ -142,6 +149,7 @@ def _plot_mnemonics_on_axes(
     show_legend: bool = True,
     legend_loc: str = "best",
     legend_fontsize: float = 8.0,
+    label_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[int, int]:
     """Plot the given mnemonics from a long DataFrame onto a single Axes.
 
@@ -189,7 +197,7 @@ def _plot_mnemonics_on_axes(
             sub[tcol], yvals,
             marker=marker, linestyle=linestyle,
             markersize=markersize, alpha=alpha,
-            label=m,
+            label=_pretty_label(m, label_map),
         )
         plotted += 1
 
@@ -224,6 +232,7 @@ def plot_mnemonics(
     figsize: Tuple[float, float] = (12.0, 5.0),
     dpi: int = 120,
     show: bool = False,
+    label_map: Optional[Dict[str, str]] = None,
 ):
     """Plot one or more mnemonics on a single Axes.
 
@@ -246,6 +255,7 @@ def plot_mnemonics(
         ax, df, mnemonics,
         time_col=time_col, value_col=value_col,
         title=title, y_label=y_label,
+        label_map=label_map,
     )
 
     fig.autofmt_xdate()
@@ -293,6 +303,7 @@ def plot_grouped(
     suptitle: Optional[str] = None,
     show: bool = False,
     sharex: bool = True,
+    label_map: Optional[Dict[str, str]] = None,
 ):
     """Plot each group in its own subplot.
 
@@ -355,6 +366,7 @@ def plot_grouped(
             time_col=time_col, value_col=value_col,
             title=label, y_label=y_label,
             x_label="Time" if (not sharex or i >= (nrows - 1) * ncols) else None,
+            label_map=label_map,
         )
         total_plotted += plotted
         total_missing += missing
@@ -398,6 +410,7 @@ def plot_telemetry(
     dpi: int = 120,
     suptitle: Optional[str] = None,
     show: bool = False,
+    label_map: Optional[Dict[str, str]] = None,
 ):
     """
     High-level plotting entry point.
@@ -444,6 +457,7 @@ def plot_telemetry(
             time_col=time_col, value_col=value_col,
             output=output, figsize=figsize, dpi=dpi,
             suptitle=suptitle, show=show,
+            label_map=label_map,
         )
 
     # No groups_config: single-axes plot
@@ -453,6 +467,7 @@ def plot_telemetry(
         time_col=time_col, value_col=value_col,
         output=output, figsize=figsize or (12.0, 5.0), dpi=dpi,
         title=suptitle, show=show,
+        label_map=label_map,
     )
 
 
@@ -483,6 +498,7 @@ def plot_per_mnemonic(
     suptitle: Optional[str] = None,
     show: bool = False,
     sharex: bool = True,
+    label_map: Optional[Dict[str, str]] = None,
 ):
     """Produce one subplot per mnemonic in a single figure.
 
@@ -540,9 +556,10 @@ def plot_per_mnemonic(
         plotted, missing = _plot_mnemonics_on_axes(
             ax, df, [m],
             time_col=tcol, value_col=vcol,
-            title=m,
+            title=_pretty_label(m, label_map),
             x_label="Time" if (not sharex or i >= (nrows - 1) * ncols) else None,
             show_legend=False,
+            label_map=label_map,
         )
         total_plotted += plotted
         total_missing += missing

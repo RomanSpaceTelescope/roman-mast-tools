@@ -115,6 +115,8 @@ DEFAULT_COLUMNS = [
     'productLevel', 'product_type',
     'exposure_time', 'exposure_start_time', 'exposure_end_time',
     'ra', 'dec',  # per-exposure boresight (degrees, ICRS)
+    'ra_v1', 'dec_v1',  # V1 (telescope) axis pointing (degrees, ICRS)
+    'pa_v3',            # position angle of V3 axis E of N (degrees)
 ]
 
 # Every Roman WFI product kind we know how to build a filename for. A "kind"
@@ -361,9 +363,15 @@ class Exposure:
     exposure: int                       # 1-based exposure number in the visit
     optical_element: Optional[str]      # e.g. 'F062'
     exposure_start_time: Any = None
+    exposure_end_time: Any = None
     exposure_time: Any = None
     ra: Optional[float] = None          # boresight RA (deg, ICRS)
     dec: Optional[float] = None         # boresight Dec (deg, ICRS)
+    ra_v1: Optional[float] = None       # V1 (telescope) axis RA (deg, ICRS)
+    dec_v1: Optional[float] = None      # V1 (telescope) axis Dec (deg, ICRS)
+    pa_v3: Optional[float] = None       # V3 position angle E of N (deg)
+    pitch: Optional[float] = None       # sun_angle − 90° (deg); filled by compute_pitch_roll
+    roll: Optional[float] = None        # off-normal roll (deg); filled by compute_pitch_roll
     scas: list = field(default_factory=list)         # sorted list of SCA ints
     filenames: list = field(default_factory=list)    # filenames for this exposure
 
@@ -591,9 +599,13 @@ def _group_exposures(results, data_level, filtered=None):
                 exposure=exp_num,
                 optical_element=_get(row, 'optical_element'),
                 exposure_start_time=_get(row, 'exposure_start_time'),
+                exposure_end_time=_get(row, 'exposure_end_time'),
                 exposure_time=_get(row, 'exposure_time'),
                 ra=_as_float(_get(row, 'ra')),
                 dec=_as_float(_get(row, 'dec')),
+                ra_v1=_as_float(_get(row, 'ra_v1')),
+                dec_v1=_as_float(_get(row, 'dec_v1')),
+                pa_v3=_as_float(_get(row, 'pa_v3')),
             )
         exp = exposures[key]
         if sca not in exp.scas:
@@ -708,6 +720,53 @@ def close_streams(asdf_files):
                 af.close()
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Pitch / roll computation
+# ---------------------------------------------------------------------------
+
+def compute_pitch_roll(exp: 'Exposure') -> tuple:
+    """Compute sun-relative pitch and off-normal roll for an exposure.
+
+    Requires ``ra_v1``, ``dec_v1``, ``pa_v3``, and ``exposure_start_time``
+    to be set on *exp*.  Also populates ``exp.pitch`` and ``exp.roll`` in-place
+    and returns ``(pitch_deg, roll_deg)``.
+
+    Pitch = sun_angle − 90° (zero = boresight perpendicular to Sun).
+    Roll  = off-normal rotation about the boresight (Roman OPUP sign convention).
+
+    Raises ``ImportError`` if ``roman_opup_tools`` is not installed.
+    """
+    try:
+        from astropy.coordinates import SkyCoord
+        from astropy import units as u
+        from roman_opup_tools.roman_attitude import RomanPointing
+    except ImportError as exc:
+        raise ImportError(
+            "roman_opup_tools is required for --pitch-roll. "
+            "Install it with: pip install -e <path-to-roman-opup-tools>"
+        ) from exc
+
+    if exp.ra_v1 is None or exp.dec_v1 is None or exp.pa_v3 is None:
+        return None, None
+    t_str = str(exp.exposure_start_time) if exp.exposure_start_time else None
+    if t_str is None:
+        return None, None
+
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        p = RomanPointing(observation_date=t_str)
+        boresight = SkyCoord(ra=exp.ra_v1 * u.deg, dec=exp.dec_v1 * u.deg, frame='icrs')
+        p.set_target(boresight, roll=0.0)
+        pa_nominal = p.get_position_angle().value % 360
+        roll_deg = -((exp.pa_v3 - pa_nominal + 180) % 360 - 180)
+        pitch_deg = p.get_pitch_angle().value
+
+    exp.pitch = pitch_deg
+    exp.roll  = roll_deg
+    return pitch_deg, roll_deg
 
 
 # ---------------------------------------------------------------------------
@@ -1031,6 +1090,8 @@ def print_summary(res: DataResults, max_rows: int = 50, show_files: bool = False
         print(f"  visit_id decoded as PPPPPCCAAASSSOOOVVV → {legend}")
         print()
 
+        show_pitch_roll = any(e.pitch is not None for e in res.exposures)
+
         # Header — chunk-colored labels above matching columns.
         header_bits = [
             _ansi(f"{'#':>3}", '1'),
@@ -1044,16 +1105,27 @@ def print_summary(res: DataResults, max_rows: int = 50, show_files: bool = False
             _ansi(f"{'Exp':>4}",   '1'),
             _ansi(f"{'Filter':<7}",'1'),
             _ansi(f"{'SCAs':>5}",  '1'),
-            _ansi(f"{'RA':>10}",   '1'),
-            _ansi(f"{'Dec':>10}",  '1'),
-            _ansi("Start time",    '1'),
+            _ansi(f"{'RA':>10}",     '1'),
+            _ansi(f"{'Dec':>10}",    '1'),
+            _ansi(f"{'V1 RA':>10}",  '1'),
+            _ansi(f"{'V1 Dec':>10}", '1'),
+            _ansi(f"{'PA(V3)':>7}",  '1'),
+            _ansi(f"{'Pitch':>7}",   '1'),
+            _ansi(f"{'Roll':>7}",    '1'),
+            _ansi("Start time",      '1'),
+            _ansi("End time",        '1'),
         ]
-        print("  " + header_bits[0] + "  " + header_bits[1] + " "
-              + " ".join(header_bits[2:8]) + "  "
-              + header_bits[8] + " " + header_bits[9] + " " + header_bits[10]
-              + "  " + header_bits[11] + " " + header_bits[12]
-              + "  " + header_bits[13])
-        print(_ansi("  " + "-" * 100, '2'))
+        hdr = ("  " + header_bits[0] + "  " + header_bits[1] + " "
+               + " ".join(header_bits[2:8]) + "  "
+               + header_bits[8] + " " + header_bits[9] + " " + header_bits[10]
+               + "  " + header_bits[11] + " " + header_bits[12]
+               + "  " + header_bits[13] + " " + header_bits[14]
+               + " " + header_bits[15])
+        if show_pitch_roll:
+            hdr += " " + header_bits[16] + " " + header_bits[17]
+        hdr += "  " + header_bits[18] + "  " + header_bits[19]
+        print(hdr)
+        print(_ansi("  " + "-" * (120 + (17 if show_pitch_roll else 0)), '2'))
 
         prev = None
         for i, exp in enumerate(res.exposures):
@@ -1074,6 +1146,7 @@ def print_summary(res: DataResults, max_rows: int = 50, show_files: bool = False
             }
 
             start = str(exp.exposure_start_time) if exp.exposure_start_time else ''
+            end   = str(exp.exposure_end_time)   if exp.exposure_end_time   else ''
             filt  = str(exp.optical_element) if exp.optical_element else ''
             vid_colored = _colorize_visit_id(exp.visit_id)
 
@@ -1092,7 +1165,18 @@ def print_summary(res: DataResults, max_rows: int = 50, show_files: bool = False
                     else f"{'—':>10} ")
             row += (f"{exp.dec:>+10.5f}  " if exp.dec is not None
                     else f"{'—':>10}  ")
-            row += start
+            row += (f"{exp.ra_v1:>10.5f} " if exp.ra_v1 is not None
+                    else f"{'—':>10} ")
+            row += (f"{exp.dec_v1:>+10.5f} " if exp.dec_v1 is not None
+                    else f"{'—':>10} ")
+            row += (f"{exp.pa_v3:>7.3f} " if exp.pa_v3 is not None
+                    else f"{'—':>7} ")
+            if show_pitch_roll:
+                row += (f"{exp.pitch:>7.3f} " if exp.pitch is not None
+                        else f"{'—':>7} ")
+                row += (f"{exp.roll:>7.3f} " if exp.roll is not None
+                        else f"{'—':>7} ")
+            row += " " + start + "  " + end
             print(row)
 
             prev = exp
@@ -1360,6 +1444,9 @@ Examples:
     p.add_argument('--show-files',      action='store_true',
                    help='Also print the flat filename list after the '
                         'per-exposure summary')
+    p.add_argument('--pitch-roll',      action='store_true',
+                   help='Compute sun-relative pitch and off-normal roll for each '
+                        'exposure (requires roman_opup_tools)')
 
     args = p.parse_args()
 
@@ -1368,6 +1455,11 @@ Examples:
         return
 
     res = list_data_from_args(args)
+
+    if getattr(args, 'pitch_roll', False):
+        for exp in res.exposures:
+            compute_pitch_roll(exp)
+
     print_summary(res, max_rows=args.max_rows, show_files=args.show_files)
 
 
