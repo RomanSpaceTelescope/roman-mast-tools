@@ -47,8 +47,12 @@ print('OK')
 ## Windows (miniforge)
 
 `environment.yml` works on Windows as-is once `romancal` is out of the
-picture (see above). If you are on an older checkout that still lists it,
-or `pip install -e .` tries to build `galsim` and fails with
+picture (see above). Note that `astroquery` used to arrive transitively via
+`romancal`; it is now an explicit dependency in `pyproject.toml`, so
+`pip install -e .` pulls the pinned pre-release build on every platform.
+
+If you are on an older checkout that still lists `romancal`, or
+`pip install -e .` tries to build `galsim` and fails with
 `ValueError: list.remove(x): x not in list`, install the deps explicitly and
 skip dependency resolution for the editable install:
 
@@ -80,11 +84,17 @@ and pip; no conda required.
    python3 -m venv ~/roman-mast-tools-env
    ```
 
+   On Windows use `py -3.12 -m venv %USERPROFILE%\roman-mast-tools-env`.
+
 3. Activate the environment:
 
    ```bash
    source ~/roman-mast-tools-env/bin/activate
    ```
+
+   On Windows: `%USERPROFILE%\roman-mast-tools-env\Scripts\activate` (cmd)
+   or `& $env:USERPROFILE\roman-mast-tools-env\Scripts\Activate.ps1`
+   (PowerShell).
 
 4. Upgrade the packaging tools inside the environment (avoids surprises
    when building `astroquery` from the PR branch):
@@ -93,14 +103,16 @@ and pip; no conda required.
    pip install --upgrade pip setuptools wheel
    ```
 
-5. Install the requirements:
+5. Install the package and its dependencies (editable, so edits to the
+   scripts take effect without reinstalling):
 
    ```bash
-   pip install -r requirements.txt
+   pip install -e .
    ```
 
-   The `git+https://.../astroquery.git@refs/pull/3593/head` line will build
-   `astroquery` from that pull request. This can take a minute or two.
+   The `astroquery @ git+https://...` dependency in `pyproject.toml` will
+   build `astroquery` from the pinned pre-release branch. This can take a
+   minute or two.
 
 6. (Optional, only if you want to run the notebook) Install JupyterLab and
    register a kernel for this environment:
@@ -164,8 +176,9 @@ python write_wfi_fits.py --help
 ## Updating
 
 The astroquery PR is expected to be merged and released before launch and
-commissioning. Once that happens, the `git+…` line in `requirements.txt`
-can be replaced with a normal `astroquery>=<version>` pin.
+commissioning. Once that happens, the `astroquery @ git+…` line in
+`pyproject.toml` (and `environment.yml`) can be replaced with a normal
+`astroquery>=<version>` pin.
 
 To reinstall from scratch:
 
@@ -175,15 +188,17 @@ rm -rf ~/roman-mast-tools-env
 python3 -m venv ~/roman-mast-tools-env
 source ~/roman-mast-tools-env/bin/activate
 pip install --upgrade pip setuptools wheel
-pip install -r requirements.txt
+pip install -e .
 ```
 
 ## Troubleshooting
 
 - **`error: could not find git`** — install git and re-run step 5.
-- **`ModuleNotFoundError: astroquery.mast`** after install — you're on the
-  system Python, not the venv. Re-run `source
-  ~/roman-mast-tools-env/bin/activate` and check `which python`.
+- **`ModuleNotFoundError: astroquery.mast`** after install — either you're
+  on the system Python, not the venv (re-run the activate command from step
+  3 and check `which python` / `where python`), or you installed with
+  `--no-deps` on an old checkout and need to `pip install
+  "git+https://github.com/snbianco/astroquery.git@2026.2"` by hand.
 - **Notebook kernel missing** — re-run step 6, then reload the JupyterLab
   browser tab.
 - **`MAST token not found!`** — see the notebook section above.

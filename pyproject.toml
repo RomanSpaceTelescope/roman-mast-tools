@@ -17,6 +17,9 @@ dependencies = [
     "requests",
     "roman_datamodels>=1.0.0",
     "rad>=1.0.0",
+    # Roman MAST search/streaming support is not in a released astroquery yet.
+    # Previously pulled in transitively via romancal; must be explicit now.
+    "astroquery @ git+https://github.com/snbianco/astroquery.git@2026.2",
     "fsspec[s3]",
     "s3fs",
     "photutils",
