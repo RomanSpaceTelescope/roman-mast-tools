@@ -287,7 +287,133 @@ def _load_yaml(path: str) -> dict:
     with open(path, "r") as f:
         return yaml.safe_load(f)
 
+# --- Add near the other top-level helpers, after _load_yaml() ------------
 
+def _load_derived_definitions(groups_config: str) -> dict:
+    """Return the `derived:` mapping from the groups YAML (may be empty)."""
+    cfg = _load_yaml(groups_config)
+    return cfg.get("derived", {}) or {}
+
+
+def _resolve_derived_dependencies(
+    derived_defs: dict, requested: Sequence[str]
+) -> List[str]:
+    """
+    Given a list of requested (possibly derived) mnemonics, walk the
+    `depends_on` graph and return the full ordered list of derived names
+    that need to be evaluated (topologically sorted, dependencies first).
+    """
+    order: List[str] = []
+    visiting: set = set()
+    visited: set = set()
+
+    def visit(name: str):
+        if name in visited or name not in derived_defs:
+            return
+        if name in visiting:
+            raise ValueError(f"Cyclic dependency detected involving '{name}'")
+        visiting.add(name)
+        for dep in (derived_defs[name].get("depends_on") or []):
+            visit(dep)
+        visiting.remove(name)
+        visited.add(name)
+        order.append(name)
+
+    for r in requested:
+        visit(r)
+    return order
+
+
+def _collect_raw_inputs(derived_defs: dict, derived_names: Sequence[str]) -> List[str]:
+    """
+    Return the de-duplicated list of raw MAST mnemonics (WFI_MCU_B_ANALOG_N etc.)
+    needed to evaluate the given derived mnemonics.  Any input that is itself
+    another derived mnemonic is excluded (it will be computed, not queried).
+    """
+    raw = []
+    seen: set = set()
+    for name in derived_names:
+        spec = derived_defs.get(name, {}) or {}
+        inputs = (spec.get("inputs") or {})
+        for _, src in inputs.items():
+            if src in derived_defs:
+                continue  # dependency handled via depends_on
+            if src not in seen:
+                seen.add(src)
+                raw.append(src)
+    return raw
+
+
+def _partition_derived(
+    mnemonics: Sequence[str], derived_defs: dict
+) -> Tuple[List[str], List[str]]:
+    """
+    Split a mnemonic list into (raw_mnemonics, derived_mnemonics)
+    based on the `derived:` section of the YAML.
+    """
+    derived, raw = [], []
+    for m in mnemonics:
+        (derived if m in derived_defs else raw).append(m)
+    return raw, derived
+
+
+def _compute_derived_columns(
+    combined_df: "pd.DataFrame",
+    derived_defs: dict,
+    derived_names: Sequence[str],
+    verbose: bool = True,
+) -> "pd.DataFrame":
+    """
+    Evaluate derived mnemonic formulas and add them as columns to a wide
+    (combined) DataFrame indexed by ObsTime.  Derived mnemonics are computed
+    in dependency order (`depends_on`), so intermediates like
+    WFI_MCU_B_BOARD_T_RAW become available for downstream formulas.
+    """
+    import numpy as np
+
+    if combined_df is None or combined_df.empty:
+        return combined_df
+
+    # Topologically ordered list
+    order = _resolve_derived_dependencies(derived_defs, derived_names)
+
+    for name in order:
+        spec = derived_defs[name]
+        inputs = (spec.get("inputs") or {})
+        formula = spec.get("formula")
+        if not formula:
+            if verbose:
+                print(f"⚠ Derived '{name}' has no formula; skipping.")
+            continue
+
+        # Build local namespace: each variable -> pd.Series (or scalar).
+        local_ns = {"np": np}
+        missing = []
+        for var, src in inputs.items():
+            if src in combined_df.columns:
+                local_ns[var] = combined_df[src]
+            else:
+                missing.append(src)
+
+        if missing:
+            if verbose:
+                print(f"⚠ Cannot compute '{name}': missing input columns {missing}")
+            combined_df[name] = np.nan
+            continue
+
+        try:
+            combined_df[name] = eval(  # noqa: S307 (trusted YAML input)
+                formula, {"__builtins__": {}}, local_ns
+            )
+            if verbose:
+                units = spec.get("units", "")
+                print(f"  ✓ Computed derived mnemonic '{name}' [{units}]")
+        except Exception as e:
+            if verbose:
+                print(f"✗ Failed to evaluate '{name}': {e}")
+            combined_df[name] = np.nan
+
+    return combined_df
 def list_available_groups(groups_config: str) -> List[Tuple[str, str, int]]:
     """
     Return a list of (group_name, label, n_mnemonics) tuples from a YAML config.
@@ -309,52 +435,114 @@ def list_available_groups(groups_config: str) -> List[Tuple[str, str, int]]:
     return out
 
 
+def _mnemonics_of(group_info: dict) -> List[str]:
+    """Extract mnemonic *names* from a group entry, accepting list or dict form."""
+    m = (group_info or {}).get("mnemonics") or {}
+    if isinstance(m, dict):
+        return list(m.keys())
+    if isinstance(m, list):
+        return list(m)
+    return []
+
+
+def _labels_of(group_info: dict) -> dict:
+    """Extract {mnemonic: description} from a group entry (empty if list form)."""
+    m = (group_info or {}).get("mnemonics") or {}
+    if isinstance(m, dict):
+        return dict(m)
+    return {}
+
+
 def extract_mnemonics_from_groups(
     groups_config: str,
     selected_groups: Optional[Sequence[str]] = None,
     verbose: bool = True,
 ) -> List[str]:
-    """
-    Extract a de-duplicated list of mnemonics from a YAML plot-groups file.
+    cfg = _load_yaml(groups_config)
+    groups = cfg.get("groups", {}) or {}
+    selected_set = set(selected_groups) if selected_groups else None
 
-    Parameters
-    ----------
-    groups_config : str
-        Path to YAML groups file.
-    selected_groups : list of str, optional
-        If given, only mnemonics from these group names are returned.
-        If None, mnemonics from all groups are returned.
+    mnemonics: List[str] = []
+    seen = set()
+    for name, info in groups.items():
+        if selected_set is not None and name not in selected_set:
+            continue
+        for mn in _mnemonics_of(info):
+            if mn not in seen:
+                seen.add(mn)
+                mnemonics.append(mn)
+    return mnemonics
+
+
+def extract_labels_from_groups(
+    groups_config: str,
+    selected_groups: Optional[Sequence[str]] = None,
+) -> dict:
+    """
+    Return {mnemonic: 'human description'} for all mnemonics in the
+    given (or all) groups.  Missing descriptions are omitted.
     """
     cfg = _load_yaml(groups_config)
     groups = cfg.get("groups", {}) or {}
-
     selected_set = set(selected_groups) if selected_groups else None
-    mnemonics: List[str] = []
-    seen = set()
 
+    labels: dict = {}
     for name, info in groups.items():
         if selected_set is not None and name not in selected_set:
-            if verbose:
-                print(f"  ✗ Skipping group: {name}")
             continue
-        if verbose:
-            print(f"  ✓ Including group: {name}")
-        for m in (info or {}).get("mnemonics", []) or []:
-            if m not in seen:
-                seen.add(m)
-                mnemonics.append(m)
+        for mn, desc in _labels_of(info).items():
+            if desc and mn not in labels:
+                labels[mn] = str(desc)
+    return labels
 
-    # Warn about any requested group names that were not found
-    if selected_set is not None:
-        missing = selected_set - set(groups.keys())
-        if missing and verbose:
-            print(
-                f"⚠ Warning: the following selected groups were not found in "
-                f"{groups_config}: {sorted(missing)}"
-            )
+def expand_to_raw_mnemonics(
+    mnemonics: Sequence[str],
+    groups_config: Optional[str],
+    verbose: bool = True,
+) -> Tuple[List[str], List[str]]:
+    """
+    Split `mnemonics` into (raw_to_query, derived_to_compute).  Also expands
+    each derived mnemonic into its raw ANALOG input channels and includes any
+    dependency chain (e.g. WFI_MCU_B_BOARD_T_RAW).
 
-    return mnemonics
+    Returns
+    -------
+    raw_query_list : list[str]
+        The de-duplicated set of mnemonics to actually request from MAST.
+    derived_list : list[str]
+        The derived mnemonics that should be computed client-side, in
+        dependency order.
+    """
+    if not groups_config:
+        return list(mnemonics), []
 
+    derived_defs = _load_derived_definitions(groups_config)
+    if not derived_defs:
+        return list(mnemonics), []
+
+    raw, derived = _partition_derived(mnemonics, derived_defs)
+
+    # Walk dependencies to include intermediates (e.g. BOARD_T_RAW)
+    ordered_derived = _resolve_derived_dependencies(derived_defs, derived)
+
+    # Gather all raw MAST inputs needed
+    needed_raw = _collect_raw_inputs(derived_defs, ordered_derived)
+
+    # Merge with any raw mnemonics the user already requested
+    seen = set()
+    raw_query_list: List[str] = []
+    for m in raw + needed_raw:
+        if m not in seen:
+            seen.add(m)
+            raw_query_list.append(m)
+
+    if verbose and ordered_derived:
+        print(
+            f"  ↳ {len(ordered_derived)} derived mnemonic(s) will be computed "
+            f"from {len(needed_raw)} raw MCU-B analog channel(s)."
+        )
+
+    return raw_query_list, ordered_derived
 
 def _read_mnemonics_file(path: str) -> List[str]:
     """Read a whitespace/newline/comma-separated list of mnemonics from a file."""
@@ -382,39 +570,20 @@ def _read_mnemonics_file(path: str) -> List[str]:
 # ---------------------------------------------------------------------------
 
 def query_telemetry(
-    mnemonics: Optional[Sequence[str]] = None,
-    start_time: Union[str, datetime, None] = None,
-    end_time: Union[str, datetime, None] = None,
-    *,
-    groups_config: Optional[str] = None,
-    selected_groups: Optional[Sequence[str]] = None,
-    server: str = "mast",
-    api_token: Optional[str] = None,
-    combine: bool = True,
-    max_retries: int = 3,
-    retry_delay: float = 1.0,
-    verbose: bool = True,
-) -> Union[pd.DataFrame, dict]:
-    """
-    Query Roman telemetry from the MAST Engineering DB.
-
-    You may supply mnemonics directly via ``mnemonics``, or auto-extract them
-    from a YAML plot-groups file via ``groups_config`` (optionally filtered by
-    ``selected_groups``).
-
-    Returns a combined DataFrame (default) or a dict of DataFrames keyed by
-    mnemonic when ``combine=False``.
-    """
+    mnemonics=None, start_time=None, end_time=None, *,
+    groups_config=None, selected_groups=None,
+    server="mast", api_token=None,
+    combine=True, max_retries=3, retry_delay=1.0, verbose=True,
+):
     if start_time is None or end_time is None:
         raise ValueError("start_time and end_time are required")
 
-    # Resolve mnemonic list
+    # Resolve mnemonic list from groups + explicit args
     resolved: List[str] = list(mnemonics) if mnemonics else []
     if groups_config:
         extracted = extract_mnemonics_from_groups(
             groups_config, selected_groups=selected_groups, verbose=verbose
         )
-        # Merge (extracted first, then any explicit extras) with de-dup
         seen = set(extracted)
         merged = list(extracted)
         for m in resolved:
@@ -424,25 +593,59 @@ def query_telemetry(
         resolved = merged
 
     if not resolved:
-        raise ValueError(
-            "No mnemonics to query. Provide `mnemonics` and/or `groups_config`."
-        )
+        raise ValueError("No mnemonics to query.")
 
-    if verbose:
-        print(f"Querying {len(resolved)} mnemonic(s) from server='{server}' "
-              f"between {start_time} and {end_time}")
-
-    querier = MASTEngDBQuery(api_token=api_token, server=server)
-    return querier.query_multiple_mnemonics(
-        resolved,
-        start_time,
-        end_time,
-        combine=combine,
-        max_retries=max_retries,
-        retry_delay=retry_delay,
-        verbose=verbose,
+    # NEW: split raw / derived
+    raw_to_query, derived_to_compute = expand_to_raw_mnemonics(
+        resolved, groups_config, verbose=verbose
     )
 
+    querier = MASTEngDBQuery(api_token=api_token, server=server)
+    raw_results = querier.query_multiple_mnemonics(
+        raw_to_query, start_time, end_time,
+        combine=False, max_retries=max_retries,
+        retry_delay=retry_delay, verbose=verbose,
+    )
+
+    # Build wide DF and compute derived columns
+    combined_dfs = []
+    for mnem, df in raw_results.items():
+        if df is None or df.empty:
+            continue
+        if "ObsTime" in df.columns and "EUValue" in df.columns:
+            s = df.set_index("ObsTime")["EUValue"]
+            s.name = mnem
+            combined_dfs.append(s)
+
+    if combined_dfs:
+        wide = pd.concat(combined_dfs, axis=1)
+        wide = wide[~wide.index.duplicated(keep="first")]
+        wide.index.name = "ObsTime"
+    else:
+        wide = pd.DataFrame()
+
+    if derived_to_compute and not wide.empty and groups_config:
+        derived_defs = _load_derived_definitions(groups_config)
+        wide = _compute_derived_columns(
+            wide, derived_defs, derived_to_compute, verbose=verbose
+        )
+
+    if combine:
+        return wide
+
+    # combine=False: return dict.  Add synthetic long-form DataFrames for
+    # derived mnemonics so callers see them alongside raw results.
+    if derived_to_compute and not wide.empty:
+        for name in derived_to_compute:
+            if name in wide.columns:
+                s = wide[name].dropna()
+                if not s.empty:
+                    raw_results[name] = pd.DataFrame({
+                        "ObsTime": s.index,
+                        "EUValue": s.values,
+                        "mnemonic": name,
+                    })
+    return raw_results
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -746,8 +949,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("No mnemonics specified. Use --mnemonics, --mnemonics-file, "
                      "or --plot-groups.")
 
+    # NEW: separate raw-vs-derived using the groups YAML `derived:` section
+    groups_file = args.plot_groups or _resolve_default_groups_file()
+    raw_to_query, derived_to_compute = expand_to_raw_mnemonics(
+        mnemonics, groups_file, verbose=verbose
+    )
+
     if verbose:
-        print(f"Resolved {len(mnemonics)} mnemonic(s) to query.")
+        print(
+            f"Resolved {len(raw_to_query)} raw mnemonic(s) to query "
+            f"(+{len(derived_to_compute)} derived to compute)."
+        )
 
     # --- Query MAST EDB ---
     try:
@@ -758,11 +970,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     combine = not args.no_combine
     try:
-        # When plotting, we need the per-mnemonic long-format DataFrames
-        # (each carries a 'mnemonic' column), so query with combine=False
-        # and build the combined wide DataFrame ourselves if needed.
         raw_results = querier.query_multiple_mnemonics(
-            mnemonics,
+            raw_to_query,        # <-- pass raw list, not `mnemonics`
             args.start,
             args.end,
             combine=False,
@@ -774,37 +983,82 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"ERROR during query: {e}", file=sys.stderr)
         return 1
 
+    # Build the wide combined DataFrame first (needed to compute derived cols).
     plot_df = pd.concat(
         [df for df in raw_results.values() if df is not None and not df.empty],
         ignore_index=True,
     ) if raw_results else pd.DataFrame()
 
-    if combine:
-        combined_dfs = []
-        for mnem, df in raw_results.items():
-            if df is None or df.empty:
-                continue
-            if "ObsTime" in df.columns and "EUValue" in df.columns:
-                series = df.set_index("ObsTime")["EUValue"]
-                series.name = mnem
-                combined_dfs.append(series)
-        if combined_dfs:
-            result = pd.concat(combined_dfs, axis=1)
-            result = result[~result.index.duplicated(keep="first")]
-            result.index.name = "ObsTime"
-        else:
-            result = pd.DataFrame()
+    combined_dfs = []
+    for mnem, df in raw_results.items():
+        if df is None or df.empty:
+            continue
+        if "ObsTime" in df.columns and "EUValue" in df.columns:
+            series = df.set_index("ObsTime")["EUValue"]
+            series.name = mnem
+            combined_dfs.append(series)
+
+    if combined_dfs:
+        wide = pd.concat(combined_dfs, axis=1)
+        wide = wide[~wide.index.duplicated(keep="first")]
+        wide.index.name = "ObsTime"
     else:
-        result = raw_results
+        wide = pd.DataFrame()
+
+    # NEW: compute derived columns from the wide DataFrame
+    if derived_to_compute and not wide.empty:
+        derived_defs = _load_derived_definitions(groups_file)
+        wide = _compute_derived_columns(
+            wide, derived_defs, derived_to_compute, verbose=verbose
+        )
+
+        # Also add derived data back into the long-form plot_df so the
+        # existing plotting code (which expects ObsTime/EUValue/mnemonic)
+        # can visualize derived quantities too.
+        long_rows = []
+        for name in derived_to_compute:
+            if name in wide.columns:
+                s = wide[name].dropna()
+                if not s.empty:
+                    long_rows.append(
+                        pd.DataFrame({
+                            "ObsTime": s.index,
+                            "EUValue": s.values,
+                            "mnemonic": name,
+                        })
+                    )
+        if long_rows:
+            plot_df = pd.concat([plot_df, *long_rows], ignore_index=True)
+
+    result = wide if combine else raw_results
+
+    # --- Build label map for column renaming ---
+    _label_map: dict = {}
+    if args.plot_groups:
+        selected_for_labels = (
+            [s.strip() for s in args.select_groups.split(",") if s.strip()]
+            if args.select_groups else None
+        )
+        try:
+            _label_map = extract_labels_from_groups(
+                args.plot_groups, selected_groups=selected_for_labels
+            )
+        except Exception:
+            pass
 
     # --- Save output ---
     if args.output:
         fmt = _infer_output_format(args.output, args.output_format)
         if combine:
             if isinstance(result, dict):
-                # Shouldn't happen when combine=True, but guard anyway
                 result = pd.concat(result.values(), ignore_index=True)
-            save_edb_data(result, args.output, file_format=fmt)
+            save_df = result
+            if _label_map and hasattr(save_df, "columns"):
+                save_df = save_df.rename(columns={
+                    m: f"{m} - {desc}" for m, desc in _label_map.items()
+                    if m in save_df.columns
+                })
+            save_edb_data(save_df, args.output, file_format=fmt)
         else:
             # One file per mnemonic
             base, ext = os.path.splitext(args.output)
@@ -840,6 +1094,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if args.select_groups:
             selected = [s.strip() for s in args.select_groups.split(",") if s.strip()]
 
+        label_map = {}
+        if args.plot_groups:
+            try:
+                label_map = extract_labels_from_groups(
+                    args.plot_groups, selected_groups=selected
+                )
+            except Exception as e:
+                if verbose:
+                    print(f"⚠ Could not load legend labels: {e}")
+
         if plot_df.empty:
             print("WARNING: no data returned — skipping plot.", file=sys.stderr)
         elif args.plot_per_mnemonic:
@@ -849,6 +1113,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 layout=args.plot_layout,
                 output=args.plot_output,
                 show=args.show,
+                label_map=label_map,
             )
         else:
             plot_telemetry(
@@ -858,6 +1123,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 layout=args.plot_layout,
                 output=args.plot_output,
                 show=args.show,
+                label_map=label_map,
             )
 
         if verbose and args.plot_output:

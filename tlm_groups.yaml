@@ -1,27 +1,620 @@
 groups:
   rcs_pd:
-    label: "RCS photodiodes"
-    y_label: "Voltage (V)"
+    label: RCS photodiodes
+    y_label: Voltage (V)
     mnemonics:
-      - WFI_MCE_SRCS_PD1_V
-      - WFI_MCE_SRCS_PD2_V
+    - WFI_MCE_SRCS_PD1_V
+    - WFI_MCE_SRCS_PD2_V
 
   bank1_leds:
-    label: "RCS LED Bank 1"
+    label: RCS LED Bank 1
     mnemonics:
-      - WFI_MCE_SRCS_BANK1SEL_LED1
-      - WFI_MCE_SRCS_BANK1SEL_LED2
-      - WFI_MCE_SRCS_BANK1SEL_LED3
-      - WFI_MCE_SRCS_BANK1SEL_LED4
-      - WFI_MCE_SRCS_BANK1SEL_LED5
-      - WFI_MCE_SRCS_BANK1SEL_LED6
+    - WFI_MCE_SRCS_BANK1SEL_LED1
+    - WFI_MCE_SRCS_BANK1SEL_LED2
+    - WFI_MCE_SRCS_BANK1SEL_LED3
+    - WFI_MCE_SRCS_BANK1SEL_LED4
+    - WFI_MCE_SRCS_BANK1SEL_LED5
+    - WFI_MCE_SRCS_BANK1SEL_LED6
 
   bank2_leds:
-    label: "RCS LED Bank 2"
+    label: RCS LED Bank 2
     mnemonics:
-      - WFI_MCE_SRCS_BANK2SEL_LED1
-      - WFI_MCE_SRCS_BANK2SEL_LED2
-      - WFI_MCE_SRCS_BANK2SEL_LED3
-      - WFI_MCE_SRCS_BANK2SEL_LED4
-      - WFI_MCE_SRCS_BANK2SEL_LED5
-      - WFI_MCE_SRCS_BANK2SEL_LED6
+    - WFI_MCE_SRCS_BANK2SEL_LED1
+    - WFI_MCE_SRCS_BANK2SEL_LED2
+    - WFI_MCE_SRCS_BANK2SEL_LED3
+    - WFI_MCE_SRCS_BANK2SEL_LED4
+    - WFI_MCE_SRCS_BANK2SEL_LED5
+    - WFI_MCE_SRCS_BANK2SEL_LED6
+
+# -----------------------------------------------------------------
+  # MCE thermal sensor groups
+  #   Each mnemonic is followed by its physical-location description
+  #   (used as an extended legend label at plot time).
+  # -----------------------------------------------------------------
+  temp_acm:
+    label: ACM Temperature
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_MCE_ADC_WTSM13: "ACM -X Actuator I/F"
+      WFI_MCE_TEMP_ACM_1: "ACM Actuator 1"
+      WFI_MCE_TEMP_ACM_2: "ACM Actuator 2"
+      WFI_MCE_TEMP_ACM_3: "ACM Actuator 3"
+      WFI_MCE_TEMP_ACM_4: "ACM Actuator 4"
+      WFI_MCE_TEMP_ACM_5: "ACM Actuator 5"
+      WFI_MCE_TEMP_ACM_6: "ACM Actuator 6"
+
+  temp_bcr:
+    label: BCR Temperature
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_MCE_ADC_WTSM12: "BCR +Y"
+      WFI_MCE_ADC_WTSM20: "BCR +X+Y"
+      WFI_MCE_ADC_WTSM21: "BCR +X-Y"
+      WFI_MCE_ADC_WTSM22: "BCR -X+Y"
+      WFI_MCE_ADC_WTSM23: "BCR -X-Y"
+
+  temp_coba:
+    label: COBA Temperature
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_MCE_ADC_WTSM04: "COBA near EWA"
+
+  temp_cpr:
+    label: CPR Temperature
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_MCE_ADC_WTSM00: "CPR Strap at MPA I/F"
+
+  temp_ewa:
+    label: EWA Temperature
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_MCE_ADC_WTSM16: "EWTA Outboard"
+      WFI_MCE_ADC_WTSM17: "EWTA Inboard"
+      WFI_MCE_ADC_WTSM24: "EW Motor I/F"
+      WFI_MCE_TEMP_EWA:   "EW Motor"
+
+  temp_enclosure:
+    label: Enclosure Temperature
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_MCE_ADC_WTSM10: "Encl Frame +X+Y"
+      WFI_MCE_ADC_WTSM11: "Encl Frame near CMU I/F"
+      WFI_MCE_TEMP_CMU:   "CMU Internal"
+
+  temp_fpe:
+    label: FPE Temperature
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_MCE_ADC_WTSM14: "FPE +X-Z"
+      WFI_MCE_ADC_WTSM15: "FPE -X-Z"
+
+  temp_mpr:
+    label: MPR Temperature
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_MCE_ADC_WTSM02: "MPR +X"
+
+  temp_ob:
+    label: OB Temperature
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_MCE_ADC_WTSM06: "OB near Latch C"
+      WFI_MCE_ADC_WTSM07: "OB near Latch B"
+      WFI_MCE_ADC_WTSM08: "OB near EWA I/F"
+      WFI_MCE_ADC_WTSM09: "OB near Latch A (-X)"
+
+  temp_scea:
+    label: SCEA Temperature
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_MCE_ADC_WTSM01: "SCEA Cold Bar"
+
+  temp_rcs:
+    label: RCS/sRCS Temperature
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_MCE_ADC_WTSM03:           "sRCSE Box Lid"
+      WFI_MCE_ADC_WTSM19:           "RCS-R on HP"
+      WFI_MCE_SRCS_SPHERE_T_K:      "sRCSS Sphere"       
+      WFI_RCS_R_WTSC07P_K:          "RCS-R near Heater"
+      WFI_SRSCE_PLTF_WTSC08P_K:     "sRCSE Platform"
+      WFI_SRSCE_SHRD_WTSC09P_K:     "sRCSS Shroud"
+
+  temp_aperture:
+    label: Aperture Area Temperature
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_MCE_ADC_WTSM05: "Aperture Adiabatic (on MLI)"
+
+  # -----------------------------------------------------------------
+  # WTSC primary (P) thermistor groups
+  # -----------------------------------------------------------------
+  temp_cpr_wtsc:
+    label: CPR WTSC Temperatures (primary)
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_CPR_PX_ALBEMET_WTSC00P_K: "CPR +X Bar"
+      WFI_CPR_MX_ALBEMET_WTSC01P_K: "CPR -X Bar"
+
+  temp_mpr_wtsc:
+    label: MPR WTSC Temperatures (primary)
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_MPR_CENTER_WTSC02P_K:         "MPR Center"
+      WFI_MPR_PXPY_BLADE_FLX_WTSC03P_K: "MPR +X+Y Flexure I/F"
+
+  temp_fpe_wtsc:
+    label: FPE WTSC Temperatures (primary)
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_FPE_PX_WTSC04P_K: "FPE +X+Y"
+      WFI_FPE_MX_WTSC05P_K: "FPE -X-Y"
+      WFI_FPE_R_WTSC06P_K:  "FPE-R"
+
+  temp_coba_wtsc:
+    label: COBA WTSC Temperatures (primary)
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_COBA_WTSC10P_K: "COBA near MPA"
+
+  temp_latch_wtsc:
+    label: Latch WTSC Temperatures (primary)
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_LATCH_C_WTSC11P_K: "Latch C Frame"
+      WFI_LATCH_B_WTSC12P_K: "Latch B Frame"
+      WFI_LATCH_A_WTSC13P_K: "Latch A Frame"
+
+  temp_scea_wtsc:
+    label: SCEA WTSC Temperatures (primary)
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_SCEA_WTSC14P_K: "SCEA 6-pack Bar"
+
+  temp_bcr_wtsc:
+    label: BCR WTSC Temperatures (primary)
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_BCR_PX_WTSC15P_K: "BCR +X"
+      WFI_BCR_MY_WTSC16P_K: "BCR -Y"
+
+  temp_acm_wtsc:
+    label: ACM WTSC Temperatures (primary)
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_ACM_MY_MP_FLX_WTSC17P_K: "ACM -Y MP Flexure I/F"
+      WFI_ACM_MY_ACTR_WTSC18P_K:   "ACM -Y Actuator I/F"
+
+  temp_ewa_wtsc:
+    label: EWA WTSC Temperatures (primary)
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_EWTA_MY_NR_OB_FLX_WTSC19P_K: "EWTA Outboard near -Y Flexure"
+
+  temp_ob_wtsc:
+    label: OB WTSC Temperatures (primary)
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_OB_MY_NR_ACM_FLX_WTSC20P_K: "OB -Y near ACM Flexure"
+      WFI_OB_NR_LATCH_A_WTSC21P_K:    "OB near Latch A (+X)"
+
+  temp_enclosure_wtsc:
+    label: Enclosure WTSC Temperatures (primary)
+    y_label: Temperature (K)
+    mnemonics:
+      WFI_ENCL_FRM_NR_LATCH_A_WTSC22P_K:  "Encl Frame near Latch A"
+      WFI_ENCL_FRM_PX_PY_NR_HP_WTSC23P_K: "Encl Frame near +X+Y HP"
+      WFI_ENCL_CAP_WTSC24P_K:             "Encl Cap near Snout"
+
+  # -----------------------------------------------------------------
+  # MCU-B derived temperature groups
+  # -----------------------------------------------------------------
+  temp_mpa_ctrl:
+    label: MPA Control Sensor (WTSF00, MCU-B)
+    y_label: Temperature (K)
+    mnemonics:
+    - WFI_MCU_B_MPA_T_CTRLSENS
+
+  temp_scea_ctrl:
+    label: SCEA Control Sensor (WTSF02, MCU-B)
+    y_label: Temperature (K)
+    mnemonics:
+    - WFI_MCU_B_SCEA_T_CTRLSENS
+
+  temp_offs_ctrl:
+    label: Offset (CPR) Control Sensor (WTSF04, MCU-B)
+    y_label: Temperature (K)
+    mnemonics:
+    - WFI_MCU_B_OFFS_T_CTRLSENS
+
+  temp_mpa_mon:
+    label: MPA Monitor Sensors (WTSF01, MCU-B)
+    y_label: Temperature (K)
+    mnemonics:
+    - WFI_MCU_B_MPA_MON_COLDEST
+    - WFI_MCU_B_MPA_MON_COLD
+    - WFI_MCU_B_MPA_MON_MID
+    - WFI_MCU_B_MPA_MON_WARM
+
+  temp_scea_mon:
+    label: SCEA Monitor Sensors (WTSF03, MCU-B)
+    y_label: Temperature (K)
+    mnemonics:
+    - WFI_MCU_B_SCEA_MON_COLDEST
+
+  temp_offs_mon:
+    label: Offset (CPR) Monitor Sensors (WTSF05, MCU-B)
+    y_label: Temperature (K)
+    mnemonics:
+    - WFI_MCU_B_OFFS_MON_COLDEST
+    - WFI_MCU_B_OFFS_MON_COLD
+    - WFI_MCU_B_OFFS_MON_MID
+    - WFI_MCU_B_OFFS_MON_WARM
+
+  temp_mcu_b_board:
+    label: MCU-B Board Temperatures
+    y_label: Temperature (deg C)
+    mnemonics:
+    - WFI_MCU_B_BOARD_T
+    - WFI_MCU_B_U7_CASE_T
+    - WFI_MCU_B_FPGA_CASE_T
+
+
+
+# =====================================================================
+# Derived mnemonics
+# ---------------------------------------------------------------------
+# Each entry specifies how a "virtual" mnemonic is computed from one
+# or more raw MAST channels.  Formulas use pandas/numpy expressions
+# where the variables refer to the `inputs:` keys.
+#
+# Board T raw is needed for the RAWC correction of most sensors.
+# =====================================================================
+derived:
+
+  # ---------------------------------------------------------------
+  # MCU-B board / support temperatures (needed by many others; first)
+  # ---------------------------------------------------------------
+  WFI_MCU_B_BOARD_T:
+    units: deg C
+    inputs:
+      A25: WFI_MCU_B_ANALOG_25
+    # Constants: GAIN2_CAL=1.99692, GAIN4_CAL=3.98769 (from equations file)
+    formula: "((((-3.78965180500010e-05 * A25) + 1.59274182543759e-04) * 1.99692 / 3.98769) * 1000.0) - 273.15"
+
+  WFI_MCU_B_BOARD_T_RAW:
+    # Raw counts of the board thermistor channel — used as an argument
+    # in the RAWC corrections of the other MCU_B sensors.
+    units: counts
+    inputs:
+      A25: WFI_MCU_B_ANALOG_25
+    formula: "A25"
+
+  WFI_MCU_B_U7_CASE_T:
+    units: deg C
+    inputs:
+      A26: WFI_MCU_B_ANALOG_26
+    formula: "((((-3.78965180500010e-05 * A26) + 1.59274182543759e-04) * 1.99692 / 3.98769) * 1000.0) - 273.15"
+
+  WFI_MCU_B_FPGA_CASE_T:
+    units: deg C
+    inputs:
+      A27: WFI_MCU_B_ANALOG_27
+    formula: "((((-3.78965180500010e-05 * A27) + 1.59274182543759e-04) * 1.99692 / 3.98769) * 1000.0) - 273.15"
+
+  # ---------------------------------------------------------------
+  # MPA control sensor (channel 1)
+  # ---------------------------------------------------------------
+  WFI_MCU_B_MPA_T_CTRLSENS:
+    units: K
+    depends_on: [WFI_MCU_B_BOARD_T_RAW]
+    inputs:
+      A1: WFI_MCU_B_ANALOG_1
+      BT_RAW: WFI_MCU_B_BOARD_T_RAW
+    formula: >
+      6.41857391845582e-10 *
+        (4*A1 - (-0.0425613392114692*BT_RAW + -707.913328147364))**2
+      + 0.0029979598180664 *
+        (4*A1 - (-0.0425613392114692*BT_RAW + -707.913328147364))
+      + 1921.4436501897
+
+  # ---------------------------------------------------------------
+  # SCEA control sensor (channel 2)
+  # ---------------------------------------------------------------
+  WFI_MCU_B_SCEA_T_CTRLSENS:
+    units: K
+    depends_on: [WFI_MCU_B_BOARD_T_RAW]
+    inputs:
+      A2: WFI_MCU_B_ANALOG_2
+      BT_RAW: WFI_MCU_B_BOARD_T_RAW
+    formula: >
+      2.13315623243882e-09 *
+        (A2 - (-0.0128045349611677*BT_RAW + -202.013683375665))**2
+      + 0.00500165709400535 *
+        (A2 - (-0.0128045349611677*BT_RAW + -202.013683375665))
+      + 752.992610435348
+
+  # ---------------------------------------------------------------
+  # OFFS (Offset / CPR) control sensor (channel 3)
+  # ---------------------------------------------------------------
+  WFI_MCU_B_OFFS_T_CTRLSENS:
+    units: K
+    depends_on: [WFI_MCU_B_BOARD_T_RAW]
+    inputs:
+      A3: WFI_MCU_B_ANALOG_3
+      BT_RAW: WFI_MCU_B_BOARD_T_RAW
+    formula: >
+      8.35571760906265e-09 *
+        (A3 - (-0.0239806634915274*BT_RAW + -386.892093222091))**2
+      + 0.0110613586627784 *
+        (A3 - (-0.0239806634915274*BT_RAW + -386.892093222091))
+      + 2220.54665679542
+
+  # ---------------------------------------------------------------
+  # MPA monitor (channels 4-7)
+  # ---------------------------------------------------------------
+  WFI_MCU_B_MPA_MON_COLDEST:
+    units: K
+    depends_on: [WFI_MCU_B_BOARD_T_RAW]
+    inputs:
+      A4: WFI_MCU_B_ANALOG_4
+      BT_RAW: WFI_MCU_B_BOARD_T_RAW
+    formula: >
+      1.12910444303998e-08 *
+        (A4 - (0.159130641617435*BT_RAW + 2566.97786965457))**2
+      + 0.0108621655844855 *
+        (A4 - (0.159130641617435*BT_RAW + 2566.97786965457))
+      + 496.001679486628
+
+  WFI_MCU_B_MPA_MON_COLD:
+    units: K
+    depends_on: [WFI_MCU_B_BOARD_T_RAW]
+    inputs:
+      A5: WFI_MCU_B_ANALOG_5
+      BT_RAW: WFI_MCU_B_BOARD_T_RAW
+    formula: >
+      3.16481446326687e-09 *
+        (A5 - (0.305043014574195*BT_RAW + 4919.81285200111))**2
+      + 0.00594788978985127 *
+        (A5 - (0.305043014574195*BT_RAW + 4919.81285200111))
+      + 994.75731186642
+
+  WFI_MCU_B_MPA_MON_MID:
+    units: K
+    depends_on: [WFI_MCU_B_BOARD_T_RAW]
+    inputs:
+      A6: WFI_MCU_B_ANALOG_6
+      BT_RAW: WFI_MCU_B_BOARD_T_RAW
+    formula: >
+      1.44864488045953e-08 *
+        (A6 - (0.147635306436666*BT_RAW + 2382.09055251355))**2
+      + 0.0130212825782102 *
+        (A6 - (0.147635306436666*BT_RAW + 2382.09055251355))
+      + 1509.01808348352
+
+  WFI_MCU_B_MPA_MON_WARM:
+    units: K
+    depends_on: [WFI_MCU_B_BOARD_T_RAW]
+    inputs:
+      A7: WFI_MCU_B_ANALOG_7
+      BT_RAW: WFI_MCU_B_BOARD_T_RAW
+    formula: >
+      3.21396206149109e-08 *
+        (A7 - (0.147317761313605*BT_RAW + 2379.53384948017))**2
+      + 0.0146939753155724 *
+        (A7 - (0.147317761313605*BT_RAW + 2379.53384948017))
+      + 2111.78018221429
+
+  # ---------------------------------------------------------------
+  # SCEA monitor (channel 8; equations file shows only COLDEST for B)
+  # ---------------------------------------------------------------
+  WFI_MCU_B_SCEA_MON_COLDEST:
+    units: K
+    depends_on: [WFI_MCU_B_BOARD_T_RAW]
+    inputs:
+      A8: WFI_MCU_B_ANALOG_8
+      BT_RAW: WFI_MCU_B_BOARD_T_RAW
+    formula: >
+      1.09815017012195e-08 *
+        (A8 - (0.141866523707574*BT_RAW + 2290.41722452358))**2
+      + 0.0108678867720667 *
+        (A8 - (0.141866523707574*BT_RAW + 2290.41722452358))
+      + 495.576854941062
+
+  # ---------------------------------------------------------------
+  # OFFS monitor (channels 12-15)
+  # NOTE: MCU_B channel 12 (COLDEST) coefficients were not explicitly
+  # present in the extracts I inspected; the values below were taken
+  # from the closest MCU-B analogue.  Verify against the full equations
+  # file if precision matters.
+  # ---------------------------------------------------------------
+  WFI_MCU_B_OFFS_MON_COLDEST:
+    units: K
+    depends_on: [WFI_MCU_B_BOARD_T_RAW]
+    inputs:
+      A12: WFI_MCU_B_ANALOG_12
+      BT_RAW: WFI_MCU_B_BOARD_T_RAW
+    formula: >
+      1.11494073767193e-08 *
+        (A12 - (0.147582623144033*BT_RAW + 2378.23391135125))**2
+      + 0.0108974926521344 *
+        (A12 - (0.147582623144033*BT_RAW + 2378.23391135125))
+      + 497.163950305601
+
+  WFI_MCU_B_OFFS_MON_COLD:
+    units: K
+    depends_on: [WFI_MCU_B_BOARD_T_RAW]
+    inputs:
+      A13: WFI_MCU_B_ANALOG_13
+      BT_RAW: WFI_MCU_B_BOARD_T_RAW
+    formula: >
+      3.16036130242238e-09 *
+        (A13 - (0.277749632384719*BT_RAW + 4413.90450011856))**2
+      + 0.00594743523581407 *
+        (A13 - (0.277749632384719*BT_RAW + 4413.90450011856))
+      + 994.53482485982
+
+  WFI_MCU_B_OFFS_MON_MID:
+    units: K
+    depends_on: [WFI_MCU_B_BOARD_T_RAW]
+    inputs:
+      A14: WFI_MCU_B_ANALOG_14
+      BT_RAW: WFI_MCU_B_BOARD_T_RAW
+    formula: >
+      1.45681520851788e-08 *
+        (A14 - (0.127769679733178*BT_RAW + 2019.81690451373))**2
+      + 0.013022887491986 *
+        (A14 - (0.127769679733178*BT_RAW + 2019.81690451373))
+      + 1508.54284027266
+
+  WFI_MCU_B_OFFS_MON_WARM:
+    units: K
+    depends_on: [WFI_MCU_B_BOARD_T_RAW]
+    inputs:
+      A15: WFI_MCU_B_ANALOG_15
+      BT_RAW: WFI_MCU_B_BOARD_T_RAW
+    formula: >
+      3.03799033909641e-08 *
+        (A15 - (0.118539252278035*BT_RAW + 1869.19323238329))**2
+      + 0.0147158206514635 *
+        (A15 - (0.118539252278035*BT_RAW + 1869.19323238329))
+      + 2111.05243471556
+
+  # ===================================================================
+  # WTSC primary (P) Kelvin conversions   [ T_K = T_C + 273.15 ]
+  # Grouped by CSV Component (comments only; YAML is a flat dict here).
+  # ===================================================================
+
+  # ---------- CPR ----------
+  WFI_CPR_PX_ALBEMET_WTSC00P_K:              # CPR +X Albemet
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC00P}
+    formula: "T_C + 273.15"
+  WFI_CPR_MX_ALBEMET_WTSC01P_K:              # CPR -X Albemet
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC01P}
+    formula: "T_C + 273.15"
+
+  # ---------- MPR ----------
+  WFI_MPR_CENTER_WTSC02P_K:                  # MPR Center
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC02P}
+    formula: "T_C + 273.15"
+  WFI_MPR_PXPY_BLADE_FLX_WTSC03P_K:          # MPR +X+Y Blade Flexure
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC03P}
+    formula: "T_C + 273.15"
+
+  # ---------- FPE ----------
+  WFI_FPE_PX_WTSC04P_K:                      # FPE +X+Y
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC04P}
+    formula: "T_C + 273.15"
+  WFI_FPE_MX_WTSC05P_K:                      # FPE -X-Y
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC05P}
+    formula: "T_C + 273.15"
+  WFI_FPE_R_WTSC06P_K:                       # FPE-R
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC06P}
+    formula: "T_C + 273.15"
+
+  # ---------- RCS ----------
+  WFI_RCS_R_WTSC07P_K:                       # RCS-R
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC07P}
+    formula: "T_C + 273.15"
+
+  # ---------- sRCSE ----------
+  WFI_SRCSE_PLTF_WTSC08P_K:                  # sRCSE Platform
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC08P}
+    formula: "T_C + 273.15"
+  WFI_SRCSE_SHRD_WTSC09P_K:                  # sRCSE Shroud
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC09P}
+    formula: "T_C + 273.15"
+
+  # ---------- COBA ----------
+  WFI_COBA_WTSC10P_K:                        # COBA near MPA
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC10P}
+    formula: "T_C + 273.15"
+
+  # ---------- Latch ----------
+  WFI_LATCH_C_WTSC11P_K:                     # Latch C Frame
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC11P}
+    formula: "T_C + 273.15"
+  WFI_LATCH_B_WTSC12P_K:                     # Latch B Frame
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC12P}
+    formula: "T_C + 273.15"
+  WFI_LATCH_A_WTSC13P_K:                     # Latch A Frame
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC13P}
+    formula: "T_C + 273.15"
+
+  # ---------- SCEA ----------
+  WFI_SCEA_WTSC14P_K:                        # SCEA
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC14P}
+    formula: "T_C + 273.15"
+
+  # ---------- BCR ----------
+  WFI_BCR_PX_WTSC15P_K:                      # BCR +X  (verify vs CSV)
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC15P}
+    formula: "T_C + 273.15"
+  WFI_BCR_MY_WTSC16P_K:                      # BCR -Y
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC16P}
+    formula: "T_C + 273.15"
+
+  # ---------- ACM ----------
+  WFI_ACM_MY_MP_FLX_WTSC17P_K:               # ACM -Y MP Flexure I/F
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC17P}
+    formula: "T_C + 273.15"
+  WFI_ACM_MY_ACTR_WTSC18P_K:                 # ACM -Y Actuator I/F
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC18P}
+    formula: "T_C + 273.15"
+
+  # ---------- EWA ----------
+  WFI_EWTA_MY_NR_OB_FLX_WTSC19P_K:           # EWTA Outboard near -Y Flexure
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC19P}
+    formula: "T_C + 273.15"
+
+  # ---------- OB ----------
+  WFI_OB_MY_NR_ACM_FLX_WTSC20P_K:            # OB -Y near ACM Flexure
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC20P}
+    formula: "T_C + 273.15"
+  WFI_OB_NR_LATCH_A_WTSC21P_K:               # OB near Latch A (+X)
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC21P}
+    formula: "T_C + 273.15"
+
+  # ---------- Enclosure ----------
+  WFI_ENCL_FRM_NR_LATCH_A_WTSC22P_K:         # Encl Frame near Latch A
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC22P}
+    formula: "T_C + 273.15"
+  WFI_ENCL_FRM_PX_PY_NR_HP_WTSC23P_K:        # Encl Frame near +X+Y HP
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC23P}
+    formula: "T_C + 273.15"
+  WFI_ENCL_CAP_WTSC24P_K:                    # Enclosure Cap
+    units: K
+    inputs: {T_C: CDHA_TCS_WTSC24P}
+    formula: "T_C + 273.15"
+
+
+  WFI_MCE_SRCS_SPHERE_T_K:
+      units: K
+      inputs: {T_C: WFI_MCE_SRCS_SPHERE_T}
+      formula: "T_C + 273.15"
+      depends_on: [WFI_MCE_SRCS_SPHERE_T]
