@@ -8,10 +8,16 @@ data_level) can be used.
 
 Example (program 1047 pass 1, three filters):
 
-    python rgb_sca9_1047_p1.py --sca 7 \\
+    roman-color --sca 7 \\
         --blue  program=1047,pass=1,observation=12,exposure=2 \\
         --green program=1047,pass=1,observation=5,exposure=2  \\
         --red   program=1047,pass=1,observation=9,exposure=2
+
+Full focal plane, saved as stitched uncompressed FITS without DS9:
+
+    roman-color --mosaic --no-ds9 --save-fits --program 1047 --pass 1 \\
+        --blue observation=12,exposure=2 --green observation=5,exposure=2 \\
+        --red observation=9,exposure=2
 """
 from __future__ import annotations
 
@@ -21,17 +27,36 @@ import os
 import sys
 
 import numpy as np
-import pyds9
 from astropy.io import fits
 from astropy.stats import sigma_clipped_stats
-from astropy.wcs import WCS
 from scipy.ndimage import shift as ndi_shift
 from scipy.signal import fftconvolve
 
 from roman_mast import list_data, close_streams
-from roman_fits import stream_materialized, _write_hdulist
+from roman_fits import (
+    stream_materialized, mosaic_grid, stitch_mosaic, write_mosaic_fits,
+    _write_hdulist,
+)
+
+# pyds9 is optional (not a declared dependency) — --no-ds9 / --save-fits /
+# --headless-png must work on machines without DS9. Same guard as roman_fits.
+try:
+    import pyds9
+except ImportError:  # pragma: no cover
+    pyds9 = None
 
 DS9_TARGET = None  # None → pyds9 default; else the XPA target name
+
+
+def _connect_ds9():
+    if pyds9 is None:
+        raise ImportError(
+            "pyds9 is required to push into DS9. Install with `pip install "
+            "pyds9` (and run `ds9 &`), or pass --no-ds9 with --save-fits / "
+            "--headless-png for file output only."
+        )
+    print('[rgb] connecting to DS9 via pyds9', file=sys.stderr)
+    return pyds9.DS9(target=DS9_TARGET) if DS9_TARGET else pyds9.DS9()
 
 # Preferred output layout: mounted shared storage on server nodes. Falls
 # back to CWD-relative if the mount isn't present (e.g. laptop dev).
@@ -340,8 +365,7 @@ def _run_ds9(layers, blue):
     GAIN_SIGMA = {'blue': 30.0, 'green': 25.0, 'red': 20.0}
     LOW_SIGMA = 1.0
 
-    print('[rgb] connecting to DS9 via pyds9', file=sys.stderr)
-    d = pyds9.DS9(target=DS9_TARGET) if DS9_TARGET else pyds9.DS9()
+    d = _connect_ds9()
     d.set('frame delete all')
     d.set('frame new rgb')
     for channel in ('red', 'green', 'blue'):
@@ -433,57 +457,90 @@ def _build_channel_mef(sca_layers, ref_hdrs, channel: str,
     return data
 
 
-def _headless_mosaic_png(sca_layers, limits, ref_hdrs, png_path: str):
-    """Render an RGB PNG of the focal-plane mosaic without DS9.
+def _stitch_channels(sca_layers, limits, ref_hdrs, *, fits_dir=None,
+                     png_path=None, channel_meta=None):
+    """Stitch each channel's per-SCA aligned arrays into one focal-plane image.
 
-    Uses reproject.mosaicking to reproject the 18 per-SCA aligned arrays
-    of each channel onto a single common celestial WCS, applies the same
-    asinh + per-channel limits used in DS9, stacks R/G/B, and saves via
-    matplotlib.
+    All three channels land on the same celestial grid (derived from blue's
+    per-SCA WCS headers). Per channel, optionally:
+      - write the stitched image as plain float32 FITS to
+        `fits_dir/stitched_{channel}.fits` (uncompressed — the DS9 MEFs
+        written by _run_ds9_mosaic are per-SCA tiles, not a single image);
+      - fold it into an RGB PNG (same asinh + per-channel limits as the DS9
+        push) saved to `png_path` via matplotlib, no DS9 needed.
+
+    Channels are processed one at a time and dropped before the next so
+    only one ~0.8 GB full-focal-plane array is resident.
     """
-    from reproject import reproject_interp
-    from reproject.mosaicking import (
-        find_optimal_celestial_wcs, reproject_and_coadd,
-    )
-    import matplotlib.pyplot as plt
+    if fits_dir is None and png_path is None:
+        return
 
     def _asinh_scale(arr, lo, hi):
         # Match DS9's asinh: normalize to [0, 1] then apply asinh stretch.
         x = (arr - lo) / max(hi - lo, 1e-12)
-        x = np.clip(x, 0.0, 1.0)
+        x = np.clip(np.nan_to_num(x, nan=0.0), 0.0, 1.0)
         return np.arcsinh(10.0 * x) / np.arcsinh(10.0)
 
-    # Common WCS built from blue's per-SCA WCS headers.
-    inputs_blue = [(sca_layers[sca]['blue'], WCS(ref_hdrs[sca]))
-                   for sca in sorted(sca_layers)
-                   if 'blue' in sca_layers[sca]]
-    common_wcs, common_shape = find_optimal_celestial_wcs(inputs_blue)
-    print(f'[rgb] headless mosaic grid: shape={common_shape} '
-          f'CRVAL={common_wcs.wcs.crval}', file=sys.stderr)
+    def _tiles(channel):
+        return [(sca_layers[sca][channel], ref_hdrs[sca])
+                for sca in sorted(sca_layers)
+                if channel in sca_layers[sca]]
 
-    rgb = np.zeros((common_shape[0], common_shape[1], 3), dtype=np.float32)
+    # Common grid from blue's tiles; green/red are pixel-aligned to blue
+    # so they share its WCS.
+    common_wcs = common_shape = None
+    rgb = None
     for idx, channel in enumerate(('red', 'green', 'blue')):
-        inputs = [(sca_layers[sca][channel], WCS(ref_hdrs[sca]))
-                  for sca in sorted(sca_layers)
-                  if channel in sca_layers[sca]]
-        mosaic, _ = reproject_and_coadd(
-            inputs, common_wcs, shape_out=common_shape,
-            reproject_function=reproject_interp,
-            combine_function='mean',
+        tiles = _tiles(channel)
+        if not tiles:
+            print(f'[rgb] stitch: no {channel} tiles; skipping',
+                  file=sys.stderr)
+            continue
+        if common_wcs is None:
+            common_wcs, common_shape = mosaic_grid(_tiles('blue') or tiles)
+        print(f'[rgb] stitching {channel} ({len(tiles)} SCAs)',
+              file=sys.stderr)
+        mosaic, _, _, _ = stitch_mosaic(
+            tiles, common_wcs=common_wcs, shape_out=common_shape,
         )
-        lo, hi = limits[channel]
-        rgb[:, :, idx] = _asinh_scale(mosaic, lo, hi)
 
-    # Matplotlib expects sky-north-up. Astropy WCS puts DEC increasing in
-    # array Y; flip vertically so the PNG looks like DS9's default view.
-    rgb = np.flipud(rgb)
-    fig, ax = plt.subplots(figsize=(12, 12), dpi=150)
-    ax.imshow(rgb, origin='upper')
-    ax.set_axis_off()
-    fig.savefig(png_path, bbox_inches='tight', pad_inches=0,
-                facecolor='black')
-    plt.close(fig)
-    print(f'[rgb] wrote headless PNG {png_path}', file=sys.stderr)
+        if fits_dir is not None:
+            extra = {
+                'CHANNEL': (channel, 'RGB channel'),
+                'NTILES': (len(tiles), 'Number of SCA tiles stitched'),
+                'COMBINE': ('mean', 'reproject_and_coadd combine_function'),
+            }
+            meta = (channel_meta or {}).get(channel)
+            if meta:
+                extra['FILTER'] = (meta['filter'], 'Optical element / filter')
+                extra['VISITID'] = (meta['visit_id'], 'Roman visit ID')
+                extra['EXPNUM'] = (meta['exp'], 'Exposure number within visit')
+                extra['OBSNUM'] = (meta['obs'], 'Observation number')
+            write_mosaic_fits(
+                os.path.join(fits_dir, f'stitched_{channel}.fits'),
+                mosaic, common_wcs, extra=extra,
+            )
+
+        if png_path is not None:
+            if rgb is None:
+                rgb = np.zeros((common_shape[0], common_shape[1], 3),
+                               dtype=np.float32)
+            lo, hi = limits[channel]
+            rgb[:, :, idx] = _asinh_scale(mosaic, lo, hi)
+        del mosaic
+
+    if png_path is not None and rgb is not None:
+        import matplotlib.pyplot as plt
+        # Matplotlib expects sky-north-up. Astropy WCS puts DEC increasing
+        # in array Y; flip vertically so the PNG looks like DS9's default.
+        rgb = np.flipud(rgb)
+        fig, ax = plt.subplots(figsize=(12, 12), dpi=150)
+        ax.imshow(rgb, origin='upper')
+        ax.set_axis_off()
+        fig.savefig(png_path, bbox_inches='tight', pad_inches=0,
+                    facecolor='black')
+        plt.close(fig)
+        print(f'[rgb] wrote headless PNG {png_path}', file=sys.stderr)
 
 
 def _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=None,
@@ -499,8 +556,7 @@ def _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=None,
     Optionally also writes the three MEFs to `out_dir/mosaic_{rgb}.fits`
     so downstream tools can inspect them.
     """
-    print(f'[rgb] connecting to DS9 via pyds9', file=sys.stderr)
-    d = pyds9.DS9(target=DS9_TARGET) if DS9_TARGET else pyds9.DS9()
+    d = _connect_ds9()
     d.set('frame delete all')
     d.set('frame new rgb')
 
@@ -568,9 +624,14 @@ def _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=None,
 
 
 def run_mosaic(specs, out_dir, *, workers=8, from_cache=False,
-               save_png=None, headless_png=None):
-    """Stream all 18 SCAs for each of the three channels, align per-SCA, push
-    to DS9 as one RGB frame per SCA."""
+               save_png=None, headless_png=None, save_fits=False,
+               no_ds9=False):
+    """Stream all 18 SCAs for each of the three channels, align per-SCA
+    (blue as pivot), then: write per-SCA aligned FITS, optionally stitch
+    each channel into one full-focal-plane image (`save_fits` → plain FITS,
+    `headless_png` → RGB PNG), and push one WCS-stitched RGB frame into DS9
+    unless `no_ds9`. Stitched products are written before the DS9 push so a
+    missing DS9 can't lose them."""
     import glob as _glob
 
     if from_cache:
@@ -606,10 +667,12 @@ def run_mosaic(specs, out_dir, *, workers=8, from_cache=False,
                 f'--from-cache --mosaic: no aligned FITS found in {out_dir}'
             )
         limits = _stretch_per_channel(pool)
-        _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=out_dir,
-                        save_png=save_png)
-        if headless_png:
-            _headless_mosaic_png(sca_layers, limits, ref_hdrs, headless_png)
+        _stitch_channels(sca_layers, limits, ref_hdrs,
+                         fits_dir=out_dir if save_fits else None,
+                         png_path=headless_png)
+        if not no_ds9:
+            _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=out_dir,
+                            save_png=save_png)
         print(f'[rgb] done (mosaic cache).', file=sys.stderr)
         return
 
@@ -677,10 +740,12 @@ def run_mosaic(specs, out_dir, *, workers=8, from_cache=False,
 
     # One stretch shared across all SCAs so the mosaic looks uniform.
     limits = _stretch_per_channel(pool)
-    _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=out_dir,
-                    save_png=save_png)
-    if headless_png:
-        _headless_mosaic_png(sca_layers, limits, ref_hdrs, headless_png)
+    _stitch_channels(sca_layers, limits, ref_hdrs,
+                     fits_dir=out_dir if save_fits else None,
+                     png_path=headless_png, channel_meta=channel_meta)
+    if not no_ds9:
+        _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=out_dir,
+                        save_png=save_png)
     print(f'[rgb] mosaic done. FITS in {out_dir}', file=sys.stderr)
 
 
@@ -694,8 +759,10 @@ def main():
     ap.add_argument('--mosaic', action='store_true',
                     help='Build the full 18-SCA color mosaic. Streams every '
                          'SCA in each of the three filters, aligns each SCA '
-                         'independently (blue as pivot), and loads 18 RGB '
-                         'frames into DS9 locked by WCS.')
+                         'independently (blue as pivot), writes per-SCA '
+                         'aligned FITS, and loads one WCS-stitched RGB frame '
+                         'into DS9 (unless --no-ds9). Add --save-fits and/or '
+                         '--headless-png for stitched file output.')
     ap.add_argument('--workers', type=int, default=8,
                     help='Concurrent SCA streams per filter (default 8).')
     ap.add_argument('--program', type=int, default=None,
@@ -730,6 +797,15 @@ def main():
                     help='Render a PNG without DS9 via matplotlib. Uses the '
                          'same asinh + per-channel limits as the DS9 push. '
                          'Path is absolute or relative to --out-dir.')
+    ap.add_argument('--save-fits', action='store_true',
+                    help='(--mosaic only) Stitch each channel\'s 18 aligned '
+                         'SCAs into one full-focal-plane image on a common '
+                         'WCS and write it as plain uncompressed float32 '
+                         'FITS: stitched_{red,green,blue}.fits in --out-dir.')
+    ap.add_argument('--no-ds9', action='store_true',
+                    help='(--mosaic only) Skip the DS9 push; use with '
+                         '--save-fits / --headless-png for file output on '
+                         'machines without DS9 or pyds9.')
     args = ap.parse_args()
 
     def _resolve_png_path(p, base):
@@ -768,8 +844,13 @@ def main():
             from_cache=args.from_cache,
             save_png=_resolve_png_path(args.save_png, out_dir),
             headless_png=_resolve_png_path(args.headless_png, out_dir),
+            save_fits=args.save_fits,
+            no_ds9=args.no_ds9,
         )
         return
+
+    if args.save_fits or args.no_ds9:
+        ap.error('--save-fits and --no-ds9 only apply with --mosaic')
 
     sca = args.sca
     out_dir = (os.path.abspath(args.out_dir) if args.out_dir

@@ -21,6 +21,14 @@ Public surface
         exposure. Returns {sca: local_path or None}. Silently returns None
         for SCAs that don't have a catalog on MAST.
 
+    mosaic_grid(tiles) / stitch_mosaic(tiles, common_wcs=None, ...)
+        Derive one celestial grid covering a list of (array, WCS) tiles, and
+        reproject + coadd them onto it as a single full-focal-plane image.
+
+    write_mosaic_fits(path, mosaic, wcs, extra=None, compress=False, ...)
+        Write one stitched mosaic as a plain (uncompressed by default)
+        float32 FITS image with its celestial WCS.
+
 Both are also exposed as convenience methods `DataResults.to_fits()` and
 `DataResults.to_ds9()` in `roman_mast`, which do the stream + output in
 one call.
@@ -468,6 +476,136 @@ def to_fits_files_coadd(
     _log(f"Wrote {written} coadd FITS file(s) in {out_dir}/")
     _log(f"  Open in DS9:  ds9 -mosaic {out_dir}/*.{ext}")
     return out_dir
+
+
+# ---------------------------------------------------------------------------
+# Stitched mosaic — many tiles → one image on a common celestial grid
+# ---------------------------------------------------------------------------
+
+def _wcs_tiles(tiles) -> list:
+    """Normalize [(array, WCS | fits.Header)] → [(float32 array, WCS)]."""
+    from astropy.wcs import WCS
+    out = [
+        (np.asarray(arr, dtype=np.float32),
+         w if isinstance(w, WCS) else WCS(w))
+        for arr, w in tiles
+    ]
+    if not out:
+        raise ValueError("no tiles given")
+    return out
+
+
+def mosaic_grid(tiles) -> tuple:
+    """Return (common_wcs, shape_out): the smallest celestial grid covering
+    every tile. Cheap (no reprojection) — call once, then feed the pair to
+    `stitch_mosaic` for each channel/layer that must share the grid."""
+    from reproject.mosaicking import find_optimal_celestial_wcs
+    common_wcs, shape_out = find_optimal_celestial_wcs(_wcs_tiles(tiles))
+    _log(f"stitch grid: shape={tuple(shape_out)} "
+         f"CRVAL=({common_wcs.wcs.crval[0]:.6f}, "
+         f"{common_wcs.wcs.crval[1]:.6f})")
+    return common_wcs, shape_out
+
+
+def stitch_mosaic(
+    tiles,
+    *,
+    common_wcs=None,
+    shape_out=None,
+    combine_function: str = 'mean',
+) -> tuple:
+    """Reproject `tiles` onto one celestial WCS and coadd them into one image.
+
+    Unlike the per-SCA / per-tile writers above, which keep every detector as
+    its own HDU and let DS9 do the stitching at display time, this produces a
+    single full-focal-plane array — what you want for a plain image on disk.
+
+    Parameters
+    ----------
+    tiles : list of (ndarray, WCS | fits.Header)
+        Input images with their celestial WCS. A FITS header (e.g. the SIP
+        header from `_build_sca_header`) is wrapped with `astropy.wcs.WCS`.
+    common_wcs, shape_out : optional
+        Output grid. Omit both to have `find_optimal_celestial_wcs` derive
+        the smallest grid that covers every tile. Pass the pair returned by
+        a previous call to put several channels on the *same* grid.
+    combine_function : str
+        How overlapping tiles are combined (`reproject_and_coadd` option).
+
+    Returns
+    -------
+    (mosaic, footprint, common_wcs, shape_out)
+        `mosaic` is float32 with NaN where no tile contributed.
+    """
+    # reproject is a declared dependency, but importing it pulls in a lot
+    # (dask, scipy) — keep it off the import path of the plain FITS/DS9 sinks.
+    from reproject import reproject_interp
+    from reproject.mosaicking import reproject_and_coadd
+
+    inputs = _wcs_tiles(tiles)
+    if common_wcs is None or shape_out is None:
+        common_wcs, shape_out = mosaic_grid(inputs)
+
+    mosaic, footprint = reproject_and_coadd(
+        inputs, common_wcs, shape_out=shape_out,
+        reproject_function=reproject_interp,
+        combine_function=combine_function,
+    )
+    mosaic = np.asarray(mosaic, dtype=np.float32)
+    # reproject_and_coadd zero-fills uncovered pixels; NaN is the honest
+    # value there and keeps sigma-clipped stats downstream from seeing a
+    # spurious spike at 0.
+    mosaic[footprint == 0] = np.nan
+    return mosaic, footprint, common_wcs, shape_out
+
+
+def write_mosaic_fits(
+    path: str,
+    mosaic,
+    wcs,
+    *,
+    extra: Optional[dict] = None,
+    compress: bool = False,
+    overwrite: bool = True,
+) -> str:
+    """Write one stitched mosaic to `path` as a float32 FITS image.
+
+    Default is a plain PrimaryHDU — no tile compression — so the file
+    round-trips bit-for-bit and loads in anything that reads FITS.
+    `compress=True` mirrors `to_fits_files` (RICE_1, 256×256 tiles) for
+    the cases where disk space matters more than fidelity.
+
+    Parameters
+    ----------
+    wcs : astropy.wcs.WCS | fits.Header
+        Celestial WCS of `mosaic` (the `common_wcs` from `stitch_mosaic`).
+    extra : dict, optional
+        Additional header cards, ``{KEYWORD: value}`` or
+        ``{KEYWORD: (value, comment)}``.
+    """
+    from astropy.wcs import WCS
+
+    hdr = wcs.to_header() if isinstance(wcs, WCS) else fits.Header(wcs)
+    for key, val in (extra or {}).items():
+        hdr[key] = val
+
+    data = np.asarray(mosaic, dtype=np.float32)
+    if compress:
+        hdul = fits.HDUList([
+            fits.PrimaryHDU(),
+            fits.CompImageHDU(data=data, header=hdr,
+                              compression_type='RICE_1',
+                              tile_shape=(256, 256)),
+        ])
+    else:
+        hdul = fits.HDUList([fits.PrimaryHDU(data=data, header=hdr)])
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    _write_hdulist(hdul, path, overwrite=overwrite)
+    size_mb = os.path.getsize(path) / 1e6
+    _log(f"wrote {path}  ({data.shape[0]}x{data.shape[1]}, {size_mb:.0f} MB, "
+         f"{'RICE_1' if compress else 'uncompressed'})")
+    return path
 
 
 def to_ds9_coadd(
