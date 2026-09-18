@@ -1556,16 +1556,25 @@ def main():
 
         # Parse --exposures spec — values are **filename exposure numbers**
         # (the 4-digit '_NNNN_' field), NOT positions in res.exposures.
+        # Also filter by --visit-id when specified, since the server-side
+        # --exposure filter matches observation_id='*NNNN' across all visits.
         from roman_mast import parse_int_spec as _parse_int
         exp_spec = getattr(args, 'exposures', None)
+        wanted_visit_id = getattr(args, 'visit_id', None) or None
         if not exp_spec or str(exp_spec).strip().lower() in ('all', '*', ''):
-            exp_indices = list(range(1, res.n_exposures + 1))
+            if wanted_visit_id:
+                exp_indices = [i for i, e in enumerate(res.exposures, start=1)
+                               if e.visit_id == str(wanted_visit_id)]
+            else:
+                exp_indices = list(range(1, res.n_exposures + 1))
         else:
             wanted = set(_parse_int(exp_spec))
             exp_indices = []
             matched = set()
             for i, e in enumerate(res.exposures, start=1):
                 if int(e.exposure) in wanted:
+                    if wanted_visit_id and e.visit_id != str(wanted_visit_id):
+                        continue
                     exp_indices.append(i)
                     matched.add(int(e.exposure))
             missing = wanted - matched

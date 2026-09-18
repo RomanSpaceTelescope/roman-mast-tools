@@ -1456,6 +1456,9 @@ Examples:
 
     res = list_data_from_args(args)
 
+    # Sort by exposure start time (ascending)
+    res.exposures.sort(key=lambda e: e.exposure_start_time or '')
+
     if getattr(args, 'pitch_roll', False):
         for exp in res.exposures:
             compute_pitch_roll(exp)
