@@ -27,10 +27,9 @@ Verify the install:
 
 ```bash
 python -c "
-import roman_datamodels, romancal, astroquery, fsspec, matplotlib
+import roman_datamodels, astroquery, fsspec, matplotlib
 from astroquery.mast import MastMissions
 print('roman_datamodels', roman_datamodels.__version__)
-print('romancal        ', romancal.__version__)
 print('astroquery      ', astroquery.__version__)
 print('OK')
 "
@@ -878,7 +877,7 @@ Background mosaics, DS9 displays, and matplotlib plots respect this layout.
 
 **Core**
 - `numpy`, `astropy` — array math, WCS, FITS I/O, tables
-- `roman_datamodels`, `romancal`, `rad` — Roman-specific ASDF schemas and datamodels
+- `roman_datamodels`, `rad` — Roman-specific ASDF schemas and datamodels (`romancal` is deliberately not required: nothing here imports it, and it drags in `romanisim` → `galsim`, which has no Windows build)
 - `asdf` — ASDF file parsing
 - `gwcs` — generalized WCS (Roman ships gwcs per SCA; approximated to SIP)
 - `photutils` — source detection, aperture photometry, background estimation
