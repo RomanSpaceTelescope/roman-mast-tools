@@ -605,7 +605,9 @@ def make_image_mosaic_png(sca_thumbs, out_path, *, title=None, ra=None, dec=None
         if dec is not None:
             line1_info.append(f'DEC: {dec:.6f}°')
         if exp_start is not None:
-            line1_info.append(f'Start: {exp_start}')
+            # Truncate to nearest second (remove microseconds if present)
+            exp_start_str = str(exp_start).split('.')[0]
+            line1_info.append(f'Start: {exp_start_str}')
         if line1_info:
             lines.append('  |  '.join(line1_info))
 
@@ -761,7 +763,14 @@ def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
         )
         ax.add_patch(rect)
         # SCA label just outside the top of the box
-        ax.text(cx_mm, y1 + 0.5, f'WFI{sca_num:02d}',
+        # Lower WFI09 and WFI18 labels by 5 pixels
+        label_offset = 0.5
+        if sca_num in (9, 18):
+            # Convert 5 pixels to data coordinates (mm)
+            # 5 pixels / 300 dpi = 0.01667 inches, need to convert to mm in data coords
+            pixel_to_data = (y_hi - y_lo) / (fig_h * 300)
+            label_offset -= 5 * pixel_to_data
+        ax.text(cx_mm, y1 + label_offset, f'WFI{sca_num:02d}',
                 ha='center', va='bottom', fontsize=7,
                 color='white' if has_data else '#777777',
                 alpha=0.8 if has_data else 0.4,
@@ -786,7 +795,9 @@ def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
         if dec is not None:
             line1_info.append(f'DEC: {dec:.6f}°')
         if exp_start is not None:
-            line1_info.append(f'Start: {exp_start}')
+            # Truncate to nearest second (remove microseconds if present)
+            exp_start_str = str(exp_start).split('.')[0]
+            line1_info.append(f'Start: {exp_start_str}')
         if line1_info:
             lines.append('  |  '.join(line1_info))
 
