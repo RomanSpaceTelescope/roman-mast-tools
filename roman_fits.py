@@ -46,6 +46,43 @@ import roman_datamodels as rdm
 from roman_mast import Exposure, _log, close_streams
 
 
+def _write_hdulist(hdul: fits.HDUList, path: str, *, overwrite: bool = True) -> None:
+    """Write an HDUList to ``path`` as ONE sequential write of the whole file.
+
+    Why not just ``hdul.writeto(path)``?  astropy writes the data section via
+    ``ndarray.tofile()``, which dup()s the file descriptor, fwrite()s through
+    the copy and then fclose()s it *before* astropy writes the FITS padding and
+    closes the original fd.  On a POSIX disk that is harmless.  On an S3 bucket
+    mounted with Mountpoint for Amazon S3 (RES's ``/science-*`` mounts) the
+    close of the dup'd fd is a FUSE ``flush`` that COMPLETES the upload — the
+    object is finalised and every later write/close on the original fd fails
+    with ``[Errno 9] Bad file descriptor``.  Mountpoint also forbids random
+    access, so anything that seeks/rewrites (e.g. checksum rewrites) breaks.
+
+    Serialising to memory and pushing the bytes out with a single open/write/
+    close (the same pattern pandas' ``to_csv`` uses, which works on these
+    mounts) sidesteps all of that.  Cost: one file's worth of RAM (~67 MB per
+    uncompressed SCA).
+    """
+    if os.path.exists(path):
+        if not overwrite:
+            raise FileExistsError(f"{path} exists (overwrite=False)")
+        try:
+            os.remove(path)
+        except PermissionError as exc:
+            # Mountpoint-S3 needs --allow-delete for unlink and --allow-overwrite
+            # for O_TRUNC on an existing key; neither may be enabled on a RES mount.
+            raise PermissionError(
+                f"Cannot replace existing {path}: {exc}. If this is an S3 mount, "
+                "the bucket was mounted without --allow-delete/--allow-overwrite; "
+                "delete the object another way (aws s3 rm) or write to a new name."
+            ) from exc
+    buf = io.BytesIO()
+    hdul.writeto(buf)
+    with open(path, 'wb') as f:
+        f.write(buf.getbuffer())
+
+
 # DQ bit flags sourced from roman_datamodels.dqflags.pixel — populated lazily
 # so import-time failure in the flags module (rare) doesn't break the rest
 # of roman_fits.
@@ -422,7 +459,7 @@ def to_fits_files_coadd(
         else:
             hdul = fits.HDUList([fits.PrimaryHDU(data=data, header=hdr)])
 
-        hdul.writeto(out_path, overwrite=overwrite)
+        _write_hdulist(hdul, out_path, overwrite=overwrite)
         size_mb = os.path.getsize(out_path) / 1e6
         _log(f"  {stem}: wrote {out_path}  "
              f"({data.shape[0]}x{data.shape[1]}, {size_mb:.0f} MB)")
@@ -706,7 +743,7 @@ def to_fits_files(
             hdul = fits.HDUList([fits.PrimaryHDU(data=data, header=hdr)])
 
         out_path = os.path.join(out_dir, f'sca_{scanum:02d}.{ext}')
-        hdul.writeto(out_path, overwrite=overwrite)
+        _write_hdulist(hdul, out_path, overwrite=overwrite)
         size_mb = os.path.getsize(out_path) / 1e6
         _log(f"  SCA {scanum:02d}: wrote {out_path}  "
              f"({data.shape[0]}x{data.shape[1]}, {size_mb:.0f} MB)")
