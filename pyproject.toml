@@ -16,7 +16,6 @@ dependencies = [
     "python-dotenv",
     "requests",
     "roman_datamodels>=1.0.0",
-    "romancal>=1.0.1",
     "rad>=1.0.0",
     "fsspec[s3]",
     "s3fs",

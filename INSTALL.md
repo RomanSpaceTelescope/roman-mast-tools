@@ -3,10 +3,12 @@
 These instructions create a Python environment suitable for running the
 scripts in this repo and the `comm_streaming_example.ipynb` notebook.
 
-The environment installs `romancal`, `roman_datamodels`, `rad`, `fsspec[s3]`,
+The environment installs `roman_datamodels`, `rad`, `fsspec[s3]`,
 `matplotlib`, and a pre-release build of `astroquery` from a specific pull
 request that adds the Roman MAST search/streaming support the tools depend
-on.
+on. `romancal` is intentionally not installed — nothing in this repo imports
+it, and it depends on `romanisim` → `galsim`, which cannot be built on
+Windows.
 
 ## Prerequisites
 
@@ -34,14 +36,30 @@ Then verify the install:
 
 ```bash
 python -c "
-import roman_datamodels, romancal, astroquery, fsspec, matplotlib
+import roman_datamodels, astroquery, fsspec, matplotlib
 from astroquery.mast import MastMissions
 print('roman_datamodels', roman_datamodels.__version__)
-print('romancal        ', romancal.__version__)
 print('astroquery      ', astroquery.__version__)
 print('OK')
 "
 ```
+
+## Windows (miniforge)
+
+`environment.yml` works on Windows as-is once `romancal` is out of the
+picture (see above). If you are on an older checkout that still lists it,
+or `pip install -e .` tries to build `galsim` and fails with
+`ValueError: list.remove(x): x not in list`, install the deps explicitly and
+skip dependency resolution for the editable install:
+
+```powershell
+mamba create -n roman-mast-tools python=3.12 numpy matplotlib astropy tqdm keyring python-dotenv requests s3fs git pip
+mamba activate roman-mast-tools
+pip install "roman_datamodels>=1.0.0" "rad>=1.0.0" "fsspec[s3]" photutils reproject scikit-image astroalign "git+https://github.com/snbianco/astroquery.git@2026.2"
+pip install --no-deps -e .
+```
+
+DS9/XPA is awkward on Windows; use `--to fits` and `--display mpl` there.
 
 ## Alternative: Step-by-step (venv + pip)
 
@@ -98,10 +116,9 @@ and pip; no conda required.
 
    ```bash
    python -c "
-   import roman_datamodels, romancal, astroquery, fsspec, matplotlib
+   import roman_datamodels, astroquery, fsspec, matplotlib
    from astroquery.mast import MastMissions
    print('roman_datamodels', roman_datamodels.__version__)
-   print('romancal        ', romancal.__version__)
    print('astroquery      ', astroquery.__version__)
    print('OK')
    "

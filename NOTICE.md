@@ -23,7 +23,7 @@ respective project for details.
   matplotlib                (Matplotlib License, BSD-style)
   pandas, pyarrow           (BSD-3-Clause / Apache-2.0)
   roman_datamodels,
-      romancal, rad, gwcs,
+      rad, gwcs,
       asdf                  (BSD-3-Clause; Space Telescope Science
                              Institute)
   astroquery                (BSD-3-Clause)

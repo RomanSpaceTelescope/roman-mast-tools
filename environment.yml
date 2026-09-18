@@ -11,12 +11,12 @@ dependencies:
   - python-dotenv
   - requests
   - pip
+  - git   # needed for the git+https astroquery install below (not on PATH by default on Windows)
   - s3fs
   # astroquery is intentionally NOT pulled from conda-forge — the pip
   # section below installs it from an unreleased PR that adds the Roman
   # MAST streaming support the tools depend on.
   - pip:
-      - romancal>=1.0.1
       - roman_datamodels>=1.0.0
       - rad>=1.0.0
       - git+https://github.com/snbianco/astroquery.git@2026.2
