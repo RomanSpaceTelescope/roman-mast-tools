@@ -47,7 +47,7 @@ This installs the following command-line tools:
 | `roman-metadata` | Export per-SCA ASDF metadata to CSV |
 | `roman-view-sca` | Stream and visualize a single SCA (DS9 or matplotlib) |
 | `roman-phot` | Batch aperture photometry across all SCAs of an exposure |
-| `roman-color` | Build an RGB composite of one SCA from three filters and display it in DS9 |
+| `roman-color` | Build an RGB composite of one SCA or the full focal plane from three filters; display in DS9 and/or save a PNG |
 | `roman-telem` | Query Roman telemetry mnemonics from the MAST Engineering DB |
 | `roman-telem-plot` | Plot telemetry CSV/Parquet with optional grouping |
 
@@ -476,12 +476,13 @@ rows = extract_rows(af_dict, res.select(1))
 
 ---
 
-## `roman-color` — RGB Composite of One SCA in DS9
+## `roman-color` — RGB Composite of One SCA (or the Focal Plane) in DS9 / PNG
 
 Builds an RGB composite from three exposures (one per filter) of the same
 SCA, aligns them in pixel space, writes the aligned FITS files to disk,
 and pushes the trio into DS9 as an RGB frame with auto-computed asinh
-limits per channel.
+limits per channel. `--save-png` writes the same composite to a PNG with
+matplotlib, whether or not DS9 is running; `--no-ds9` skips DS9 entirely.
 
 Because Roman commissioning WCS isn't fully calibrated yet, alignment is
 done in **raw pixel space** (not WCS reprojection): the three exposures
@@ -506,7 +507,15 @@ roman-color --sca 3 --program 1047 --pass 1 \
     --red   filter=F184,exposure=2
 
 # Or by observation number, still inheriting the global program/pass.
-roman-color --sca 7 --program 1047 --pass 1 \
+# --save-png also writes rgb_sca07.png into --out-dir (give it a path to
+# choose the name). DS9 is optional: without it you still get the PNG.
+roman-color --sca 7 --program 1047 --pass 1 --save-png \
+    --blue  observation=12,exposure=2 \
+    --green observation=5,exposure=2 \
+    --red   observation=9,exposure=2
+
+# PNG only, no DS9 at all (batch jobs, machines without pyds9).
+roman-color --sca 7 --program 1047 --pass 1 --no-ds9 --save-png sca07.png \
     --blue  observation=12,exposure=2 \
     --green observation=5,exposure=2 \
     --red   observation=9,exposure=2
@@ -535,7 +544,8 @@ roman-color --mosaic --program 1047 --pass 1 --workers 8 \
     --red   filter=F184,exposure=2
 
 # --mosaic --from-cache re-uses the 54 aligned FITS without re-streaming.
-roman-color --mosaic --program 1047 --pass 1 --from-cache \
+# --save-png writes rgb_mosaic.png (focal-plane layout) next to them.
+roman-color --mosaic --program 1047 --pass 1 --from-cache --save-png \
     --blue  filter=F087,exposure=2 \
     --green filter=F129,exposure=2 \
     --red   filter=F184,exposure=2
@@ -574,17 +584,24 @@ roman-color --mosaic --program 1047 --pass 1 --from-cache \
    (`{channel}_obs{OO}_exp{NN}_{filter}_sca{SS}.fits`) in `--out-dir`
    (default `rgb_sca{NN}/`), all sharing blue's WCS header. These are
    the artifacts you keep for offline band-ratio experiments.
-9. **Push to DS9 via pyds9.** `frame new rgb`, then for each channel
-   pipes the in-memory FITS bytes to `rgb channel <c>` + `fits`, and
-   sets an auto-computed asinh stretch:
+9. **Save a PNG (`--save-png [PATH]`).** Renders the three aligned
+   layers with matplotlib using the auto-computed asinh stretch:
    `limits = [median − 1σ, median + gain·σ]` where
    `gain = {blue: 30, green: 25, red: 20}` — F184 gets pushed harder to
    compensate for its lower throughput and keep the composite from
-   going blue-dominated.
+   going blue-dominated. With no PATH the file is `rgb_sca{NN}.png` in
+   `--out-dir`; a relative PATH goes under `--out-dir`.
+10. **Push to DS9 via pyds9** (skipped with `--no-ds9`). `frame new rgb`,
+    then for each channel pipes the in-memory FITS bytes to
+    `rgb channel <c>` + `fits` and sets the same asinh limits. If DS9 is
+    unavailable (no pyds9, not running, no display) and a PNG was
+    requested, the run logs a warning and exits cleanly; the PNG was
+    already written in step 9.
 
 `--from-cache` skips steps 2–8 entirely: reads the three FITS from disk
 (glob-matches by channel + SCA if the exact filename doesn't hit) and
-jumps to the DS9 push. The alignment was baked in at cache-write time.
+jumps to the PNG / DS9 steps. The alignment was baked in at cache-write
+time.
 
 ### `--mosaic` mode
 
@@ -610,14 +627,18 @@ jumps to the DS9 push. The alignment was baked in at cache-write time.
    18 SCAs per channel by WCS and combines the three channels into one
    focal-plane color view.
 
-`--headless-png FILE` renders the same three-channel stretch to a PNG with
-matplotlib, no DS9 needed. By default the 18 SCAs are tiled in the fixed
-WFI focal-plane layout (`roman_phot._WFI_SCA_LAYOUT`) with no
-reprojection, so the frame is the physical detector footprint: compact,
-and the same orientation every run. Add `--png-wcs` to instead reproject
-every SCA onto a common north-up celestial grid (the grid `--save-fits`
-writes). That holds three full-focal-plane arrays in RAM and pads the
-frame with the blank corners that come from the roll angle.
+`--save-png [PATH]` renders the same three-channel stretch to a PNG with
+matplotlib before the DS9 push, so it works with or without DS9 (default
+name `rgb_mosaic.png` in `--out-dir`). By default the 18 SCAs are tiled
+in the fixed WFI focal-plane layout (`roman_phot._WFI_SCA_LAYOUT`) with
+no reprojection, so the frame is the physical detector footprint:
+compact, and the same orientation every run. Add `--png-wcs` to instead
+reproject every SCA onto a common north-up celestial grid (the grid
+`--save-fits` writes). That holds three full-focal-plane arrays in RAM
+and pads the frame with the blank corners that come from the roll angle.
+`--no-ds9` skips step 6; if DS9 turns out to be unavailable after
+`--save-png` / `--save-fits` were written, the run warns and exits
+cleanly instead of failing.
 
 `--mosaic --from-cache` reloads the 54 FITS from `--out-dir` and jumps
 straight to step 5 — fastest way to iterate on the stretch after the
@@ -625,7 +646,8 @@ initial run.
 
 ### Tuning the stretch
 
-Per-channel σ-gains live at the top of `_run_ds9` in `roman_color.py`:
+Per-channel σ-gains are module-level constants in `roman_color.py`, shared
+by the DS9 pushes and the PNG renders in both modes:
 
 ```python
 GAIN_SIGMA = {'blue': 30.0, 'green': 25.0, 'red': 20.0}

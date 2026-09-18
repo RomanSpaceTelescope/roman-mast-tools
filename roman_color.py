@@ -1,4 +1,5 @@
-"""Build an RGB composite of one SCA in DS9.
+"""Build an RGB composite of one SCA (or the full focal plane) in DS9 and/or
+as a PNG.
 
 Each RGB channel is specified as a comma-separated key=value list of
 `roman_mast.list_data` filters, plus `exposure=N` to pick which exposure
@@ -13,17 +14,18 @@ Example (program 1047 pass 1, three filters):
         --green program=1047,pass=1,observation=5,exposure=2  \\
         --red   program=1047,pass=1,observation=9,exposure=2
 
-Full focal plane, saved as stitched uncompressed FITS without DS9:
+Same SCA, also saved as a PNG (rgb_sca07.png in the output dir). DS9 is
+optional: if it isn't running you still get the PNG.
 
-    roman-color --mosaic --no-ds9 --save-fits --program 1047 --pass 1 \\
+    roman-color --sca 7 --save-png --program 1047 --pass 1 \\
         --blue observation=12,exposure=2 --green observation=5,exposure=2 \\
         --red observation=9,exposure=2
 
-Full focal plane as a PNG. By default the SCAs are tiled in the fixed WFI
-focal-plane layout (compact, no reprojection); add --png-wcs for a north-up
-reprojected frame instead:
+Full focal plane as a PNG with no DS9 at all. By default the SCAs are tiled
+in the fixed WFI focal-plane layout (compact, no reprojection); add
+--png-wcs for a north-up reprojected frame, --save-fits for stitched FITS:
 
-    roman-color --mosaic --no-ds9 --headless-png mosaic.png --program 1047 \\
+    roman-color --mosaic --no-ds9 --save-png mosaic.png --program 1047 \\
         --pass 1 --blue observation=12,exposure=2 \\
         --green observation=5,exposure=2 --red observation=9,exposure=2
 """
@@ -47,8 +49,8 @@ from roman_fits import (
     _write_hdulist,
 )
 
-# pyds9 is optional (not a declared dependency) — --no-ds9 / --save-fits /
-# --headless-png must work on machines without DS9. Same guard as roman_fits.
+# pyds9 is optional (not a declared dependency) — --no-ds9 / --save-png /
+# --save-fits must work on machines without DS9. Same guard as roman_fits.
 try:
     import pyds9
 except ImportError:  # pragma: no cover
@@ -61,8 +63,8 @@ def _connect_ds9():
     if pyds9 is None:
         raise ImportError(
             "pyds9 is required to push into DS9. Install with `pip install "
-            "pyds9` (and run `ds9 &`), or pass --no-ds9 with --save-fits / "
-            "--headless-png for file output only."
+            "pyds9` (and run `ds9 &`), or pass --no-ds9 with --save-png / "
+            "--save-fits for file output only."
         )
     print('[rgb] connecting to DS9 via pyds9', file=sys.stderr)
     return pyds9.DS9(target=DS9_TARGET) if DS9_TARGET else pyds9.DS9()
@@ -369,11 +371,32 @@ def align_to_ref(raw: np.ndarray, ref_aligned: np.ndarray, *,
     return shifted.astype(np.float32)
 
 
+# Per-channel asinh stretch: limits = [median - LOW_SIGMA*rms,
+# median + GAIN_SIGMA[channel]*rms]. Red (F184) is pushed harder to make up
+# for its lower throughput so the composite doesn't go blue-dominated.
+# Shared by the DS9 pushes and the PNG renders in both modes.
+GAIN_SIGMA = {'blue': 30.0, 'green': 25.0, 'red': 20.0}
+LOW_SIGMA = 1.0
+
+
+def _sca_limits(arr, channel: str, *, tag: str = '') -> tuple[float, float]:
+    """(lo, hi) asinh limits for one channel of one SCA from sigma-clipped
+    stats of its finite pixels. Logs the numbers so DS9 and PNG runs are
+    comparable."""
+    finite = np.isfinite(arr)
+    if finite.any():
+        _, med, std = sigma_clipped_stats(arr[finite])
+    else:
+        med, std = 0.0, 1.0
+    lo = float(med - LOW_SIGMA * std)
+    hi = float(med + GAIN_SIGMA[channel] * std)
+    print(f'[rgb] {tag}{channel}: bkg={med:.4g}  rms={std:.4g}  '
+          f'limits=[{lo:.4g}, {hi:.4g}]  asinh', file=sys.stderr)
+    return lo, hi
+
+
 def _run_ds9(layers, blue):
     """Push the three aligned layers into DS9 as an RGB frame."""
-    GAIN_SIGMA = {'blue': 30.0, 'green': 25.0, 'red': 20.0}
-    LOW_SIGMA = 1.0
-
     d = _connect_ds9()
     d.set('frame delete all')
     d.set('frame new rgb')
@@ -381,22 +404,59 @@ def _run_ds9(layers, blue):
         lyr = layers[channel]
         d.set(f'rgb channel {channel}')
         d.set('fits', _fits_bytes(lyr['aligned'], blue['hdr']))
-
-        arr = lyr['aligned']
-        finite = np.isfinite(arr)
-        if finite.any():
-            _, med, std = sigma_clipped_stats(arr[finite])
-        else:
-            med, std = 0.0, 1.0
-        lo = float(med - LOW_SIGMA * std)
-        hi = float(med + GAIN_SIGMA[channel] * std)
-        print(f'[rgb] {channel}: bkg={med:.4g}  rms={std:.4g}  '
-              f'limits=[{lo:.4g}, {hi:.4g}]  asinh', file=sys.stderr)
+        lo, hi = _sca_limits(lyr['aligned'], channel, tag='ds9 ')
         d.set(f'scale limits {lo} {hi}')
         d.set('scale asinh')
     d.set('rgb channel red')
     d.set('wcs align no')  # image-aligned display; WCS not yet trustworthy
     d.set('zoom to fit')
+
+
+def _sca_png(layers, png_path: str):
+    """Render the three aligned single-SCA layers to an RGB PNG.
+
+    Same per-channel asinh limits as the DS9 push (`_sca_limits`), array
+    row 0 at the bottom like DS9's default display and the mosaic PNGs.
+    Needs only `layers[channel]['aligned']`, so it works for both the
+    streamed and the --from-cache layer dicts.
+    """
+    import matplotlib.pyplot as plt
+    rgb = None
+    for idx, channel in enumerate(('red', 'green', 'blue')):
+        arr = layers[channel]['aligned']
+        lo, hi = _sca_limits(arr, channel, tag='png ')
+        if rgb is None:
+            rgb = np.zeros(arr.shape + (3,), dtype=np.float32)
+        rgb[:, :, idx] = _asinh_scale(arr, lo, hi)
+    rgb = np.flipud(rgb)
+    fig, ax = plt.subplots(figsize=(12, 12), dpi=150)
+    ax.imshow(rgb, origin='upper', interpolation='nearest')
+    ax.set_axis_off()
+    fig.savefig(png_path, bbox_inches='tight', pad_inches=0,
+                facecolor='black')
+    plt.close(fig)
+    print(f'[rgb] wrote PNG {png_path}', file=sys.stderr)
+
+
+def _push_ds9(push, *args, file_outputs: bool, **kwargs) -> bool:
+    """Run a DS9 push (`_run_ds9` / `_run_ds9_mosaic`).
+
+    A missing pyds9, no running DS9, or no display all surface here as an
+    exception. When the user asked for file products (--save-png /
+    --save-fits) those are already on disk by the time we get here, so
+    the run is a success from the file point of view: log a WARNING and
+    return False. With no file outputs requested the exception propagates,
+    because the user asked for DS9 and got nothing.
+    """
+    try:
+        push(*args, **kwargs)
+    except Exception as e:  # pyds9 raises assorted types on XPA failure
+        if not file_outputs:
+            raise
+        print(f'[rgb] WARNING: DS9 push failed ({type(e).__name__}: {e}); '
+              'file outputs were written, continuing.', file=sys.stderr)
+        return False
+    return True
 
 
 ALL_SCAS = list(range(1, 19))
@@ -407,9 +467,8 @@ def _stretch_per_channel(all_arrays_by_channel):
 
     all_arrays_by_channel : {channel: [aligned_ndarray, ...]}
         Concatenated across SCAs, so the mosaic gets a uniform stretch.
+        Uses the module-level GAIN_SIGMA / LOW_SIGMA.
     """
-    GAIN_SIGMA = {'blue': 30.0, 'green': 25.0, 'red': 20.0}
-    LOW_SIGMA = 1.0
     limits = {}
     for channel, arrays in all_arrays_by_channel.items():
         # Sample from every SCA — full stack would be huge. Use every 8th px.
@@ -534,7 +593,7 @@ def _focal_plane_png(sca_layers, limits, png_path, *, decimate=4):
     fig.savefig(png_path, bbox_inches='tight', pad_inches=0,
                 facecolor='black')
     plt.close(fig)
-    print(f'[rgb] wrote headless PNG {png_path} (focal-plane layout, '
+    print(f'[rgb] wrote PNG {png_path} (focal-plane layout, '
           f'{n_tiles} SCAs, canvas {width}x{height} px at decimate='
           f'{decimate})', file=sys.stderr)
 
@@ -623,11 +682,10 @@ def _stitch_channels(sca_layers, limits, ref_hdrs, *, fits_dir=None,
         fig.savefig(png_path, bbox_inches='tight', pad_inches=0,
                     facecolor='black')
         plt.close(fig)
-        print(f'[rgb] wrote headless PNG {png_path}', file=sys.stderr)
+        print(f'[rgb] wrote PNG {png_path} (WCS grid)', file=sys.stderr)
 
 
-def _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=None,
-                    save_png=None):
+def _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=None):
     """Push a single WCS-stitched RGB mosaic into DS9.
 
     Builds three MEFs (one per channel, each holding all 18 SCAs as
@@ -663,59 +721,16 @@ def _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=None,
     d.set('wcs align no')
     d.set('zoom to fit')
 
-    if save_png:
-        # Try a few DS9 save variants — behaviour depends on DS9 version
-        # and whether the DS9 window is realized (some builds fail
-        # `saveimage png` on headless / offscreen setups).
-        import time
-        abs_path = os.path.abspath(save_png)
-        png_dir = os.path.dirname(abs_path) or '.'
-        png_name = os.path.basename(abs_path)
-        os.makedirs(png_dir, exist_ok=True)
-        print(f'[rgb] saving PNG to: {png_name}', file=sys.stderr)
-        print(f'[rgb] full path: {abs_path}', file=sys.stderr)
-        # Give DS9 a moment to finish rendering before we ask for the image.
-        d.set('update now')
-        time.sleep(0.5)
-        variants = [
-            f'saveimage png {abs_path}',
-            f'saveimage {abs_path} png',
-            f'export png {abs_path}',
-            f'export {abs_path} png',
-        ]
-        saved = False
-        for cmd in variants:
-            try:
-                d.set(cmd)
-                if os.path.exists(abs_path) and os.path.getsize(abs_path) > 0:
-                    file_size_mb = os.path.getsize(abs_path) / 1e6
-                    print(f'[rgb] ✓ PNG saved successfully ({file_size_mb:.1f} MB): '
-                          f'{png_name}', file=sys.stderr)
-                    print(f'[rgb] location: {abs_path}', file=sys.stderr)
-                    saved = True
-                    break
-                else:
-                    print(f'[rgb] DS9 `{cmd}` returned OK but no file at '
-                          f'{abs_path}', file=sys.stderr)
-            except Exception as e:
-                print(f'[rgb] DS9 `{cmd}` failed: '
-                      f'{type(e).__name__}: {e}', file=sys.stderr)
-        if not saved:
-            print('[rgb] WARNING: all DS9 saveimage/export variants failed. '
-                  'Use --headless-png for a matplotlib render instead.',
-                  file=sys.stderr)
-
 
 def run_mosaic(specs, out_dir, *, workers=8, from_cache=False,
-               save_png=None, headless_png=None, save_fits=False,
-               no_ds9=False, png_wcs=False):
+               save_png=None, save_fits=False, no_ds9=False, png_wcs=False):
     """Stream all 18 SCAs for each of the three channels, align per-SCA
     (blue as pivot), then: write per-SCA aligned FITS, optionally stitch
     each channel into one full-focal-plane image (`save_fits` → plain FITS,
-    `headless_png` → RGB PNG in the fixed focal-plane layout, or on the
-    common WCS grid when `png_wcs`), and push one WCS-stitched RGB frame
-    into DS9 unless `no_ds9`. Stitched products are written before the DS9
-    push so a missing DS9 can't lose them."""
+    `save_png` → RGB PNG in the fixed focal-plane layout, or on the common
+    WCS grid when `png_wcs`), and push one WCS-stitched RGB frame into DS9
+    unless `no_ds9`. File products are written before the DS9 push, and a
+    DS9 failure after them is a warning, not an error."""
     import glob as _glob
 
     if from_cache:
@@ -753,10 +768,11 @@ def run_mosaic(specs, out_dir, *, workers=8, from_cache=False,
         limits = _stretch_per_channel(pool)
         _stitch_channels(sca_layers, limits, ref_hdrs,
                          fits_dir=out_dir if save_fits else None,
-                         png_path=headless_png, png_wcs=png_wcs)
+                         png_path=save_png, png_wcs=png_wcs)
         if not no_ds9:
-            _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=out_dir,
-                            save_png=save_png)
+            _push_ds9(_run_ds9_mosaic, sca_layers, limits, ref_hdrs,
+                      out_dir=out_dir,
+                      file_outputs=bool(save_png or save_fits))
         print(f'[rgb] done (mosaic cache).', file=sys.stderr)
         return
 
@@ -826,12 +842,17 @@ def run_mosaic(specs, out_dir, *, workers=8, from_cache=False,
     limits = _stretch_per_channel(pool)
     _stitch_channels(sca_layers, limits, ref_hdrs,
                      fits_dir=out_dir if save_fits else None,
-                     png_path=headless_png, channel_meta=channel_meta,
+                     png_path=save_png, channel_meta=channel_meta,
                      png_wcs=png_wcs)
     if not no_ds9:
-        _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=out_dir,
-                        save_png=save_png)
+        _push_ds9(_run_ds9_mosaic, sca_layers, limits, ref_hdrs,
+                  out_dir=out_dir, file_outputs=bool(save_png or save_fits))
     print(f'[rgb] mosaic done. FITS in {out_dir}', file=sys.stderr)
+
+
+# Sentinel for `--save-png` given without a path: main() substitutes a
+# mode-specific default filename inside --out-dir.
+_AUTO_PNG = '__auto__'
 
 
 def main():
@@ -846,8 +867,8 @@ def main():
                          'SCA in each of the three filters, aligns each SCA '
                          'independently (blue as pivot), writes per-SCA '
                          'aligned FITS, and loads one WCS-stitched RGB frame '
-                         'into DS9 (unless --no-ds9). Add --save-fits and/or '
-                         '--headless-png for stitched file output.')
+                         'into DS9 (unless --no-ds9). Add --save-png and/or '
+                         '--save-fits for stitched file output.')
     ap.add_argument('--workers', type=int, default=8,
                     help='Concurrent SCA streams per filter (default 8).')
     ap.add_argument('--program', type=int, default=None,
@@ -869,26 +890,29 @@ def main():
     ap.add_argument('--green', required=True, help='Green-layer spec')
     ap.add_argument('--blue', required=True, help='Blue-layer spec')
     ap.add_argument('--out-dir', default=None,
-                    help='Output directory for aligned FITS '
-                         '(default: rgb_sca<N>)')
+                    help='Output directory for aligned FITS and PNGs. '
+                         'Default: a descriptive p<program>/<pass_exp_'
+                         'filters[_scaNN|_mosaic]> folder under the shared '
+                         'science mount when it exists, else under the '
+                         'current directory.')
     ap.add_argument('--from-cache', action='store_true',
                     help='Skip MAST streaming + alignment; load the aligned '
-                         'FITS files from --out-dir and push to DS9.')
-    ap.add_argument('--save-png', default=None,
-                    help='After loading in DS9, export the current view to '
-                         'PNG via DS9 (WYSIWYG of the DS9 display). Path is '
-                         'either absolute or relative to --out-dir.')
-    ap.add_argument('--headless-png', default=None,
-                    help='Render a PNG without DS9 via matplotlib. Uses the '
-                         'same asinh + per-channel limits as the DS9 push. '
-                         'With --mosaic the 18 SCAs are tiled in the fixed '
-                         'WFI focal-plane layout (no reprojection) unless '
-                         '--png-wcs is given. Path is absolute or relative '
-                         'to --out-dir.')
+                         'FITS files from --out-dir, then save/push as '
+                         'requested.')
+    ap.add_argument('--save-png', nargs='?', const=_AUTO_PNG, default=None,
+                    metavar='PATH',
+                    help='Write an RGB PNG with matplotlib using the same '
+                         'asinh stretch as the DS9 view. Works with or '
+                         'without DS9, in both --sca and --mosaic modes. '
+                         'PATH is absolute or relative to --out-dir; with '
+                         'no PATH it is rgb_sca<NN>.png / rgb_mosaic.png in '
+                         '--out-dir. With --mosaic the 18 SCAs are tiled in '
+                         'the fixed WFI focal-plane layout (no reprojection) '
+                         'unless --png-wcs is given.')
     ap.add_argument('--png-wcs', action='store_true',
-                    help='(--mosaic --headless-png only) Reproject the PNG '
-                         'onto a common north-up celestial grid instead of '
-                         'the fixed focal-plane layout. Holds three '
+                    help='(--mosaic only) With --save-png, reproject the '
+                         'PNG onto a common north-up celestial grid instead '
+                         'of the fixed focal-plane layout. Holds three '
                          'full-focal-plane arrays in RAM and pads the frame '
                          'with blank corners from the roll angle.')
     ap.add_argument('--save-fits', action='store_true',
@@ -897,15 +921,22 @@ def main():
                          'WCS and write it as plain uncompressed float32 '
                          'FITS: stitched_{red,green,blue}.fits in --out-dir.')
     ap.add_argument('--no-ds9', action='store_true',
-                    help='(--mosaic only) Skip the DS9 push; use with '
-                         '--save-fits / --headless-png for file output on '
-                         'machines without DS9 or pyds9.')
+                    help='Skip the DS9 push entirely (both modes). Not '
+                         'required just to get files: if DS9 is unavailable '
+                         'after --save-png / --save-fits were written, the '
+                         'run warns and exits cleanly anyway.')
     args = ap.parse_args()
 
-    def _resolve_png_path(p, base):
+    def _resolve_png_path(p, base, auto_name):
+        """None -> None; the --save-png sentinel -> auto_name in base;
+        relative -> under base; absolute unchanged. Creates the parent."""
         if p is None:
             return None
-        return p if os.path.isabs(p) else os.path.join(base, p)
+        if p == _AUTO_PNG:
+            p = auto_name
+        path = p if os.path.isabs(p) else os.path.join(base, p)
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        return path
 
     if not args.mosaic and args.sca is None:
         ap.error('either --sca N or --mosaic is required')
@@ -936,23 +967,24 @@ def main():
         run_mosaic(
             specs, out_dir, workers=args.workers,
             from_cache=args.from_cache,
-            save_png=_resolve_png_path(args.save_png, out_dir),
-            headless_png=_resolve_png_path(args.headless_png, out_dir),
+            save_png=_resolve_png_path(args.save_png, out_dir,
+                                       'rgb_mosaic.png'),
             save_fits=args.save_fits,
             no_ds9=args.no_ds9,
             png_wcs=args.png_wcs,
         )
         return
 
-    if args.save_fits or args.no_ds9 or args.png_wcs:
-        ap.error('--save-fits, --no-ds9 and --png-wcs only apply with '
-                 '--mosaic')
+    if args.save_fits or args.png_wcs:
+        ap.error('--save-fits and --png-wcs only apply with --mosaic')
 
     sca = args.sca
     out_dir = (os.path.abspath(args.out_dir) if args.out_dir
                else _default_out_dir(_spec_dir_name(specs, sca=sca)))
     os.makedirs(out_dir, exist_ok=True)
     print(f'[rgb] output dir: {out_dir}', file=sys.stderr)
+    png_path = _resolve_png_path(args.save_png, out_dir,
+                                 f'rgb_sca{sca:02d}.png')
 
     layers = {}
 
@@ -990,7 +1022,10 @@ def main():
             layers[channel] = {'aligned': data, 'hdr': hdr,
                                'obs': obs, 'exp': expn, 'filter': filt}
         blue = layers['blue']
-        _run_ds9(layers, blue)
+        if png_path:
+            _sca_png(layers, png_path)
+        if not args.no_ds9:
+            _push_ds9(_run_ds9, layers, blue, file_outputs=bool(png_path))
         print('[rgb] done (cache).', file=sys.stderr)
         return
 
@@ -1019,9 +1054,15 @@ def main():
         path = os.path.join(out_dir, cache_name(channel, lyr, sca))
         write_fits(path, lyr['aligned'], blue['hdr'])
 
-    _run_ds9(layers, blue)
-    print(f'[rgb] done. RGB loaded in DS9. FITS written to {out_dir}',
-          file=sys.stderr)
+    # PNG before DS9, so a missing DS9 can't cost us the file.
+    if png_path:
+        _sca_png(layers, png_path)
+    pushed = False
+    if not args.no_ds9:
+        pushed = _push_ds9(_run_ds9, layers, blue,
+                           file_outputs=bool(png_path))
+    print(f'[rgb] done. FITS written to {out_dir}'
+          f'{". RGB loaded in DS9" if pushed else ""}', file=sys.stderr)
 
 
 if __name__ == '__main__':
