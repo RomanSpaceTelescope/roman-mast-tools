@@ -530,7 +530,11 @@ def _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=None,
         # `saveimage png` on headless / offscreen setups).
         import time
         abs_path = os.path.abspath(save_png)
-        os.makedirs(os.path.dirname(abs_path) or '.', exist_ok=True)
+        png_dir = os.path.dirname(abs_path) or '.'
+        png_name = os.path.basename(abs_path)
+        os.makedirs(png_dir, exist_ok=True)
+        print(f'[rgb] saving PNG to: {png_name}', file=sys.stderr)
+        print(f'[rgb] full path: {abs_path}', file=sys.stderr)
         # Give DS9 a moment to finish rendering before we ask for the image.
         d.set('update now')
         time.sleep(0.5)
@@ -545,8 +549,10 @@ def _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=None,
             try:
                 d.set(cmd)
                 if os.path.exists(abs_path) and os.path.getsize(abs_path) > 0:
-                    print(f'[rgb] wrote DS9 PNG via `{cmd}` → {abs_path}',
-                          file=sys.stderr)
+                    file_size_mb = os.path.getsize(abs_path) / 1e6
+                    print(f'[rgb] ✓ PNG saved successfully ({file_size_mb:.1f} MB): '
+                          f'{png_name}', file=sys.stderr)
+                    print(f'[rgb] location: {abs_path}', file=sys.stderr)
                     saved = True
                     break
                 else:
