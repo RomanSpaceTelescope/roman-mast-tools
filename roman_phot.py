@@ -485,7 +485,8 @@ def background_map_one_sca(data, dq, *, superpixel=512, mask_sigma=1.5,
 
 
 
-def make_image_mosaic_png(sca_thumbs, out_path, *, title=None):
+def make_image_mosaic_png(sca_thumbs, out_path, *, title=None, ra=None, dec=None,
+                          exp_start=None, pitch=None, roll=None):
     """Render a WFI focal-plane image mosaic from decimated SCA thumbnails.
 
     Parameters
@@ -496,10 +497,25 @@ def make_image_mosaic_png(sca_thumbs, out_path, *, title=None):
         Destination PNG path.
     title : str or None
         Figure title.
+    ra : float or None
+        Right Ascension in degrees.
+    dec : float or None
+        Declination in degrees.
+    exp_start : str or None
+        Exposure start time.
+    pitch : float or None
+        Sun-relative pitch angle in degrees.
+    roll : float or None
+        Off-normal roll angle in degrees.
     """
     import matplotlib.pyplot as plt
+    import matplotlib.cm as cm
     from matplotlib.patches import Rectangle
     from astropy.visualization import simple_norm
+
+    # Set Times font globally for this plot
+    plt.rcParams['font.family'] = 'serif'
+    plt.rcParams['font.serif'] = ['Times New Roman', 'Times', 'DejaVu Serif']
 
     thumbs = {k: v for k, v in sca_thumbs.items() if v is not None}
     if not thumbs:
@@ -525,7 +541,8 @@ def make_image_mosaic_png(sca_thumbs, out_path, *, title=None):
     fig_h = fig_w / aspect
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor='#1a1a1a')
     ax.set_facecolor('#1a1a1a')
-    ax.set_xlim(x_lo, x_hi)
+    # Flip horizontal axis: positive RA goes left (East on sky)
+    ax.set_xlim(x_hi, x_lo)
     ax.set_ylim(y_lo, y_hi)
     ax.set_aspect('equal')
     ax.set_xticks([])
@@ -541,10 +558,12 @@ def make_image_mosaic_png(sca_thumbs, out_path, *, title=None):
         y1 = cy_mm + half
 
         if has_data:
+            # Flip left-right and top-bottom to correct orientation
+            tile = np.fliplr(np.flipud(tile))
             if rot == 180.0:
                 tile = np.rot90(tile, 2)
             ax.imshow(tile, extent=[x0, x1, y0, y1],
-                      origin='upper', cmap='gray', norm=norm,
+                      origin='upper', cmap='viridis', norm=norm,
                       interpolation='nearest', aspect='auto')
 
         rect = Rectangle(
@@ -554,14 +573,60 @@ def make_image_mosaic_png(sca_thumbs, out_path, *, title=None):
             facecolor='none',
         )
         ax.add_patch(rect)
-        # SCA label above the active area
-        ax.text(cx_mm, y1 + 1.5, f'SCA {sca_num:02d}',
+        # SCA label just outside the top of the box
+        ax.text(cx_mm, y1 + 0.5, f'WFI{sca_num:02d}',
                 ha='center', va='bottom', fontsize=7,
                 color='#888888' if has_data else '#555555',
                 fontweight='bold')
 
-    ax.set_title(title or 'Roman WFI — image mosaic (::2)',
-                 color='white', fontsize=12, pad=10)
+    # Add colorbar inside the plot area
+    sm = cm.ScalarMappable(norm=norm, cmap='viridis')
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.02, pad=0.02, location='right')
+    cbar.set_label('DN/s', color='white', fontsize=10)
+    cbar.ax.yaxis.set_tick_params(color='white')
+    plt.setp(cbar.ax.yaxis.get_ticklabels(), color='white')
+
+    # Title inside the plot area, lowered by ~100 pixels
+    # Convert 100 pixels to data coordinates (approximate)
+    fig_dpi = 300
+    fig_height_inches = fig_h
+    y_range = y_hi - y_lo
+    offset_data = 100 / fig_dpi * y_range / fig_height_inches
+
+    # Build title with RA, DEC, exp_start on first line, pitch/roll on second
+    title_text = title or 'Roman WFI'
+    lines = []
+
+    # First line: RA, DEC, exp_start
+    if ra is not None or dec is not None or exp_start is not None:
+        line1_info = []
+        if ra is not None:
+            line1_info.append(f'RA: {ra:.6f}°')
+        if dec is not None:
+            line1_info.append(f'DEC: {dec:.6f}°')
+        if exp_start is not None:
+            line1_info.append(f'Start: {exp_start}')
+        if line1_info:
+            lines.append('  |  '.join(line1_info))
+
+    # Second line: pitch, roll
+    if pitch is not None or roll is not None:
+        line2_info = []
+        if pitch is not None:
+            line2_info.append(f'Pitch: {pitch:.3f}°')
+        if roll is not None:
+            line2_info.append(f'Roll: {roll:.3f}°')
+        if line2_info:
+            lines.append('  |  '.join(line2_info))
+
+    if lines:
+        title_text += '\n' + '\n'.join(lines)
+
+    ax.text(0.5 * (x_hi + x_lo), y_hi - offset_data,
+            title_text,
+            color='white', fontsize=12, ha='center', va='top',
+            transform=ax.transData, family='serif')
+
     ax.axis('off')
     fig.tight_layout()
     fig.savefig(out_path, dpi=300, facecolor=fig.get_facecolor())
@@ -570,7 +635,8 @@ def make_image_mosaic_png(sca_thumbs, out_path, *, title=None):
 
 
 def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
-                        pct_lo=2, pct_hi=98, stretch_mode='symmetric'):
+                        pct_lo=2, pct_hi=98, stretch_mode='symmetric',
+                        ra=None, dec=None, exp_start=None, pitch=None, roll=None):
     """Render a WFI focal-plane background mosaic and save to a PNG.
 
     Parameters
@@ -588,11 +654,25 @@ def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
     stretch_mode : str
         'symmetric' (default): symmetric around zero, diverging colormap.
         'percentile': stretch from pct_lo to pct_hi percentiles, sequential colormap.
+    ra : float or None
+        Right Ascension in degrees.
+    dec : float or None
+        Declination in degrees.
+    exp_start : str or None
+        Exposure start time.
+    pitch : float or None
+        Sun-relative pitch angle in degrees.
+    roll : float or None
+        Off-normal roll angle in degrees.
     """
     import matplotlib.pyplot as plt
     import matplotlib.cm as cm
     import matplotlib.colors as mcolors
     from matplotlib.patches import Rectangle
+
+    # Set Times font globally for this plot
+    plt.rcParams['font.family'] = 'serif'
+    plt.rcParams['font.serif'] = ['Times New Roman', 'Times', 'DejaVu Serif']
 
     # Physical size of one superpixel in focal-plane mm
     sp_mm = superpixel * _ROMAN_PIXEL_SCALE_MM   # e.g. 512 × 0.01 = 5.12 mm
@@ -633,10 +713,10 @@ def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
         cmap = 'viridis'
         cbar_label = 'Background level (DN/s)'
     else:
-        # Symmetric around zero (diverging)
+        # Symmetric around zero (viridis)
         abs_lim = max(abs(np.percentile(all_vals, pct_lo)), abs(np.percentile(all_vals, pct_hi)))
         norm = mcolors.Normalize(vmin=-abs_lim, vmax=abs_lim)
-        cmap = 'RdBu_r'
+        cmap = 'viridis'
         cbar_label = 'Background residual (DN/s)'
 
     aspect = (x_hi - x_lo) / (y_hi - y_lo)
@@ -644,7 +724,8 @@ def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
     fig_h = fig_w / aspect
     fig, ax = plt.subplots(figsize=(fig_w, fig_h), facecolor='#1a1a1a')
     ax.set_facecolor('#1a1a1a')
-    ax.set_xlim(x_lo, x_hi)
+    # Flip horizontal axis: positive RA goes left (East on sky)
+    ax.set_xlim(x_hi, x_lo)
     ax.set_ylim(y_lo, y_hi)
     ax.set_aspect('equal')
 
@@ -660,6 +741,8 @@ def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
         y1 = cy_mm + half_h_mm
 
         if has_data:
+            # Flip left-right and top-bottom to correct orientation
+            tile = np.fliplr(np.flipud(tile))
             if rot == 180.0:
                 tile = np.rot90(tile, 2)
             # extent=[left, right, bottom, top]; origin='upper' maps row 0 to top
@@ -677,21 +760,60 @@ def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
             alpha=0.8 if has_data else 0.4,
         )
         ax.add_patch(rect)
-        # SCA label above the active area
-        ax.text(cx_mm, y1 + 1.5, f'SCA {sca_num:02d}',
+        # SCA label just outside the top of the box
+        ax.text(cx_mm, y1 + 0.5, f'WFI{sca_num:02d}',
                 ha='center', va='bottom', fontsize=7,
                 color='white' if has_data else '#777777',
                 alpha=0.8 if has_data else 0.4,
                 fontweight='bold')
 
     sm = cm.ScalarMappable(norm=norm, cmap=cmap)
-    cbar = fig.colorbar(sm, ax=ax, fraction=0.02, pad=0.02)
-    cbar.set_label(cbar_label, color='white', fontsize=10)
+    cbar = fig.colorbar(sm, ax=ax, fraction=0.02, pad=0.02, location='right')
+    cbar.set_label(cbar_label, color='white', fontsize=10, family='serif')
     cbar.ax.yaxis.set_tick_params(color='white')
-    plt.setp(cbar.ax.yaxis.get_ticklabels(), color='white')
+    plt.setp(cbar.ax.yaxis.get_ticklabels(), color='white', family='serif')
 
-    ax.set_title(title or 'Roman WFI — source-masked background mosaic',
-                 color='white', fontsize=12, pad=10)
+    # Build title with RA, DEC, exp_start on first line, pitch/roll on second
+    # Same layout as image mosaic
+    title_text = title or 'Roman WFI'
+    lines = []
+
+    # First line: RA, DEC, exp_start
+    if ra is not None or dec is not None or exp_start is not None:
+        line1_info = []
+        if ra is not None:
+            line1_info.append(f'RA: {ra:.6f}°')
+        if dec is not None:
+            line1_info.append(f'DEC: {dec:.6f}°')
+        if exp_start is not None:
+            line1_info.append(f'Start: {exp_start}')
+        if line1_info:
+            lines.append('  |  '.join(line1_info))
+
+    # Second line: pitch, roll
+    if pitch is not None or roll is not None:
+        line2_info = []
+        if pitch is not None:
+            line2_info.append(f'Pitch: {pitch:.3f}°')
+        if roll is not None:
+            line2_info.append(f'Roll: {roll:.3f}°')
+        if line2_info:
+            lines.append('  |  '.join(line2_info))
+
+    if lines:
+        title_text += '\n' + '\n'.join(lines)
+
+    # Title inside the plot area, lowered by ~100 pixels (same as image mosaic)
+    # Convert 100 pixels to data coordinates
+    fig_dpi = 300
+    fig_height_inches = fig_h
+    y_range = y_hi - y_lo
+    offset_data = 100 / fig_dpi * y_range / fig_height_inches
+    ax.text(0.5 * (x_hi + x_lo), y_hi - offset_data,
+            title_text,
+            color='white', fontsize=12, ha='center', va='top',
+            transform=ax.transData, family='serif')
+
     ax.axis('off')
     fig.tight_layout()
     fig.savefig(out_path, dpi=300, facecolor=fig.get_facecolor())
@@ -699,7 +821,8 @@ def make_bkg_mosaic_png(sca_maps, out_path, *, superpixel=512, title=None,
     print(f'[roman_phot] background mosaic -> {out_path}', file=sys.stderr)
 
 
-def make_source_dot_mosaic_png(sources_csv_path, out_path, *, title=None):
+def make_source_dot_mosaic_png(sources_csv_path, out_path, *, title=None,
+                                ra=None, dec=None, exp_start=None, pitch=None, roll=None):
     """Render all detected sources as dots in the WFI focal-plane layout.
 
     Parameters
@@ -711,10 +834,24 @@ def make_source_dot_mosaic_png(sources_csv_path, out_path, *, title=None):
         Destination PNG path.
     title : str or None
         Figure title.
+    ra : float or None
+        Right Ascension in degrees.
+    dec : float or None
+        Declination in degrees.
+    exp_start : str or None
+        Exposure start time.
+    pitch : float or None
+        Sun-relative pitch angle in degrees.
+    roll : float or None
+        Off-normal roll angle in degrees.
     """
     import matplotlib.pyplot as plt
     from matplotlib.patches import Rectangle
     from astropy.table import Table
+
+    # Set Times font globally for this plot
+    plt.rcParams['font.family'] = 'serif'
+    plt.rcParams['font.serif'] = ['Times New Roman', 'Times', 'DejaVu Serif']
 
     try:
         sources = Table.read(sources_csv_path, format='ascii.csv')
@@ -767,14 +904,12 @@ def make_source_dot_mosaic_png(sources_csv_path, out_path, *, title=None):
         if has_data:
             x_pix = np.asarray(sources['x_centroid'][mask], dtype=float)
             y_pix = np.asarray(sources['y_centroid'][mask], dtype=float)
-            # Convert science pixel coords to focal-plane mm.
-            # origin='upper' convention: col 0 → x0, row 0 → y1 (top).
+            # Convert science pixel coords to focal-plane mm, flipping to match corrected orientation
             offset_x = (x_pix + _ROMAN_REF_PIX + 0.5) * _ROMAN_PIXEL_SCALE_MM
             offset_y = (y_pix + _ROMAN_REF_PIX + 0.5) * _ROMAN_PIXEL_SCALE_MM
-            # Note: rotation is now handled by WCS in the image data itself,
-            # so we don't need to apply it to source positions here
-            x_fp = cx_mm + (offset_x - half)
-            y_fp = cy_mm - (offset_y - half)
+            # Flip both x and y to match the fliplr(flipud()) applied to images
+            x_fp = cx_mm - (offset_x - half)
+            y_fp = cy_mm + (offset_y - half)
             ax.scatter(x_fp, y_fp, s=0.5, c='#ffdd88', alpha=0.6,
                        linewidths=0, rasterized=True)
 
@@ -786,15 +921,43 @@ def make_source_dot_mosaic_png(sources_csv_path, out_path, *, title=None):
             alpha=0.8 if has_data else 0.4,
         )
         ax.add_patch(rect)
-        # SCA label above the active area
-        ax.text(cx_mm, y1 + 1.5, f'SCA {sca_num:02d}',
+        # SCA label just outside the top of the box
+        ax.text(cx_mm, y1 + 0.5, f'WFI{sca_num:02d}',
                 ha='center', va='bottom', fontsize=7,
                 color='white' if has_data else '#777777',
                 alpha=0.8 if has_data else 0.4,
                 fontweight='bold')
 
-    ax.set_title(title or f'Roman WFI — sources  ({len(sources):,} total)',
-                 color='white', fontsize=12, pad=10)
+    # Build title with RA, DEC, exp_start on first line, pitch/roll on second
+    title_text = title or f'Roman WFI — sources  ({len(sources):,} total)'
+    lines = []
+
+    # First line: RA, DEC, exp_start
+    if ra is not None or dec is not None or exp_start is not None:
+        line1_info = []
+        if ra is not None:
+            line1_info.append(f'RA: {ra:.6f}°')
+        if dec is not None:
+            line1_info.append(f'DEC: {dec:.6f}°')
+        if exp_start is not None:
+            line1_info.append(f'Start: {exp_start}')
+        if line1_info:
+            lines.append('  |  '.join(line1_info))
+
+    # Second line: pitch, roll
+    if pitch is not None or roll is not None:
+        line2_info = []
+        if pitch is not None:
+            line2_info.append(f'Pitch: {pitch:.3f}°')
+        if roll is not None:
+            line2_info.append(f'Roll: {roll:.3f}°')
+        if line2_info:
+            lines.append('  |  '.join(line2_info))
+
+    if lines:
+        title_text += '\n' + '\n'.join(lines)
+
+    ax.set_title(title_text, color='white', fontsize=12, pad=10, family='serif')
     ax.axis('off')
     fig.tight_layout()
     fig.savefig(out_path, dpi=300, facecolor=fig.get_facecolor())
@@ -1323,7 +1486,8 @@ def make_histograms_from_csv(csv_path, output_path, columns=None, bins=30, outli
 # CLI
 # ---------------------------------------------------------------------------
 
-def _run_phot_results(args, results, *, exp_label, exp_title, out_dir, p):
+def _run_phot_results(args, results, *, exp_label, exp_title, out_dir, p,
+                      ra=None, dec=None, exp_start=None, pitch=None, roll=None):
     """Write CSV/PNG outputs from a completed photometry results list.
 
     Shared by both the MAST and URI-file code paths so the output logic
@@ -1359,6 +1523,9 @@ def _run_phot_results(args, results, *, exp_label, exp_title, out_dir, p):
         print(f'[roman_phot] summary ({len(summary)} SCAs) -> {p("summary.csv")}',
               file=sys.stderr)
 
+    # Metadata to pass to mosaic functions
+    meta_kwargs = dict(ra=ra, dec=dec, exp_start=exp_start, pitch=pitch, roll=roll)
+
     mosaic_tasks = []
     sca_maps = {}
     if args.bkg_mosaic:
@@ -1367,23 +1534,27 @@ def _run_phot_results(args, results, *, exp_label, exp_title, out_dir, p):
         save_mosaic_data(sca_maps, sca_maps_full, p('mosaic_data.npz'))
         mosaic_tasks.append((make_bkg_mosaic_png, (sca_maps, p('bkg_mosaic.png')),
                              dict(superpixel=args.bkg_superpixel,
-                                  title=f'{exp_title} — background mosaic')))
+                                  title=exp_title,
+                                  **meta_kwargs)))
 
         # Full focal-plane fitted background mosaic at fine resolution
         mosaic_tasks.append((make_bkg_mosaic_png, (sca_maps_full, p('bkg_mosaic_full.png')),
                              dict(superpixel=args.bkg_superpixel_full,
                                   stretch_mode='percentile',
-                                  title=f'{exp_title} — background mosaic (full)')))
+                                  title=exp_title,
+                                  **meta_kwargs)))
 
         if tables:
             mosaic_tasks.append((make_source_dot_mosaic_png,
                                  (p('sources.csv'), p('source_mosaic.png')),
-                                 dict(title=f'{exp_title} — sources')))
+                                 dict(title=exp_title,
+                                      **meta_kwargs)))
 
     if args.image_mosaic:
         sca_thumbs = {r['sca']: r['thumb'] for r in results}
         mosaic_tasks.append((make_image_mosaic_png, (sca_thumbs, p('image_mosaic.png')),
-                             dict(title=f'{exp_title} — image mosaic')))
+                             dict(title=exp_title,
+                                  **meta_kwargs)))
 
     if mosaic_tasks:
         import multiprocessing
@@ -1653,10 +1824,23 @@ def main():
                     max_workers=args.workers,
                     image_mosaic=args.image_mosaic,
                 )
+
+                # Compute pitch/roll if roman_opup_tools is available
+                pitch_deg, roll_deg = None, None
+                try:
+                    from roman_mast import compute_pitch_roll
+                    pitch_deg, roll_deg = compute_pitch_roll(exp)
+                except (ImportError, Exception) as e:
+                    print(f'[roman_phot] WARNING: could not compute pitch/roll: {e}',
+                          file=sys.stderr)
+
                 _run_phot_results(
                     args, results,
                     exp_label=exp_label, exp_title=exp_title,
                     out_dir=out_dir, p=p,
+                    ra=exp.ra_v1, dec=exp.dec_v1,
+                    exp_start=str(exp.exposure_start_time) if exp.exposure_start_time else None,
+                    pitch=pitch_deg, roll=roll_deg,
                 )
             finally:
                 from roman_mast import close_streams
@@ -1736,73 +1920,13 @@ def main():
                             max_workers=args.workers,
                             image_mosaic=args.image_mosaic)
 
-    if not results:
-        sys.exit('[roman_phot] ERROR: no SCAs completed successfully')
-
-    # Per-SCA CSVs
-    if args.per_sca:
-        for r in results:
-            if r['table'] is not None and len(r['table']) > 0:
-                path = p(f'sca{r["sca"]:02d}.csv')
-                r['table'].write(path, format='ascii.csv', overwrite=True)
-                print(f'[roman_phot] wrote {path}', file=sys.stderr)
-
-    # Combined per-source CSV
-    tables = [r['table'] for r in results if r['table'] is not None and len(r['table']) > 0]
-    if tables:
-        combined = vstack(tables, metadata_conflicts='silent')
-        combined.write(p('sources.csv'), format='ascii.csv', overwrite=True)
-        print(f'[roman_phot] combined source table ({len(combined)} rows) -> {p("sources.csv")}',
-              file=sys.stderr)
-    else:
-        print('[roman_phot] WARNING: no sources detected in any SCA; combined CSV not written',
-              file=sys.stderr)
-
-    # Per-SCA summary CSV
-    summary = build_summary(results)
-    if len(summary) > 0:
-        summary.write(p('summary.csv'), format='ascii.csv', overwrite=True)
-        print(f'[roman_phot] summary ({len(summary)} SCAs) -> {p("summary.csv")}', file=sys.stderr)
-
-    # Mosaic PNGs — rendered in parallel (each is independent and CPU-bound)
-    mosaic_tasks = []
-    sca_maps = {}
-    if args.bkg_mosaic:
-        sca_maps = {r['sca']: r['bkg_map'] for r in results}
-        sca_maps_full = {r['sca']: r['bkg_map_full'] for r in results}
-        save_mosaic_data(sca_maps, sca_maps_full, p('mosaic_data.npz'))
-        mosaic_tasks.append((make_bkg_mosaic_png, (sca_maps, p('bkg_mosaic.png')),
-                             dict(superpixel=args.bkg_superpixel,
-                                  title=f'{exp_title} — background mosaic')))
-
-        # Full focal-plane fitted background mosaic at fine resolution
-        mosaic_tasks.append((make_bkg_mosaic_png, (sca_maps_full, p('bkg_mosaic_full.png')),
-                             dict(superpixel=args.bkg_superpixel_full,
-                                  stretch_mode='percentile',
-                                  title=f'{exp_title} — background mosaic (full)')))
-
-        if tables:
-            mosaic_tasks.append((make_source_dot_mosaic_png,
-                                 (p('sources.csv'), p('source_mosaic.png')),
-                                 dict(title=f'{exp_title} — sources')))
-
-    if args.image_mosaic:
-        sca_thumbs = {r['sca']: r['thumb'] for r in results}
-        mosaic_tasks.append((make_image_mosaic_png, (sca_thumbs, p('image_mosaic.png')),
-                             dict(title=f'{exp_title} — image mosaic')))
-
-    if mosaic_tasks:
-        import multiprocessing
-        with ProcessPoolExecutor(max_workers=len(mosaic_tasks),
-                                 mp_context=multiprocessing.get_context('fork')) as pool:
-            futs = [pool.submit(fn, *a, **kw) for fn, a, kw in mosaic_tasks]
-            for fut in as_completed(futs):
-                fut.result()  # re-raise any exception
-
-    # Generate histograms
-    if not args.no_hist and tables:
-        make_histograms_from_csv(p('sources.csv'), p('histograms.png'),
-                                 columns=['aperture_sum_0', 'snr'])
+    # URI-file path doesn't have exposure metadata, so all values are None
+    _run_phot_results(
+        args, results,
+        exp_label=exp_label, exp_title=exp_title,
+        out_dir=out_dir, p=p,
+        ra=None, dec=None, exp_start=None, pitch=None, roll=None,
+    )
 
 
 def _register_as_importable():
