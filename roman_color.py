@@ -18,6 +18,14 @@ Full focal plane, saved as stitched uncompressed FITS without DS9:
     roman-color --mosaic --no-ds9 --save-fits --program 1047 --pass 1 \\
         --blue observation=12,exposure=2 --green observation=5,exposure=2 \\
         --red observation=9,exposure=2
+
+Full focal plane as a PNG. By default the SCAs are tiled in the fixed WFI
+focal-plane layout (compact, no reprojection); add --png-wcs for a north-up
+reprojected frame instead:
+
+    roman-color --mosaic --no-ds9 --headless-png mosaic.png --program 1047 \\
+        --pass 1 --blue observation=12,exposure=2 \\
+        --green observation=5,exposure=2 --red observation=9,exposure=2
 """
 from __future__ import annotations
 
@@ -25,6 +33,7 @@ import argparse
 import io
 import os
 import sys
+import warnings
 
 import numpy as np
 from astropy.io import fits
@@ -457,8 +466,81 @@ def _build_channel_mef(sca_layers, ref_hdrs, channel: str,
     return data
 
 
+def _asinh_scale(arr, lo, hi):
+    """Match DS9's asinh: normalize to [0, 1] then apply the asinh stretch."""
+    x = (arr - lo) / max(hi - lo, 1e-12)
+    x = np.clip(np.nan_to_num(x, nan=0.0), 0.0, 1.0)
+    return np.arcsinh(10.0 * x) / np.arcsinh(10.0)
+
+
+def _focal_plane_png(sca_layers, limits, png_path, *, decimate=4):
+    """Render the RGB mosaic in the fixed WFI focal-plane layout (no WCS).
+
+    Each SCA is block-averaged by `decimate`, stretched with the shared
+    per-channel asinh limits, and dropped onto a black canvas at its
+    focal-plane position from `roman_phot._WFI_SCA_LAYOUT`. Nothing is
+    reprojected: the canvas is the physical detector footprint (~266 x
+    165 mm), so the frame has no blank corners from the roll angle, is the
+    same orientation every time (+X focal-plane to the left, +Y up, same
+    convention as roman_phot's mosaics), and peak memory is one decimated
+    tile rather than three full-focal-plane arrays.
+    """
+    from roman_phot import (_WFI_SCA_LAYOUT, _ROMAN_SCA_FULL_SIZE,
+                            _ROMAN_PIXEL_SCALE_MM)
+    import matplotlib.pyplot as plt
+
+    mm_per_px = _ROMAN_PIXEL_SCALE_MM * decimate        # canvas pixel pitch
+    half = _ROMAN_SCA_FULL_SIZE * _ROMAN_PIXEL_SCALE_MM / 2  # 20.48 mm
+    xs = [cx for cx, _, _ in _WFI_SCA_LAYOUT.values()]
+    ys = [cy for _, cy, _ in _WFI_SCA_LAYOUT.values()]
+    x_hi, y_hi = max(xs) + half, max(ys) + half
+    x_lo, y_lo = min(xs) - half, min(ys) - half
+    width = int(np.ceil((x_hi - x_lo) / mm_per_px))
+    height = int(np.ceil((y_hi - y_lo) / mm_per_px))
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+
+    def _block_mean(arr, d):
+        h, w = (arr.shape[0] // d) * d, (arr.shape[1] // d) * d
+        blocks = arr[:h, :w].reshape(h // d, d, w // d, d)
+        with warnings.catch_warnings():
+            # All-NaN blocks (DQ holes) become NaN -> black; no warning.
+            warnings.simplefilter('ignore', RuntimeWarning)
+            return np.nanmean(blocks, axis=(1, 3))
+
+    n_tiles = 0
+    for sca in sorted(sca_layers):
+        cx, cy, _ = _WFI_SCA_LAYOUT[sca]
+        # Canvas column grows toward -X (East-left), row grows toward -Y.
+        # Raw array row 0 lands at the bottom of the tile: the same flipud
+        # the WCS path applies to the whole mosaic.
+        col0 = int(round((x_hi - (cx + half)) / mm_per_px))
+        row0 = int(round((y_hi - (cy + half)) / mm_per_px))
+        for idx, channel in enumerate(('red', 'green', 'blue')):
+            arr = sca_layers[sca].get(channel)
+            if arr is None:
+                continue
+            lo, hi = limits[channel]
+            tile = np.flipud(_asinh_scale(_block_mean(arr, decimate), lo, hi))
+            h, w = tile.shape
+            r1, c1 = min(row0 + h, height), min(col0 + w, width)
+            canvas[row0:r1, col0:c1, idx] = (
+                255 * tile[:r1 - row0, :c1 - col0]).astype(np.uint8)
+        n_tiles += 1
+
+    fig_w = 16.0
+    fig, ax = plt.subplots(figsize=(fig_w, fig_w * height / width), dpi=150)
+    ax.imshow(canvas, origin='upper', interpolation='nearest')
+    ax.set_axis_off()
+    fig.savefig(png_path, bbox_inches='tight', pad_inches=0,
+                facecolor='black')
+    plt.close(fig)
+    print(f'[rgb] wrote headless PNG {png_path} (focal-plane layout, '
+          f'{n_tiles} SCAs, canvas {width}x{height} px at decimate='
+          f'{decimate})', file=sys.stderr)
+
+
 def _stitch_channels(sca_layers, limits, ref_hdrs, *, fits_dir=None,
-                     png_path=None, channel_meta=None):
+                     png_path=None, channel_meta=None, png_wcs=False):
     """Stitch each channel's per-SCA aligned arrays into one focal-plane image.
 
     All three channels land on the same celestial grid (derived from blue's
@@ -467,19 +549,20 @@ def _stitch_channels(sca_layers, limits, ref_hdrs, *, fits_dir=None,
         `fits_dir/stitched_{channel}.fits` (uncompressed — the DS9 MEFs
         written by _run_ds9_mosaic are per-SCA tiles, not a single image);
       - fold it into an RGB PNG (same asinh + per-channel limits as the DS9
-        push) saved to `png_path` via matplotlib, no DS9 needed.
+        push) saved to `png_path` via matplotlib, no DS9 needed. Only when
+        `png_wcs` is set; the default PNG is the fixed focal-plane layout
+        from `_focal_plane_png`, which needs no reprojection.
 
     Channels are processed one at a time and dropped before the next so
     only one ~0.8 GB full-focal-plane array is resident.
     """
+    if png_path is not None and not png_wcs:
+        # Default PNG: fixed focal-plane tiling. Cheap, and no blank corners
+        # from putting a rolled focal plane on a north-up sky grid.
+        _focal_plane_png(sca_layers, limits, png_path)
+        png_path = None
     if fits_dir is None and png_path is None:
         return
-
-    def _asinh_scale(arr, lo, hi):
-        # Match DS9's asinh: normalize to [0, 1] then apply asinh stretch.
-        x = (arr - lo) / max(hi - lo, 1e-12)
-        x = np.clip(np.nan_to_num(x, nan=0.0), 0.0, 1.0)
-        return np.arcsinh(10.0 * x) / np.arcsinh(10.0)
 
     def _tiles(channel):
         return [(sca_layers[sca][channel], ref_hdrs[sca])
@@ -625,13 +708,14 @@ def _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=None,
 
 def run_mosaic(specs, out_dir, *, workers=8, from_cache=False,
                save_png=None, headless_png=None, save_fits=False,
-               no_ds9=False):
+               no_ds9=False, png_wcs=False):
     """Stream all 18 SCAs for each of the three channels, align per-SCA
     (blue as pivot), then: write per-SCA aligned FITS, optionally stitch
     each channel into one full-focal-plane image (`save_fits` → plain FITS,
-    `headless_png` → RGB PNG), and push one WCS-stitched RGB frame into DS9
-    unless `no_ds9`. Stitched products are written before the DS9 push so a
-    missing DS9 can't lose them."""
+    `headless_png` → RGB PNG in the fixed focal-plane layout, or on the
+    common WCS grid when `png_wcs`), and push one WCS-stitched RGB frame
+    into DS9 unless `no_ds9`. Stitched products are written before the DS9
+    push so a missing DS9 can't lose them."""
     import glob as _glob
 
     if from_cache:
@@ -669,7 +753,7 @@ def run_mosaic(specs, out_dir, *, workers=8, from_cache=False,
         limits = _stretch_per_channel(pool)
         _stitch_channels(sca_layers, limits, ref_hdrs,
                          fits_dir=out_dir if save_fits else None,
-                         png_path=headless_png)
+                         png_path=headless_png, png_wcs=png_wcs)
         if not no_ds9:
             _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=out_dir,
                             save_png=save_png)
@@ -742,7 +826,8 @@ def run_mosaic(specs, out_dir, *, workers=8, from_cache=False,
     limits = _stretch_per_channel(pool)
     _stitch_channels(sca_layers, limits, ref_hdrs,
                      fits_dir=out_dir if save_fits else None,
-                     png_path=headless_png, channel_meta=channel_meta)
+                     png_path=headless_png, channel_meta=channel_meta,
+                     png_wcs=png_wcs)
     if not no_ds9:
         _run_ds9_mosaic(sca_layers, limits, ref_hdrs, out_dir=out_dir,
                         save_png=save_png)
@@ -796,7 +881,16 @@ def main():
     ap.add_argument('--headless-png', default=None,
                     help='Render a PNG without DS9 via matplotlib. Uses the '
                          'same asinh + per-channel limits as the DS9 push. '
-                         'Path is absolute or relative to --out-dir.')
+                         'With --mosaic the 18 SCAs are tiled in the fixed '
+                         'WFI focal-plane layout (no reprojection) unless '
+                         '--png-wcs is given. Path is absolute or relative '
+                         'to --out-dir.')
+    ap.add_argument('--png-wcs', action='store_true',
+                    help='(--mosaic --headless-png only) Reproject the PNG '
+                         'onto a common north-up celestial grid instead of '
+                         'the fixed focal-plane layout. Holds three '
+                         'full-focal-plane arrays in RAM and pads the frame '
+                         'with blank corners from the roll angle.')
     ap.add_argument('--save-fits', action='store_true',
                     help='(--mosaic only) Stitch each channel\'s 18 aligned '
                          'SCAs into one full-focal-plane image on a common '
@@ -846,11 +940,13 @@ def main():
             headless_png=_resolve_png_path(args.headless_png, out_dir),
             save_fits=args.save_fits,
             no_ds9=args.no_ds9,
+            png_wcs=args.png_wcs,
         )
         return
 
-    if args.save_fits or args.no_ds9:
-        ap.error('--save-fits and --no-ds9 only apply with --mosaic')
+    if args.save_fits or args.no_ds9 or args.png_wcs:
+        ap.error('--save-fits, --no-ds9 and --png-wcs only apply with '
+                 '--mosaic')
 
     sca = args.sca
     out_dir = (os.path.abspath(args.out_dir) if args.out_dir
