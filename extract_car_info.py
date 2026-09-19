@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
 Script to extract CAR (Commissioning Activity Record) information from RST spreadsheet.
-Extracts: CAR number, CAR name, APT program, start time, and duration.
-Ignores CARs that are crossed out (strikethrough formatting).
+Extracts: CAR number, CAR name, APT program, UTC start time (ISO format), and duration.
+Uses DOY from column E and as-run time from column D.
+Ignores CARs that are crossed out (strikethrough formatting) or contain "analysis".
 """
 
 import pandas as pd
 import openpyxl
+from openpyxl.styles import Font
 import re
 import sys
 from pathlib import Path
+from datetime import datetime, timedelta
 
 def is_strikethrough(cell):
     """Check if a cell has strikethrough formatting."""
@@ -38,23 +41,64 @@ def extract_apt_from_description(description):
         return match.group(1)
     return None
 
-def parse_spreadsheet(filepath):
-    """Parse the RST commissioning spreadsheet and extract CAR information."""
+def extract_doy(doy_time_cell):
+    """Extract DOY from the DOY\nTime cell."""
+    if pd.isna(doy_time_cell):
+        return None
+    
+    doy_time_str = str(doy_time_cell).strip()
+    # Split by newline to get DOY
+    parts = doy_time_str.split('\n')
+    if len(parts) >= 1:
+        doy = parts[0].strip()
+        try:
+            return int(doy)
+        except ValueError:
+            return None
+    return None
 
+def doy_to_iso(doy, time_str, year=2026):
+    """
+    Convert DOY and time to ISO 8601 format.
+    
+    Args:
+        doy: Day of year (1-366)
+        time_str: Time string in HH:MM:SS format
+        year: Year (default 2026)
+    
+    Returns:
+        ISO formatted datetime string (YYYY-MM-DDTHH:MM:SS)
+    """
+    try:
+        # Create a datetime object for Jan 1 of the given year
+        jan_first = datetime(year, 1, 1)
+        # Add the number of days (DOY - 1 because Jan 1 is DOY 1)
+        target_date = jan_first + timedelta(days=int(doy) - 1)
+        
+        # Parse the time
+        time_parts = time_str.split(':')
+        hour = int(time_parts[0])
+        minute = int(time_parts[1])
+        second = int(time_parts[2])
+        
+        # Combine date and time
+        full_datetime = target_date.replace(hour=hour, minute=minute, second=second)
+        
+        # Return ISO format
+        return full_datetime.strftime('%Y-%m-%dT%H:%M:%S')
+    except Exception as e:
+        print(f"Warning: Could not convert DOY {doy} and time {time_str}: {e}")
+        return None
+
+def parse_spreadsheet(filepath, year=2026):
+    """Parse the RST commissioning spreadsheet and extract CAR information."""
+    
     # Load workbook with openpyxl to check formatting
     wb = openpyxl.load_workbook(filepath)
     ws = wb.active
-
+    
     # Also read with pandas for easier data extraction
     df = pd.read_excel(filepath, sheet_name=0)
-    
-    # The data structure appears to be:
-    # Column A (0): CAR ID with name and sometimes duration
-    # Column B (1): Step number
-    # Column C (2): MET
-    # Column D (3): As Run Start Time (UTC)
-    # Column E (4): Duration (HH:MM:SS)
-    # Column F+ : RP, Step Description, etc.
     
     cars = []
     current_car = None
@@ -62,19 +106,25 @@ def parse_spreadsheet(filepath):
     for idx, row in df.iterrows():
         # Excel rows are 1-indexed, and there may be header rows
         excel_row = idx + 2  # Adjust if your spreadsheet has headers
-
-        car_id_cell = row.iloc[0]  # First column
-
+        
+        car_id_cell = row.iloc[0]  # First column (A)
+        
         # Check if this is a new CAR (starts with "CAR-")
         if pd.notna(car_id_cell) and isinstance(car_id_cell, str) and car_id_cell.startswith('CAR-'):
-
+            
             # Check if the cell is crossed out (strikethrough)
             openpyxl_cell = ws.cell(row=excel_row, column=1)
             if is_strikethrough(openpyxl_cell):
                 print(f"Skipping crossed-out CAR at row {excel_row}: {car_id_cell.split(chr(10))[0]}")
                 current_car = None  # Make sure we don't process this CAR
                 continue
-
+            
+            # Check if the CAR contains "analysis" (case-insensitive)
+            if 'analysis' in car_id_cell.lower():
+                print(f"Skipping analysis CAR at row {excel_row}: {car_id_cell.split(chr(10))[0]}")
+                current_car = None
+                continue
+            
             # Extract CAR number from cell (first line)
             lines = car_id_cell.split('\n')
             car_number = lines[0].strip()
@@ -91,9 +141,8 @@ def parse_spreadsheet(filepath):
                 'CAR_Number': car_number,
                 'CAR_Name': car_name,
                 'APT_Program': apt_program,
-                'Start_Time': None,
-                'Duration': duration_from_header,
-                'MET': None
+                'Start_Time_UTC': None,
+                'Duration': duration_from_header
             }
             
         # Check for start time and duration in subsequent row
@@ -103,25 +152,35 @@ def parse_spreadsheet(filepath):
             
             # Look for the first step (usually xxx.0000)
             if pd.notna(step) and isinstance(step, str) and '.0000' in step:
-                # Get MET (column C/2)
-                met = row.iloc[2] if len(row) > 2 else None
-                if pd.notna(met):
-                    current_car['MET'] = str(met).strip()
+                # Column layout:
+                # A (0): CAR ID/Name
+                # B (1): Step
+                # C (2): MET
+                # D (3): As Run Start Time (HH:MM:SS)
+                # E (4): DOY\nTime format
+                # F (5): Duration
                 
-                # Get start time (column D/3)
-                start_time = row.iloc[3] if len(row) > 3 else None
-                if pd.notna(start_time):
-                    current_car['Start_Time'] = str(start_time).strip()
+                # Get DOY from column E (index 4)
+                doy_cell = row.iloc[4] if len(row) > 4 else None
+                doy = extract_doy(doy_cell)
                 
-                # Get duration from row if not already in header (column E/4)
+                # Get as-run time from column D (index 3)
+                as_run_time = row.iloc[3] if len(row) > 3 else None
+                
+                # Combine DOY and as-run time to create ISO format
+                if doy is not None and pd.notna(as_run_time):
+                    as_run_time_str = str(as_run_time).strip()
+                    current_car['Start_Time_UTC'] = doy_to_iso(doy, as_run_time_str, year)
+                
+                # Get duration from column F (index 5) if not already in header
                 if not current_car['Duration']:
-                    duration = row.iloc[4] if len(row) > 4 else None
+                    duration = row.iloc[5] if len(row) > 5 else None
                     if pd.notna(duration):
                         current_car['Duration'] = str(duration).strip()
                 
                 # Try to extract APT from step description if not found in name
-                if not current_car['APT_Program'] and len(row) > 6:
-                    description = row.iloc[6]  # Step description column
+                if not current_car['APT_Program'] and len(row) > 7:
+                    description = row.iloc[7]  # Step description column
                     apt_from_desc = extract_apt_from_description(description)
                     if apt_from_desc:
                         current_car['APT_Program'] = apt_from_desc
@@ -129,7 +188,7 @@ def parse_spreadsheet(filepath):
                 # Add to list and reset
                 cars.append(current_car)
                 current_car = None
-
+    
     wb.close()
     return cars
 
@@ -140,7 +199,7 @@ def format_output_table(cars):
     df = pd.DataFrame(cars)
     
     # Reorder columns
-    column_order = ['CAR_Number', 'CAR_Name', 'APT_Program', 'MET', 'Start_Time', 'Duration']
+    column_order = ['CAR_Number', 'CAR_Name', 'APT_Program', 'Start_Time_UTC', 'Duration']
     df = df[column_order]
     
     # Fill NaN values with empty string for better display
@@ -150,27 +209,40 @@ def format_output_table(cars):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python extract_car_info.py <spreadsheet_file> [output_csv]")
+        print("Usage: python extract_car_info.py <spreadsheet_file> [output_csv] [--year YYYY]")
         print("Example: python extract_car_info.py RST_Commissioning_CAST_AS_RUN.xlsx")
+        print("         python extract_car_info.py RST_Commissioning_CAST_AS_RUN.xlsx output.csv --year 2026")
         sys.exit(1)
     
     input_file = sys.argv[1]
-    output_file = sys.argv[2] if len(sys.argv) > 2 else None
+    output_file = None
+    year = 2026  # Default year
+    
+    # Parse command line arguments
+    i = 2
+    while i < len(sys.argv):
+        if sys.argv[i] == '--year' and i + 1 < len(sys.argv):
+            year = int(sys.argv[i + 1])
+            i += 2
+        else:
+            output_file = sys.argv[i]
+            i += 1
     
     if not Path(input_file).exists():
         print(f"Error: File '{input_file}' not found.")
         sys.exit(1)
     
-    print(f"Processing: {input_file}\n")
-
+    print(f"Processing: {input_file}")
+    print(f"Using year: {year}\n")
+    
     # Extract CAR data
-    cars = parse_spreadsheet(input_file)
-
+    cars = parse_spreadsheet(input_file, year)
+    
     # Format as table
     df = format_output_table(cars)
-
+    
     # Display results
-    print(f"\nFound {len(df)} CAR entries (excluding crossed-out items):\n")
+    print(f"\nFound {len(df)} CAR entries (excluding crossed-out and analysis items):\n")
     print(df.to_string(index=False))
     
     # Save to CSV if output file specified
