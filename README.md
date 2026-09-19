@@ -610,6 +610,15 @@ jumps to the DS9 push. The alignment was baked in at cache-write time.
    18 SCAs per channel by WCS and combines the three channels into one
    focal-plane color view.
 
+`--headless-png FILE` renders the same three-channel stretch to a PNG with
+matplotlib, no DS9 needed. By default the 18 SCAs are tiled in the fixed
+WFI focal-plane layout (`roman_phot._WFI_SCA_LAYOUT`) with no
+reprojection, so the frame is the physical detector footprint: compact,
+and the same orientation every run. Add `--png-wcs` to instead reproject
+every SCA onto a common north-up celestial grid (the grid `--save-fits`
+writes). That holds three full-focal-plane arrays in RAM and pads the
+frame with the blank corners that come from the roll angle.
+
 `--mosaic --from-cache` reloads the 54 FITS from `--out-dir` and jumps
 straight to step 5 — fastest way to iterate on the stretch after the
 initial run.
