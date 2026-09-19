@@ -1049,6 +1049,11 @@ def _build_parser() -> argparse.ArgumentParser:
                         "Requires --plot-output or --show.")
     p.add_argument("--show", action="store_true",
                    help="Display the plot live in a matplotlib window.")
+    p.add_argument("--gap-break-minutes", type=float, default=None,
+                   help="Break plot traces where consecutive samples are more than this "
+                        "many minutes apart (default: 30 from YAML, or no breaks if 0). "
+                        "Gaps longer than this are shown as line breaks instead of "
+                        "misleading interpolation.")
 
     # --- MAST program-span overlays ---
     p.add_argument("--program-spans", action="store_true",
@@ -1396,18 +1401,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         if os.path.exists(car_csv_path):
             try:
-                from roman_telem_cars import load_car_spans, ROMAN_LAUNCH
+                from roman_telem_cars import load_car_spans
                 start_window = pd.Timestamp(args.start)
                 end_window = pd.Timestamp(args.end)
-                if start_window.tz is None:
-                    start_window = start_window.tz_localize("UTC")
-                if end_window.tz is None:
-                    end_window = end_window.tz_localize("UTC")
                 program_spans = load_car_spans(
                     car_csv_path,
-                    launch_time=ROMAN_LAUNCH,
                     start_window=start_window,
                     end_window=end_window,
+                    tz_naive=True,
                     verbose=verbose,
                 )
             except Exception as e:
@@ -1447,6 +1448,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 output=args.plot_output,
                 show=args.show,
                 label_map=label_map,
+                gap_break_override=args.gap_break_minutes,
                 program_spans=program_spans,
             )
         else:
@@ -1458,6 +1460,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 output=args.plot_output,
                 show=args.show,
                 label_map=label_map,
+                gap_break_override=args.gap_break_minutes,
                 program_spans=program_spans,
             )
 

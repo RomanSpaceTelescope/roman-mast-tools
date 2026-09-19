@@ -65,6 +65,48 @@ def _apply_smoothing(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window=int(window), min_periods=1, center=True).mean()
 
 
+def _insert_gap_breaks(
+    series: pd.Series,
+    max_gap: pd.Timedelta = pd.Timedelta(minutes=30),
+) -> pd.Series:
+    """Return a copy of `series` with NaN values inserted wherever the gap
+    between consecutive timestamps exceeds `max_gap`. matplotlib will then
+    break the plotted line at those NaN points.
+
+    The inserted NaNs sit at the midpoint of each gap, which keeps the
+    x-axis extent unchanged but produces a visible discontinuity.
+    """
+    if series.empty or len(series) < 2:
+        return series
+
+    idx = series.index
+    if not isinstance(idx, pd.DatetimeIndex):
+        return series
+
+    deltas = idx.to_series().diff()
+    gap_mask = deltas > max_gap
+    if not gap_mask.any():
+        return series
+
+    # Build new (index, value) pairs, injecting NaNs at gap midpoints.
+    breaks_idx = []
+    for i in np.where(gap_mask.values)[0]:
+        # i is the index of the sample AFTER the gap; midpoint is between
+        # sample i-1 and sample i.
+        t_before = idx[i - 1]
+        t_after = idx[i]
+        breaks_idx.append(t_before + (t_after - t_before) / 2)
+
+    if not breaks_idx:
+        return series
+
+    breaks = pd.Series([np.nan] * len(breaks_idx),
+                       index=pd.DatetimeIndex(breaks_idx),
+                       name=series.name)
+    out = pd.concat([series, breaks]).sort_index()
+    return out
+
+
 def _group_smoothing(groups_cfg: Dict[str, dict], group_name: str) -> int:
     """Look up the smoothing window for a named group; default 1."""
     try:
@@ -72,6 +114,34 @@ def _group_smoothing(groups_cfg: Dict[str, dict], group_name: str) -> int:
         return int(gdef.get("smoothing", 1))
     except (TypeError, ValueError):
         return 1
+
+
+def _group_gap_break(
+    groups_cfg: Dict[str, dict],
+    group_name: str,
+    cli_override: Optional[float] = None,
+) -> Optional[pd.Timedelta]:
+    """Resolve gap-break threshold from YAML group config or CLI override.
+
+    Priority: CLI override > YAML group setting > default (30 min)
+    Returns None if disabled (value <= 0).
+    """
+    if cli_override is not None and cli_override <= 0:
+        return None
+    if cli_override is not None:
+        return pd.Timedelta(minutes=cli_override)
+    # Fall back to YAML
+    gdef = groups_cfg.get(group_name, {}) or {}
+    minutes = gdef.get("gap_break_minutes")
+    if minutes is None:
+        return pd.Timedelta(minutes=30)  # default
+    try:
+        minutes = float(minutes)
+    except (TypeError, ValueError):
+        return pd.Timedelta(minutes=30)
+    if minutes <= 0:
+        return None
+    return pd.Timedelta(minutes=minutes)
 
 
 def _find_group_for_mnemonic(groups_cfg: Dict[str, dict], mnem: str) -> Optional[str]:
@@ -192,6 +262,7 @@ def _plot_mnemonics_on_axes(
     legend_fontsize: float = 8.0,
     label_map: Optional[Dict[str, str]] = None,
     smoothing: int = 1,
+    max_gap: Optional[pd.Timedelta] = None,
 ) -> Tuple[int, int]:
     """Plot the given mnemonics from a long DataFrame onto a single Axes.
 
@@ -236,24 +307,36 @@ def _plot_mnemonics_on_axes(
         )
         yvals = pd.to_numeric(yvals, errors="coerce")
 
+        # Create a Series with time as index for gap-break detection
+        time_series = pd.Series(yvals.values, index=sub[tcol].values)
+
         if smoothing > 1:
+            # Smooth first, then insert gap breaks
+            yvals_smooth = _apply_smoothing(time_series, smoothing)
+            if max_gap is not None:
+                yvals_smooth = _insert_gap_breaks(yvals_smooth, max_gap=max_gap)
             # Faint raw trace behind the smoothed line
+            yvals_raw = time_series
+            if max_gap is not None:
+                yvals_raw = _insert_gap_breaks(yvals_raw, max_gap=max_gap)
             ax.plot(
-                sub[tcol], yvals,
+                yvals_raw.index, yvals_raw.values,
                 marker=marker, linestyle=linestyle,
                 markersize=markersize, alpha=0.25,
                 color=None, label=None,
             )
-            yvals_smooth = _apply_smoothing(yvals, smoothing)
             ax.plot(
-                sub[tcol], yvals_smooth,
+                yvals_smooth.index, yvals_smooth.values,
                 marker=marker, linestyle=linestyle,
                 markersize=markersize, alpha=alpha,
                 label=f"{_pretty_label(m, label_map)} (rolling N={smoothing})",
             )
         else:
+            yvals_plot = time_series
+            if max_gap is not None:
+                yvals_plot = _insert_gap_breaks(yvals_plot, max_gap=max_gap)
             ax.plot(
-                sub[tcol], yvals,
+                yvals_plot.index, yvals_plot.values,
                 marker=marker, linestyle=linestyle,
                 markersize=markersize, alpha=alpha,
                 label=_pretty_label(m, label_map),
@@ -364,6 +447,7 @@ def plot_grouped(
     sharex: bool = True,
     label_map: Optional[Dict[str, str]] = None,
     smoothing_override: Optional[int] = None,
+    gap_break_override: Optional[float] = None,
     program_spans: Optional[list] = None,
 ):
     """Plot each group in its own subplot.
@@ -420,6 +504,7 @@ def plot_grouped(
         y_label = ginfo.get("y_label")
         smoothing = smoothing_override if smoothing_override is not None \
                     else (int(ginfo.get("smoothing", 1)) if ginfo else 1)
+        max_gap = _group_gap_break(groups, gname, gap_break_override)
 
         if not mnems:
             ax.set_title(f"{label} (no mnemonics)")
@@ -435,6 +520,7 @@ def plot_grouped(
             x_label="Time" if (not sharex or i >= (nrows - 1) * ncols) else None,
             label_map=label_map,
             smoothing=smoothing,
+            max_gap=max_gap,
         )
         total_plotted += plotted
         total_missing += missing
@@ -467,7 +553,7 @@ def plot_grouped(
             # Choose label content based on span type
             if hasattr(program_spans[0], "car_name"):
                 label_fn = lambda s: _truncate(
-                    f"{s.car_number}/{s.program}: {s.car_name}", 50
+                    f"{s.label}: {s.car_name}", 50
                 )
             else:
                 label_fn = lambda s: _truncate(f"P{s.program}", 50)
@@ -516,6 +602,7 @@ def plot_telemetry(
     show: bool = False,
     label_map: Optional[Dict[str, str]] = None,
     smoothing_override: Optional[int] = None,
+    gap_break_override: Optional[float] = None,
     program_spans: Optional[list] = None,
 ):
     """
@@ -566,6 +653,7 @@ def plot_telemetry(
             suptitle=suptitle, show=show,
             label_map=label_map,
             smoothing_override=smoothing_override,
+            gap_break_override=gap_break_override,
             program_spans=program_spans,
         )
 
@@ -595,11 +683,15 @@ def _ensure_parent_dir(path: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _program_color_map(spans):
-    """Return {program_id: rgba} using tab10, stable per program."""
+    """Return {program_id: rgba} using tab10, stable per program.
+    program=None (unassigned) maps to neutral gray."""
     import matplotlib.pyplot as plt
     cmap = plt.get_cmap("tab10")
     out = {}
     for s in spans:
+        if s.program is None:
+            out.setdefault(None, (0.5, 0.5, 0.5, 1.0))  # neutral gray
+            continue
         if s.program not in out:
             out[s.program] = cmap(len(out) % 10)
     return out
@@ -901,9 +993,10 @@ def _draw_car_legend(fig, spans, *, fontsize: float = 8.0):
     for i, (prog, name) in enumerate(sorted(seen.items())):
         # Place each line from top to bottom in axes coords
         y = 1.0 - (i + 0.5) / n_lines
+        prog_label = str(prog) if prog is not None else "unassigned"
         legend_ax.text(
             0.5, y,
-            f"P{prog}: {name}",
+            f"P{prog_label}: {name}",
             ha="center", va="center",
             fontsize=fontsize,
             color=color_map[prog],
@@ -929,6 +1022,7 @@ def plot_per_mnemonic(
     show: bool = False,
     sharex: bool = True,
     label_map: Optional[Dict[str, str]] = None,
+    gap_break_override: Optional[float] = None,
     program_spans: Optional[list] = None,
 ):
     """Produce one subplot per mnemonic in a single figure.
@@ -986,6 +1080,7 @@ def plot_per_mnemonic(
     total_plotted = 0
     total_missing = 0
 
+    max_gap = _group_gap_break({}, "", gap_break_override)
     for i, m in enumerate(mnemonics):
         ax = axes_flat[i]
         plotted, missing = _plot_mnemonics_on_axes(
@@ -995,6 +1090,7 @@ def plot_per_mnemonic(
             x_label="Time" if (not sharex or i >= (nrows - 1) * ncols) else None,
             show_legend=False,
             label_map=label_map,
+            max_gap=max_gap,
         )
         total_plotted += plotted
         total_missing += missing
@@ -1026,7 +1122,7 @@ def plot_per_mnemonic(
             # Choose label content based on span type
             if hasattr(program_spans[0], "car_name"):
                 label_fn = lambda s: _truncate(
-                    f"{s.car_number}/{s.program}: {s.car_name}", 50
+                    f"{s.label}: {s.car_name}", 50
                 )
             else:
                 label_fn = lambda s: _truncate(f"P{s.program}", 50)
