@@ -32,6 +32,7 @@ from typing import List, Optional, Sequence, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
+import numpy as np
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +288,77 @@ def _load_yaml(path: str) -> dict:
     with open(path, "r") as f:
         return yaml.safe_load(f)
 
-# --- Add near the other top-level helpers, after _load_yaml() ------------
+
+# ---------------------------------------------------------------------------
+# Spline support for derived mnemonics (mirrors NASA STOL SPLINE=)
+# ---------------------------------------------------------------------------
+
+class SplineTable:
+    """
+    Piecewise-linear lookup table, matching the semantics of a NASA STOL
+    EQUATION/SPLINE entry.  Values outside the knot range are clamped to
+    the endpoint y-values (numpy.interp default) — the STOL runtime does
+    the same and then relies on LIMSETS for out-of-range alarming.
+    """
+    __slots__ = ("name", "x", "y", "x_units", "y_units")
+
+    def __init__(self, name: str, knots: Sequence[Tuple[float, float]],
+                 x_units: str = "", y_units: str = ""):
+        arr = np.asarray(knots, dtype=float)
+        if arr.ndim != 2 or arr.shape[1] != 2:
+            raise ValueError(f"Spline {name!r}: knots must be Nx2")
+        # Sort by x ascending (numpy.interp requires monotonic xp)
+        order = np.argsort(arr[:, 0])
+        self.name = name
+        self.x = arr[order, 0]
+        self.y = arr[order, 1]
+        self.x_units = x_units
+        self.y_units = y_units
+
+    def __call__(self, x):
+        # Works for scalars, numpy arrays, and pandas Series
+        if isinstance(x, pd.Series):
+            return pd.Series(np.interp(x.values, self.x, self.y),
+                             index=x.index, name=x.name)
+        return np.interp(np.asarray(x, dtype=float), self.x, self.y)
+
+
+def _load_splines(groups_cfg: dict) -> dict:
+    """Build a name -> SplineTable dict from the YAML `splines:` section."""
+    out: dict = {}
+    for name, spec in (groups_cfg.get("splines") or {}).items():
+        knots = spec.get("knots") or []
+        out[name] = SplineTable(
+            name,
+            knots,
+            x_units=spec.get("x_units", ""),
+            y_units=spec.get("y_units", ""),
+        )
+    return out
+
+
+def _make_formula_globals(splines: dict) -> dict:
+    """
+    Build the globals dict passed to eval() when evaluating a formula.
+    Exposes numpy as `np`, plus a `spline(name, x)` callable.
+    """
+    def _spline(name: str, x):
+        try:
+            tbl = splines[name]
+        except KeyError:
+            raise KeyError(
+                f"spline({name!r}) referenced in a formula but not defined "
+                f"under `splines:` in the groups YAML."
+            )
+        return tbl(x)
+
+    return {
+        "__builtins__": {},   # sandbox
+        "np": np,
+        "abs": abs, "min": min, "max": max, "pow": pow,
+        "spline": _spline,
+    }
+
 
 def _load_derived_definitions(groups_config: str) -> dict:
     """Return the `derived:` mapping from the groups YAML (may be empty)."""
@@ -361,6 +432,7 @@ def _compute_derived_columns(
     combined_df: "pd.DataFrame",
     derived_defs: dict,
     derived_names: Sequence[str],
+    splines: Optional[dict] = None,
     verbose: bool = True,
 ) -> "pd.DataFrame":
     """
@@ -369,13 +441,17 @@ def _compute_derived_columns(
     in dependency order (`depends_on`), so intermediates like
     WFI_MCU_B_BOARD_T_RAW become available for downstream formulas.
     """
-    import numpy as np
-
     if combined_df is None or combined_df.empty:
         return combined_df
 
+    if splines is None:
+        splines = {}
+
     # Topologically ordered list
     order = _resolve_derived_dependencies(derived_defs, derived_names)
+
+    # Build formula globals once with spline support
+    formula_globals = _make_formula_globals(splines)
 
     for name in order:
         spec = derived_defs[name]
@@ -387,7 +463,7 @@ def _compute_derived_columns(
             continue
 
         # Build local namespace: each variable -> pd.Series (or scalar).
-        local_ns = {"np": np}
+        local_ns = dict(formula_globals)
         missing = []
         for var, src in inputs.items():
             if src in combined_df.columns:
@@ -403,7 +479,7 @@ def _compute_derived_columns(
 
         try:
             combined_df[name] = eval(  # noqa: S307 (trusted YAML input)
-                formula, {"__builtins__": {}}, local_ns
+                formula.replace('\n', ' '), formula_globals, local_ns
             )
             if verbose:
                 units = spec.get("units", "")
@@ -625,9 +701,11 @@ def query_telemetry(
         wide = pd.DataFrame()
 
     if derived_to_compute and not wide.empty and groups_config:
-        derived_defs = _load_derived_definitions(groups_config)
+        cfg = _load_yaml(groups_config)
+        derived_defs = cfg.get("derived", {}) or {}
+        splines = _load_splines(cfg)
         wide = _compute_derived_columns(
-            wide, derived_defs, derived_to_compute, verbose=verbose
+            wide, derived_defs, derived_to_compute, splines=splines, verbose=verbose
         )
 
     if combine:
@@ -1007,9 +1085,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # NEW: compute derived columns from the wide DataFrame
     if derived_to_compute and not wide.empty:
-        derived_defs = _load_derived_definitions(groups_file)
+        cfg = _load_yaml(groups_file)
+        derived_defs = cfg.get("derived", {}) or {}
+        splines = _load_splines(cfg)
         wide = _compute_derived_columns(
-            wide, derived_defs, derived_to_compute, verbose=verbose
+            wide, derived_defs, derived_to_compute, splines=splines, verbose=verbose
         )
 
         # Also add derived data back into the long-form plot_df so the

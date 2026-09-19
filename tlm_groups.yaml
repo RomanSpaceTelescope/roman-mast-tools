@@ -261,6 +261,66 @@ groups:
     - WFI_MCU_B_FPGA_CASE_T
 
 
+# =====================================================================
+# Spline lookup tables (piecewise-linear), e.g. thermistor R->T curves
+# transcribed from NASA STOL EQUATION/SPLINE entries.
+#
+# Each spline is a list of (x, y) knots.  Interpolation is piecewise
+# linear (numpy.interp).  x-values MUST be monotonically increasing
+# OR decreasing; the loader will sort ascending automatically.
+# =====================================================================
+splines:
+
+  # From STOL entry:
+  #   WFI_MCU_B_MPA_CSENS_FPSSEN_K  (FPA sensor SN 132459)
+  #   Input : thermistor resistance (ohms)
+  #   Output: temperature (K)
+  MPA_CSENS_FPSSEN_SN132459:
+    x_units: ohm
+    y_units: K
+    knots:
+      - [192.260, 330.048]
+      - [196.178, 326.036]
+      - [202.312, 320.044]
+      - [207.692, 315.043]
+      - [213.339, 310.038]
+      - [225.439, 300.056]
+      - [238.820, 290.046]
+      - [253.634, 280.051]
+      - [270.094, 270.040]
+      - [288.445, 260.045]
+      - [309.053, 250.034]
+      - [332.164, 240.045]
+      - [358.387, 230.043]
+      - [388.155, 220.032]
+      - [422.210, 210.043]
+      - [461.403, 200.042]
+      - [506.858, 190.037]
+      - [559.965, 180.036]
+      - [622.424, 170.042]
+      - [696.696, 160.050]
+      - [786.103, 150.054]
+      - [894.947, 140.056]
+      - [1029.33, 130.055]
+      - [1198.13, 120.054]
+      - [1414.26, 110.054]
+      - [1697.00, 100.066]
+      - [1873.00,  95.0655]
+      - [2078.70,  90.0709]
+      - [2321.51,  85.0745]
+      - [2611.99,  80.0698]
+      - [2961.34,  75.0809]
+      - [3388.93,  70.0868]
+      - [3918.95,  65.0999]
+      - [4589.79,  60.1060]
+      - [5455.02,  55.1122]
+      - [6597.56,  50.1223]
+      - [7159.09,  48.1301]
+      - [8153.84,  45.1278]
+      - [9375.92,  42.1294]
+      - [10903.3,  39.1254]
+      - [12852.3,  36.1144]
+      - [15384.8,  33.1063]
 
 # =====================================================================
 # Derived mnemonics
@@ -304,10 +364,11 @@ derived:
     formula: "((((-3.78965180500010e-05 * A27) + 1.59274182543759e-04) * 1.99692 / 3.98769) * 1000.0) - 273.15"
 
   # ---------------------------------------------------------------
-  # MPA control sensor (channel 1)
+  # MPA control sensor (channel 1) — RESISTANCE  (ohms)
+  # (quadratic polynomial of RAWC-corrected ADC counts)
   # ---------------------------------------------------------------
-  WFI_MCU_B_MPA_T_CTRLSENS:
-    units: K
+  WFI_MCU_B_MPA_T_CTRLSENS_RES:
+    units: ohm
     depends_on: [WFI_MCU_B_BOARD_T_RAW]
     inputs:
       A1: WFI_MCU_B_ANALOG_1
@@ -318,6 +379,18 @@ derived:
       + 0.0029979598180664 *
         (4*A1 - (-0.0425613392114692*BT_RAW + -707.913328147364))
       + 1921.4436501897
+
+  # ---------------------------------------------------------------
+  # MPA control sensor — TEMPERATURE (K), via STOL spline lookup
+  # This is the true engineering unit corresponding to STOL's
+  # WFI_MCU_B_MPA_CSENS_FPSSEN_K.
+  # ---------------------------------------------------------------
+  WFI_MCU_B_MPA_T_CTRLSENS:
+    units: K
+    depends_on: [WFI_MCU_B_MPA_T_CTRLSENS_RES]
+    inputs:
+      R: WFI_MCU_B_MPA_T_CTRLSENS_RES
+    formula: 'spline("MPA_CSENS_FPSSEN_SN132459", R)'
 
   # ---------------------------------------------------------------
   # SCEA control sensor (channel 2)
