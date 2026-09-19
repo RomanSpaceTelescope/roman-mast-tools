@@ -828,6 +828,171 @@ choices (`mnemonic`, `ObsTime` / `time` / `datetime`, `EUValue` / `value`
 
 ---
 
+## CAR (Commissioning Activity Report) Overlays on Telemetry Plots
+
+Telemetry plots can be annotated with **CAR activity spans** — colored vertical shaded regions labeled with CAR numbers and activity names. This helps correlate operations (thruster burns, slews, deployments, etc.) with telemetry anomalies or trending changes.
+
+CAR data comes from the **Roman commissioning operations CAST (Commissioning Activity Spreadsheet Template)**, which is publicly archived at STScI.
+
+### Workflow: Download CAST and Extract CAR Summary
+
+#### Step 1: Download the CAST from STScI
+
+1. Visit the **[Roman Mission Operations Archive](https://www.stsci.edu/roman/mission-operations/)** (or search for "Roman CAST as-run")
+2. Download the **RST_Commissioning_CAST_AS_RUN.xlsx** file (or current version; filename may vary by revision)
+3. Save it locally, e.g. to your working directory
+
+#### Step 2: Extract CAR information using `extract_car_info.py`
+
+The `extract_car_info.py` script parses the CAST Excel file and extracts commissioning activities:
+
+```bash
+python extract_car_info.py RST_Commissioning_CAST_AS_RUN.xlsx
+```
+
+**Output:**
+- A `RST_Commissioning_CAST_AS_RUN_CAR_Summary.csv` file with columns:
+  - `CAR_Number` (e.g., `CAR-173.5`)
+  - `CAR_Name` (e.g., `Count-rate Dependent Nonlinearity (Direct)`)
+  - `APT_Program` (e.g., `1025`)
+  - `MET` (Mission Elapsed Time, e.g., `L + 018:11:12:00`)
+  - `Start_Time` (wall-clock time, UTC)
+  - `Duration` (e.g., `03:10:00`)
+
+**Example:**
+```
+CAR_Number,CAR_Name,APT_Program,MET,Start_Time,Duration
+CAR-173.5,Count-rate Dependent Nonlinearity (Direct),1025,L + 018:11:12:00,19:56:00,03:10:00
+CAR-190.20,RCS Daily Monitor,1039,L + 016:21:18:00,09:18:00,00:32:00
+CAR-086.4,ST-FGS Alignment - Confirmation Image & WIM Closed-loop Checkout,1028,L + 017:19:56:00,03:06:00,02:10:00
+...
+```
+
+**Features:**
+- Automatically skips CARs marked as "Crossed Out" (strikethrough formatting in the Excel file)
+- Extracts APT program IDs from both CAR headers and step descriptions
+- Handles malformed or missing time fields gracefully
+
+#### Step 3: Place `car_summary.csv` in the tools directory
+
+Rename or symlink the extracted CSV to `car_summary.csv` in the `roman-mast-tools` directory:
+
+```bash
+cp RST_Commissioning_CAST_AS_RUN_CAR_Summary.csv roman-mast-tools/car_summary.csv
+```
+
+Once present, `roman-telem` will automatically detect and use it for plot annotations.
+
+### Using CAR Overlays with `roman-telem`
+
+#### Basic usage: Plot telemetry with CAR activity bands
+
+```bash
+# Query temperature data for a subsystem during a CAR-heavy period
+roman-telem --plot-groups tlm_groups.yaml \
+    --select-groups "temp_fps" \
+    -s "2026-09-16" -e "2026-09-20" \
+    --show
+```
+
+**What you'll see:**
+1. **Three subplots** (one per temperature sensor group in `temp_fps`):
+   - Each subplot shows temperature trending over time
+   - Colored vertical shaded bands indicate CAR activity windows
+   - Color is consistent within a program (e.g., all Program 1025 activities are blue)
+
+2. **Leader-line callouts** below the bottom axis:
+   - Vertical stubs drop from each CAR's midpoint
+   - Text labels (e.g., `CAR-173.5/1025: Count-rate Dependent Nonlinearity…`) tilt at 45° pointing upward into the stub
+   - Multiple tiers of labels automatically deconflict overlapping CARs
+   - Labels are truncated to 50 characters with an ellipsis
+
+3. **Date/time labels** on the x-axis:
+   - Format: `259|09-16 12` (day-of-year | month-day hour)
+   - Tilted 45° to match the visual language of the callouts
+
+#### Example: Correlate FPS temperatures with CAR activities
+
+During commission, FPS (Focal Plane Subsystem) temperatures fluctuate due to operational activities. The CAR overlay helps identify which activity caused each spike:
+
+```bash
+# Plot FPS temperature groups for the entire first week of operation
+roman-telem --plot-groups tlm_groups.yaml \
+    --select-groups "temp_fps" \
+    -s "2026-09-10" -e "2026-09-17" \
+    --output fps_temps_with_cars.png \
+    --plot-layout vertical
+```
+
+**What this reveals:**
+- `CAR-078.1: PAM ReCalibration` (P1104) on 2026-09-10 shows a sustained temperature rise
+- `CAR-190.x: RCS Daily Monitor` (P1039) series on 2026-09-12–09-16 produce brief spikes
+- Temperature returns to nominal after `CAR-086.4: ST-FGS Alignment` completes on 2026-09-18
+
+This makes it easy to debug thermal issues or validate that temperatures are responding as expected to each activity.
+
+#### Command-line options for CAR overlays
+
+- `--program-spans` — (legacy) query MAST for Roman exposure windows instead of loading CAR CSV. CARs take precedence if `car_summary.csv` is found.
+- `--car-csv PATH` — specify a custom CAR CSV path (default: looks for `car_summary.csv` in the package directory)
+
+### Python API: Plot with CAR Overlays
+
+```python
+import pandas as pd
+from roman_telem_plot import plot_telemetry
+from roman_telem_cars import load_car_spans, ROMAN_LAUNCH
+
+# Load telemetry data
+df = pd.read_csv("temp_fps.csv")
+
+# Load CAR spans from the extracted CSV
+car_spans = load_car_spans(
+    "car_summary.csv",
+    launch_time=ROMAN_LAUNCH,
+    start_window=pd.Timestamp("2026-09-16"),
+    end_window=pd.Timestamp("2026-09-20"),
+)
+
+# Plot with CAR overlay
+plot_telemetry(
+    df,
+    groups_config="tlm_groups.yaml",
+    selected_groups=["temp_fps"],
+    layout="vertical",
+    program_spans=car_spans,
+    output="fps_temps_with_cars.png",
+    show=False,
+)
+```
+
+### Interpreting the CAR Label Format
+
+Each callout label follows the pattern:
+
+```
+CAR-173.5/1025: Count-rate Dependent Nonlinearity…
+├──────┬─────┼────┬──────────────────────────────┘
+  CAR    subID APT  Activity name (truncated at 50 chars)
+```
+
+- **CAR number** (e.g., `CAR-173.5`): unique activity identifier from the CAST
+- **APT program** (e.g., `1025`): science program that scheduled this activity
+- **Activity name**: human-readable description (used for visual correlation with telemetry trends)
+
+The label color matches the program's shaded bands — follow color → shaded region → telemetry effect visually.
+
+### Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| CAR bands not showing on plot | Verify `car_summary.csv` exists in the package directory; check that date range overlaps CAR times |
+| Labels too crowded or missing | Increase `--days` range or reduce subplot count; very dense days may exceed 20 tiers (hard safety cap) |
+| Callouts overlapping with date labels | This is rare with constrained layout; if it happens, the auto-sizing should resolve it on next run |
+| MET times don't match wall-clock times | Check ROMAN_LAUNCH constant in `roman_telem_cars.py`; it should match the mission epoch used in your CAST |
+
+---
+
 ## Architecture
 
 ### Module hierarchy

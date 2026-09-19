@@ -54,11 +54,47 @@ _VALUE_COL_CANDIDATES = (
 )
 
 
+def _apply_smoothing(series: pd.Series, window: int) -> pd.Series:
+    """
+    Rolling-mean smoothing. window=1 (or <=1, or None) returns the series
+    unchanged. Uses min_periods=1 so the ends aren't NaN, and center=True
+    so features aren't shifted in time.
+    """
+    if window is None or window <= 1:
+        return series
+    return series.rolling(window=int(window), min_periods=1, center=True).mean()
+
+
+def _group_smoothing(groups_cfg: Dict[str, dict], group_name: str) -> int:
+    """Look up the smoothing window for a named group; default 1."""
+    try:
+        gdef = groups_cfg.get(group_name, {}) or {}
+        return int(gdef.get("smoothing", 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _find_group_for_mnemonic(groups_cfg: Dict[str, dict], mnem: str) -> Optional[str]:
+    """Find the group that contains the given mnemonic."""
+    for gname, gdef in groups_cfg.items():
+        mnems = (gdef or {}).get("mnemonics") or {}
+        # mnemonics can be either a list or a dict — handle both
+        names = mnems if isinstance(mnems, list) else list(mnems.keys())
+        if mnem in names:
+            return gname
+    return None
+
+
 def _pretty_label(mnem: str, label_map: Optional[Dict[str, str]]) -> str:
     if not label_map:
         return mnem
     desc = label_map.get(mnem)
     return f"{mnem} - {desc}" if desc else mnem
+
+
+def _truncate(s: str, n: int = 50) -> str:
+    """Truncate a string to at most n characters, with an ellipsis if trimmed."""
+    return s if len(s) <= n else s[: n - 1] + "…"
 
 
 def _find_time_column(df: pd.DataFrame) -> str:
@@ -101,7 +137,7 @@ def _find_value_column(df: pd.DataFrame, time_col: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _load_groups_config(path: str) -> Dict[str, dict]:
-    """Load a plot-groups YAML file and return the `groups` dict."""
+    """Load a plot-groups YAML file and return the full config dict."""
     try:
         import yaml  # type: ignore
     except ImportError as e:
@@ -111,7 +147,7 @@ def _load_groups_config(path: str) -> Dict[str, dict]:
         ) from e
     with open(path, "r") as f:
         cfg = yaml.safe_load(f) or {}
-    return cfg.get("groups", {}) or {}
+    return cfg
 
 
 def _filter_groups(
@@ -126,6 +162,11 @@ def _filter_groups(
     if missing:
         print(f"⚠ Warning: selected groups not found in config: {missing}")
     return out
+
+
+def _get_groups_from_config(cfg: dict) -> Dict[str, dict]:
+    """Extract the 'groups' section from a full config dict."""
+    return cfg.get("groups", {}) or {}
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +191,7 @@ def _plot_mnemonics_on_axes(
     legend_loc: str = "best",
     legend_fontsize: float = 8.0,
     label_map: Optional[Dict[str, str]] = None,
+    smoothing: int = 1,
 ) -> Tuple[int, int]:
     """Plot the given mnemonics from a long DataFrame onto a single Axes.
 
@@ -193,12 +235,29 @@ def _plot_mnemonics_on_axes(
             lambda v: _STATE_MAP.get(str(v).strip().upper(), v)
         )
         yvals = pd.to_numeric(yvals, errors="coerce")
-        ax.plot(
-            sub[tcol], yvals,
-            marker=marker, linestyle=linestyle,
-            markersize=markersize, alpha=alpha,
-            label=_pretty_label(m, label_map),
-        )
+
+        if smoothing > 1:
+            # Faint raw trace behind the smoothed line
+            ax.plot(
+                sub[tcol], yvals,
+                marker=marker, linestyle=linestyle,
+                markersize=markersize, alpha=0.25,
+                color=None, label=None,
+            )
+            yvals_smooth = _apply_smoothing(yvals, smoothing)
+            ax.plot(
+                sub[tcol], yvals_smooth,
+                marker=marker, linestyle=linestyle,
+                markersize=markersize, alpha=alpha,
+                label=f"{_pretty_label(m, label_map)} (rolling N={smoothing})",
+            )
+        else:
+            ax.plot(
+                sub[tcol], yvals,
+                marker=marker, linestyle=linestyle,
+                markersize=markersize, alpha=alpha,
+                label=_pretty_label(m, label_map),
+            )
         plotted += 1
 
     if title:
@@ -304,6 +363,8 @@ def plot_grouped(
     show: bool = False,
     sharex: bool = True,
     label_map: Optional[Dict[str, str]] = None,
+    smoothing_override: Optional[int] = None,
+    program_spans: Optional[list] = None,
 ):
     """Plot each group in its own subplot.
 
@@ -331,14 +392,18 @@ def plot_grouped(
     # Reasonable default figure size based on layout
     if figsize is None:
         base_w = 12.0
-        base_h_per_row = 3.2
+        base_h_per_row = 2.2
+        # Add extra height for program-label annotations if present
+        # CAR legend will be managed by the dedicated phantom axes
+        extra_h = 0.8 if program_spans else 0.2
         figsize = (base_w * (ncols / max(1, min(ncols, 2))),
-                   base_h_per_row * nrows)
+                   base_h_per_row * nrows + extra_h)
 
     fig, axes = plt.subplots(
         nrows=nrows, ncols=ncols,
         figsize=figsize, dpi=dpi,
         sharex=sharex, squeeze=False,
+        layout="constrained",
     )
 
     # Flatten axes into a list in row-major order
@@ -353,6 +418,8 @@ def plot_grouped(
         label = ginfo.get("label", gname)
         mnems = list(ginfo.get("mnemonics", []) or [])
         y_label = ginfo.get("y_label")
+        smoothing = smoothing_override if smoothing_override is not None \
+                    else (int(ginfo.get("smoothing", 1)) if ginfo else 1)
 
         if not mnems:
             ax.set_title(f"{label} (no mnemonics)")
@@ -367,6 +434,7 @@ def plot_grouped(
             title=label, y_label=y_label,
             x_label="Time" if (not sharex or i >= (nrows - 1) * ncols) else None,
             label_map=label_map,
+            smoothing=smoothing,
         )
         total_plotted += plotted
         total_missing += missing
@@ -375,11 +443,47 @@ def plot_grouped(
     for j in range(n, nrows * ncols):
         axes_flat[j].set_visible(False)
 
+    # Shade program spans on each subplot and add callout annotations
+    if program_spans:
+        bottom_ax = axes_flat[n - 1] if n > 0 else None
+        for ax in axes_flat[:n]:
+            _shade_program_spans(ax, program_spans)
+        # Rotate dates on bottom axis and hide on others
+        if bottom_ax:
+            for lbl in bottom_ax.get_xticklabels():
+                lbl.set_rotation(45)
+                lbl.set_ha("right")
+                lbl.set_rotation_mode("anchor")
+            # Add DOY to date format
+            import matplotlib.dates as mdates
+            bottom_ax.xaxis.set_major_formatter(mdates.DateFormatter("%j | %m-%d %H"))
+        for ax in axes_flat[:n-1]:
+            for lbl in ax.get_xticklabels():
+                lbl.set_visible(False)
+        # Add callout annotations on the bottom axis
+        if bottom_ax:
+            bottom_ax.set_xlabel("")
+            fig.canvas.draw()
+            # Choose label content based on span type
+            if hasattr(program_spans[0], "car_name"):
+                label_fn = lambda s: _truncate(
+                    f"{s.car_number}/{s.program}: {s.car_name}", 50
+                )
+            else:
+                label_fn = lambda s: _truncate(f"P{s.program}", 50)
+            _annotate_span_callouts(
+                bottom_ax, program_spans,
+                label_fn=label_fn,
+                fontsize=8,
+                max_tiers=20,
+            )
+    else:
+        fig.autofmt_xdate()
+
     if suptitle:
         fig.suptitle(suptitle, fontsize=13)
 
-    fig.autofmt_xdate()
-    fig.tight_layout(rect=(0, 0, 1, 0.97 if suptitle else 1.0))
+    # Constrained layout handles all margins automatically
 
     if output:
         _ensure_parent_dir(output)
@@ -411,6 +515,8 @@ def plot_telemetry(
     suptitle: Optional[str] = None,
     show: bool = False,
     label_map: Optional[Dict[str, str]] = None,
+    smoothing_override: Optional[int] = None,
+    program_spans: Optional[list] = None,
 ):
     """
     High-level plotting entry point.
@@ -444,7 +550,8 @@ def plot_telemetry(
         raise ValueError("plot_telemetry(): input DataFrame is empty.")
 
     if groups_config:
-        groups = _load_groups_config(groups_config)
+        cfg = _load_groups_config(groups_config)
+        groups = _get_groups_from_config(cfg)
         groups = _filter_groups(groups, selected_groups)
         if not groups:
             raise ValueError(
@@ -458,6 +565,8 @@ def plot_telemetry(
             output=output, figsize=figsize, dpi=dpi,
             suptitle=suptitle, show=show,
             label_map=label_map,
+            smoothing_override=smoothing_override,
+            program_spans=program_spans,
         )
 
     # No groups_config: single-axes plot
@@ -482,6 +591,327 @@ def _ensure_parent_dir(path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# MAST program-span shading
+# ---------------------------------------------------------------------------
+
+def _program_color_map(spans):
+    """Return {program_id: rgba} using tab10, stable per program."""
+    import matplotlib.pyplot as plt
+    cmap = plt.get_cmap("tab10")
+    out = {}
+    for s in spans:
+        if s.program not in out:
+            out[s.program] = cmap(len(out) % 10)
+    return out
+
+
+def _shade_program_spans(ax, spans, *, alpha=0.15):
+    """Overlay axvspan boxes for each ProgramSpan on `ax`.
+    Colors are stable per program. No legend entries — program labeling
+    is handled by `_annotate_program_axis` on the bottom axis."""
+    if not spans:
+        return
+    color_map = _program_color_map(spans)
+    for s in spans:
+        ax.axvspan(s.start, s.end, color=color_map[s.program],
+                   alpha=alpha, zorder=0)
+
+
+def _annotate_program_axis(
+    ax,
+    spans,
+    *,
+    unique_labels_only: bool = False,
+    y_offset: float = -0.25,
+    row_spacing: float = 0.09,
+    fontsize: float = 8.0,
+    padding_px: float = 4.0,
+    max_rows: int = 2,
+) -> int:
+    """Annotate axis with span labels, deconflicting overlaps.
+
+    By default, labels every span. If unique_labels_only=True, only labels
+    the first occurrence of each unique label (useful when many spans share
+    the same label). All spans are still shaded; only labels are deduplicated.
+
+    Labels centered under their span; when overlapping, labels move to
+    additional rows up to max_rows. Returns the number of rows used.
+
+    Call after xlim/data are established and after fig.canvas.draw() for
+    accurate text-extent measurement."""
+    if not spans:
+        return 0
+
+    import matplotlib.dates as mdates
+    import matplotlib.transforms as mtransforms
+
+    color_map = _program_color_map(spans)
+    fig = ax.figure
+    renderer = fig.canvas.get_renderer()
+    trans = mtransforms.blended_transform_factory(ax.transData, ax.transAxes)
+
+    xlim_lo, xlim_hi = ax.get_xlim()
+    row_right_px = []  # rightmost occupied pixel on each row
+
+    def _to_pixels_x(x_data):
+        return ax.transData.transform((x_data, 0))[0]
+
+    # Sort spans by start time for left-to-right greedy placement
+    ordered = sorted(spans, key=lambda s: s.start)
+
+    # If unique_labels_only, keep only the first occurrence of each label
+    if unique_labels_only:
+        seen = set()
+        spans_to_label = []
+        for s in ordered:
+            if s.label in seen:
+                continue
+            seen.add(s.label)
+            spans_to_label.append(s)
+    else:
+        spans_to_label = ordered
+
+    for s in spans_to_label:
+        x0 = max(mdates.date2num(s.start), xlim_lo)
+        x1 = min(mdates.date2num(s.end), xlim_hi)
+        if x1 <= x0:
+            continue
+        xc = 0.5 * (x0 + x1)
+        xc_px = _to_pixels_x(xc)
+
+        # Draw text off-screen to measure its width
+        txt = ax.text(
+            xc, y_offset,
+            f"P{s.program}",
+            transform=trans,
+            ha="center", va="top",
+            fontsize=fontsize,
+            color=color_map[s.program],
+            fontweight="bold",
+            clip_on=False,
+            in_layout=True,
+        )
+        bbox = txt.get_window_extent(renderer=renderer)
+        half_w = 0.5 * bbox.width
+        left_px = xc_px - half_w
+        right_px = xc_px + half_w
+
+        # Find first row where label doesn't collide
+        placed = False
+        for r, prev_right in enumerate(row_right_px):
+            if left_px >= prev_right + padding_px:
+                row_right_px[r] = right_px
+                if r > 0:
+                    txt.set_y(y_offset - r * row_spacing)
+                placed = True
+                break
+
+        if not placed:
+            if len(row_right_px) >= max_rows:
+                txt.set_visible(False)
+                continue
+            # Start a new row
+            row_right_px.append(right_px)
+            r = len(row_right_px) - 1
+            if r > 0:
+                txt.set_y(y_offset - r * row_spacing)
+
+    return len(row_right_px)
+
+
+def _annotate_span_callouts(
+    ax,
+    spans,
+    *,
+    fontsize: float = 8.0,
+    rotation: float = 45.0,
+    max_tiers: int = 20,
+    tier_step_inches: float = 0.20,
+    base_offset_inches: float = 0.10,
+    stub_lw: float = 0.8,
+    padding_px: float = 4.0,
+    label_fn=None,
+    unique_only: bool = False,
+):
+    """Draw 45°-angled callouts pointing from each shaded span to a label
+    below the axis, using variable stub lengths to deconflict overlaps.
+    Auto-grows the tier stack as needed up to max_tiers.
+
+    Returns the total number of tiers used.
+    """
+    if not spans:
+        return 0
+
+    import matplotlib.dates as mdates
+    import matplotlib.transforms as mtransforms
+
+    color_map = _program_color_map(spans)
+
+    if label_fn is None:
+        label_fn = lambda s: s.label
+
+    # Optionally deduplicate labels (rarely needed for CARs)
+    if unique_only:
+        seen, filtered = set(), []
+        for s in sorted(spans, key=lambda x: x.start):
+            k = label_fn(s)
+            if k in seen:
+                continue
+            seen.add(k)
+            filtered.append(s)
+        ordered = filtered
+    else:
+        ordered = sorted(spans, key=lambda s: s.start)
+
+    fig = ax.figure
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+
+    fig_h_in = fig.get_size_inches()[1]
+    ax_pos = ax.get_position()
+    ax_h_frac = ax_pos.height
+
+    def _in_to_axfrac(inches):
+        return inches / (fig_h_in * ax_h_frac)
+
+    base_y = -_in_to_axfrac(base_offset_inches)
+    tier_step = _in_to_axfrac(tier_step_inches)
+
+    trans = mtransforms.blended_transform_factory(ax.transData, ax.transAxes)
+    xlim_lo, xlim_hi = ax.get_xlim()
+
+    # For each tier, track list of (x0, x1) horizontal intervals occupied in pixels
+    tier_bands = []
+
+    def _overlaps(new_x0, new_x1, bands, pad):
+        """Check if [new_x0, new_x1] overlaps any band in bands (with padding)."""
+        for (bx0, bx1) in bands:
+            if not (new_x1 + pad <= bx0 or new_x0 - pad >= bx1):
+                return True
+        return False
+
+    for s in ordered:
+        # Center x of the span, clipped to visible axis
+        x0 = max(mdates.date2num(s.start), xlim_lo)
+        x1 = min(mdates.date2num(s.end), xlim_hi)
+        if x1 <= x0:
+            continue
+        xc = 0.5 * (x0 + x1)
+
+        color = color_map[s.program]
+        text = label_fn(s)
+
+        # Provisionally draw at tier 0 to measure rotated text extent
+        stub_bottom_y = base_y - 0 * tier_step
+        txt = ax.text(
+            xc, stub_bottom_y, text,
+            transform=trans,
+            ha="right", va="bottom",
+            rotation=rotation,
+            rotation_mode="anchor",
+            fontsize=fontsize,
+            color=color,
+            clip_on=False,
+        )
+        bbox = txt.get_window_extent(renderer=renderer)
+        new_x0, new_x1 = bbox.x0, bbox.x1
+
+        # Find lowest tier where this label doesn't overlap any existing band
+        placed_tier = None
+        for t, bands in enumerate(tier_bands):
+            if not _overlaps(new_x0, new_x1, bands, padding_px):
+                placed_tier = t
+                break
+
+        # If no tier found, create a new one (up to max_tiers)
+        if placed_tier is None:
+            if len(tier_bands) >= max_tiers:
+                txt.set_visible(False)
+                continue
+            tier_bands.append([])
+            placed_tier = len(tier_bands) - 1
+
+        # Move the text to its final tier
+        stub_bottom_y = base_y - placed_tier * tier_step
+        txt.set_y(stub_bottom_y)
+
+        # Re-measure at final y and record the band
+        bbox = txt.get_window_extent(renderer=renderer)
+        tier_bands[placed_tier].append((bbox.x0, bbox.x1))
+
+        # Draw the vertical stub from axis to anchor
+        ax.plot(
+            [xc, xc],
+            [0, stub_bottom_y],
+            transform=trans,
+            color=color,
+            lw=stub_lw,
+            alpha=0.6,
+            solid_capstyle="butt",
+            clip_on=False,
+            zorder=5,
+        )
+
+        # Tiny tick-mark at the top of the stub
+        ax.plot(
+            [xc], [0],
+            transform=trans,
+            marker="v",
+            markersize=4,
+            color=color,
+            clip_on=False,
+            zorder=6,
+        )
+
+    return len(tier_bands)
+
+
+def _draw_car_legend(fig, spans, *, fontsize: float = 8.0):
+    """Draw a bottom-of-figure legend inside a dedicated axes so
+    constrained_layout actually reserves space for it.
+
+    Only renders if the spans have a `car_name` attribute (i.e., are CARSpans).
+    """
+    if not spans or not hasattr(spans[0], "car_name"):
+        return
+
+    color_map = _program_color_map(spans)
+
+    # Collect first CAR name per program, in sorted order
+    seen = {}
+    for s in spans:
+        if s.program not in seen:
+            seen[s.program] = s.car_name
+
+    n_lines = len(seen)
+    if n_lines == 0:
+        return
+
+    # Add a new axes at the bottom of the figure, spanning the width.
+    # Height in inches, converted to figure fraction, matched to n_lines.
+    line_h_in = 1.6 * fontsize / 72.0        # rough line height in inches
+    fig_h_in = fig.get_size_inches()[1]
+    axes_h = (n_lines * line_h_in) / fig_h_in
+
+    # Use add_axes with a rect that constrained_layout will re-manage.
+    # The trick: make it a real axes but hide the frame/ticks.
+    legend_ax = fig.add_axes([0, 0, 1, axes_h])
+    legend_ax.set_axis_off()
+
+    for i, (prog, name) in enumerate(sorted(seen.items())):
+        # Place each line from top to bottom in axes coords
+        y = 1.0 - (i + 0.5) / n_lines
+        legend_ax.text(
+            0.5, y,
+            f"P{prog}: {name}",
+            ha="center", va="center",
+            fontsize=fontsize,
+            color=color_map[prog],
+            transform=legend_ax.transAxes,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Public API: one subplot per mnemonic
 # ---------------------------------------------------------------------------
 
@@ -499,6 +929,7 @@ def plot_per_mnemonic(
     show: bool = False,
     sharex: bool = True,
     label_map: Optional[Dict[str, str]] = None,
+    program_spans: Optional[list] = None,
 ):
     """Produce one subplot per mnemonic in a single figure.
 
@@ -533,14 +964,18 @@ def plot_per_mnemonic(
 
     if figsize is None:
         base_w = 12.0
-        base_h_per_row = 3.2
+        base_h_per_row = 2.2
+        # Add extra height for program-label annotations if present
+        # CAR legend will be managed by the dedicated phantom axes
+        extra_h = 0.8 if program_spans else 0.2
         figsize = (base_w * (ncols / max(1, min(ncols, 2))),
-                   base_h_per_row * nrows)
+                   base_h_per_row * nrows + extra_h)
 
     fig, axes = plt.subplots(
         nrows=nrows, ncols=ncols,
         figsize=figsize, dpi=dpi,
         sharex=sharex, squeeze=False,
+        layout="constrained",
     )
 
     axes_flat = [axes[r][c] for r in range(nrows) for c in range(ncols)]
@@ -567,11 +1002,47 @@ def plot_per_mnemonic(
     for j in range(n, nrows * ncols):
         axes_flat[j].set_visible(False)
 
+    # Shade program spans on each subplot and add callout annotations
+    if program_spans:
+        bottom_ax = axes_flat[n - 1] if n > 0 else None
+        for ax in axes_flat[:n]:
+            _shade_program_spans(ax, program_spans)
+        # Rotate dates on bottom axis and hide on others
+        if bottom_ax:
+            for lbl in bottom_ax.get_xticklabels():
+                lbl.set_rotation(45)
+                lbl.set_ha("right")
+                lbl.set_rotation_mode("anchor")
+            # Add DOY to date format
+            import matplotlib.dates as mdates
+            bottom_ax.xaxis.set_major_formatter(mdates.DateFormatter("%j | %m-%d %H"))
+        for ax in axes_flat[:n-1]:
+            for lbl in ax.get_xticklabels():
+                lbl.set_visible(False)
+        # Add callout annotations on the bottom axis
+        if bottom_ax:
+            bottom_ax.set_xlabel("")
+            fig.canvas.draw()
+            # Choose label content based on span type
+            if hasattr(program_spans[0], "car_name"):
+                label_fn = lambda s: _truncate(
+                    f"{s.car_number}/{s.program}: {s.car_name}", 50
+                )
+            else:
+                label_fn = lambda s: _truncate(f"P{s.program}", 50)
+            _annotate_span_callouts(
+                bottom_ax, program_spans,
+                label_fn=label_fn,
+                fontsize=8,
+                max_tiers=20,
+            )
+    else:
+        fig.autofmt_xdate()
+
     if suptitle:
         fig.suptitle(suptitle, fontsize=13)
 
-    fig.autofmt_xdate()
-    fig.tight_layout(rect=(0, 0, 1, 0.97 if suptitle else 1.0))
+    # Constrained layout handles all margins automatically
 
     if output:
         _ensure_parent_dir(output)
@@ -611,6 +1082,9 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
                         "the figure is shown interactively.")
     p.add_argument("--suptitle", default=None)
     p.add_argument("--dpi", type=int, default=120)
+    p.add_argument("--smoothing", type=int, default=None,
+                   help="Override rolling-mean window (samples) for all plotted "
+                        "groups. 1 disables smoothing.")
     args = p.parse_args(argv)
 
     # Load data
@@ -630,6 +1104,7 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
         suptitle=args.suptitle,
         dpi=args.dpi,
         show=(args.output is None),
+        smoothing_override=args.smoothing,
     )
     return 0
 

@@ -286,7 +286,36 @@ def _load_yaml(path: str) -> dict:
             "Install it with `pip install pyyaml`."
         ) from e
     with open(path, "r") as f:
-        return yaml.safe_load(f)
+        return yaml.safe_load(f) or {}
+
+
+def _normalize_includes(cfg: dict) -> None:
+    """In-place: for each group with `includes:`, materialize `mnemonics:`
+    as a merged dict pulling labels from child groups. After this pass,
+    every downstream consumer can treat `mnemonics:` as always populated."""
+    groups = cfg.get("groups") or {}
+    for name, gdef in groups.items():
+        if not gdef or "includes" not in gdef:
+            continue
+        merged = {}
+        # Parent's own mnemonics (rare when using includes, but supported)
+        own = gdef.get("mnemonics")
+        if isinstance(own, dict):
+            merged.update(own)
+        elif isinstance(own, list):
+            for m in own:
+                merged[m] = None
+        # Children — walk the full chain (excluding parent itself)
+        for child_name in _collect_group_chain(cfg, name)[1:]:
+            child = groups.get(child_name, {}) or {}
+            m = child.get("mnemonics")
+            if isinstance(m, dict):
+                for k, v in m.items():
+                    merged.setdefault(k, v)
+            elif isinstance(m, list):
+                for k in m:
+                    merged.setdefault(k, None)
+        gdef["mnemonics"] = merged
 
 
 # ---------------------------------------------------------------------------
@@ -490,24 +519,44 @@ def _compute_derived_columns(
             combined_df[name] = np.nan
 
     return combined_df
-def list_available_groups(groups_config: str) -> List[Tuple[str, str, int]]:
+def list_available_groups(groups_config: str) -> List[Tuple[str, str, int, Optional[str]]]:
     """
-    Return a list of (group_name, label, n_mnemonics) tuples from a YAML config.
+    Return a list of (group_name, label, n_mnemonics, alias_marker) tuples from a YAML config.
 
     Expected YAML structure:
         groups:
           <group_name>:
             label: <str>
-            mnemonics: [<mnemonic>, ...]
+            mnemonics: [<mnemonic>, ...]        # OR
+            includes: [<group_name>, ...]       # for aliases
             y_label: <str>   # optional
+
+    alias_marker is a string like "[alias → child1, child2]" for groups with `includes:`,
+    or None for regular groups.
     """
     cfg = _load_yaml(groups_config)
     groups = cfg.get("groups", {}) or {}
     out = []
     for name, info in groups.items():
-        label = (info or {}).get("label", name)
-        mnems = (info or {}).get("mnemonics", []) or []
-        out.append((name, label, len(mnems)))
+        info = info or {}
+        label = info.get("label", name)
+        includes = info.get("includes")
+
+        if includes:
+            # This is an alias group
+            alias_marker = f"[alias → {', '.join(includes)}]"
+            # Count resolved mnemonics
+            try:
+                mnems = _resolve_group_includes(cfg, name)
+                n_mnemonics = len(mnems)
+            except (KeyError, ValueError):
+                n_mnemonics = 0
+            out.append((name, label, n_mnemonics, alias_marker))
+        else:
+            # Regular group
+            mnems = (info.get("mnemonics", []) or [])
+            n_mnemonics = len(mnems) if isinstance(mnems, list) else len(mnems.keys())
+            out.append((name, label, n_mnemonics, None))
     return out
 
 
@@ -529,6 +578,120 @@ def _labels_of(group_info: dict) -> dict:
     return {}
 
 
+def _expand_group_aliases(
+    groups_cfg: dict,
+    group_names: Sequence[str],
+    _seen: Optional[set] = None,
+) -> List[str]:
+    """Expand any group that has `includes:` into its listed child group names,
+    recursively. Groups without `includes:` are passed through unchanged.
+
+    This makes `roman-telem temp_fps` equivalent to typing the child group names
+    directly on the command line, so each child gets its own subplot with its own
+    label, y_label, and smoothing settings."""
+    if _seen is None:
+        _seen = set()
+
+    groups = groups_cfg.get("groups") or groups_cfg
+    out: List[str] = []
+    seen_out: set = set()
+
+    def _add(name: str) -> None:
+        if name not in seen_out:
+            seen_out.add(name)
+            out.append(name)
+
+    for name in group_names:
+        if name in _seen:
+            raise ValueError(
+                f"Cyclic `includes:` detected involving group {name!r}"
+            )
+        gdef = groups.get(name)
+        if gdef is None:
+            # Not a known group — pass it through for downstream error handling
+            _add(name)
+            continue
+
+        includes = gdef.get("includes") or []
+        if includes:
+            # Alias group: recurse into children, drop the alias itself
+            child_seen = _seen | {name}
+            for child in _expand_group_aliases(groups_cfg, includes, child_seen):
+                _add(child)
+        else:
+            _add(name)
+
+    return out
+
+
+def _resolve_group_includes(
+    groups_cfg: dict,
+    group_name: str,
+    _seen: Optional[set] = None,
+) -> List[str]:
+    """
+    Return the flattened list of mnemonic names for `group_name`, expanding
+    any `includes:` references recursively.  Preserves order (parent group's
+    own mnemonics first, then each included group in listed order).
+    De-duplicates while preserving first-seen order.  Detects cycles.
+    """
+    if _seen is None:
+        _seen = set()
+    if group_name in _seen:
+        raise ValueError(
+            f"Cyclic `includes:` detected involving group {group_name!r}"
+        )
+    _seen = _seen | {group_name}
+
+    groups = groups_cfg.get("groups") or groups_cfg
+    gdef = groups.get(group_name)
+    if gdef is None:
+        raise KeyError(f"Group {group_name!r} not found in groups config")
+
+    out: List[str] = []
+    seen_mnem: set = set()
+
+    def _add(name: str):
+        if name not in seen_mnem:
+            seen_mnem.add(name)
+            out.append(name)
+
+    # 1) Direct mnemonics of this group (list OR dict form)
+    mnems = gdef.get("mnemonics")
+    if isinstance(mnems, dict):
+        for m in mnems.keys():
+            _add(m)
+    elif isinstance(mnems, list):
+        for m in mnems:
+            _add(m)
+
+    # 2) Included child groups (recurse)
+    for child in (gdef.get("includes") or []):
+        for m in _resolve_group_includes(groups_cfg, child, _seen):
+            _add(m)
+
+    return out
+
+
+def _collect_group_chain(
+    groups_cfg: dict,
+    group_name: str,
+    _seen: Optional[set] = None,
+) -> List[str]:
+    """Return [group_name, ...its includes recursively], preserving order."""
+    if _seen is None:
+        _seen = set()
+    if group_name in _seen:
+        return []
+    _seen = _seen | {group_name}
+    groups = groups_cfg.get("groups") or groups_cfg
+    gdef = groups.get(group_name, {}) or {}
+    chain = [group_name]
+    for child in (gdef.get("includes") or []):
+        chain.extend(_collect_group_chain(groups_cfg, child, _seen))
+    return chain
+
+
 def extract_mnemonics_from_groups(
     groups_config: str,
     selected_groups: Optional[Sequence[str]] = None,
@@ -540,10 +703,16 @@ def extract_mnemonics_from_groups(
 
     mnemonics: List[str] = []
     seen = set()
-    for name, info in groups.items():
-        if selected_set is not None and name not in selected_set:
+    for name in (selected_groups or groups.keys()):
+        if name not in groups:
             continue
-        for mn in _mnemonics_of(info):
+        # Use resolver to expand includes; fall back to direct mnemonics
+        try:
+            group_mnems = _resolve_group_includes(cfg, name)
+        except (KeyError, ValueError):
+            # Fallback to direct mnemonics if resolver fails
+            group_mnems = _mnemonics_of(groups.get(name, {}))
+        for mn in group_mnems:
             if mn not in seen:
                 seen.add(mn)
                 mnemonics.append(mn)
@@ -557,18 +726,20 @@ def extract_labels_from_groups(
     """
     Return {mnemonic: 'human description'} for all mnemonics in the
     given (or all) groups.  Missing descriptions are omitted.
+    Expands `includes:` to collect labels from child groups.
     """
     cfg = _load_yaml(groups_config)
     groups = cfg.get("groups", {}) or {}
-    selected_set = set(selected_groups) if selected_groups else None
 
     labels: dict = {}
-    for name, info in groups.items():
-        if selected_set is not None and name not in selected_set:
-            continue
-        for mn, desc in _labels_of(info).items():
-            if desc and mn not in labels:
-                labels[mn] = str(desc)
+    for gname in (selected_groups or groups.keys()):
+        # Walk includes to collect labels from child groups
+        for child_gname in _collect_group_chain(cfg, gname):
+            if child_gname not in groups:
+                continue
+            gdef = groups.get(child_gname, {}) or {}
+            for mn, desc in _labels_of(gdef).items():
+                labels.setdefault(mn, desc)   # first-seen wins
     return labels
 
 def expand_to_raw_mnemonics(
@@ -879,6 +1050,27 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--show", action="store_true",
                    help="Display the plot live in a matplotlib window.")
 
+    # --- MAST program-span overlays ---
+    p.add_argument("--program-spans", action="store_true",
+                   help="Query MAST for Roman exposures in the same time window "
+                        "and shade contiguous per-program chunks on the plots.")
+    p.add_argument("--program-gap-minutes", type=float, default=30.0,
+                   help="Max inter-exposure gap (min) that still counts as one "
+                        "contiguous chunk within a program (default: 30).")
+    p.add_argument("--program-filter", type=int, default=None, metavar="PROGRAM",
+                   help="Restrict span overlay to a single APT program ID.")
+    p.add_argument("--mast-token", default=None,
+                   help="MAST auth token for --program-spans (falls back to "
+                        "$MAST_API_TOKEN).")
+    p.add_argument("--program-spans-kinds", default="all",
+                   help="Product kinds to include for program-span overlays "
+                        "(default: 'all' includes L1 uncals and darks). "
+                        "Comma-separated (e.g. 'cal,uncal') or 'all'.")
+    p.add_argument("--car-csv", default=None,
+                   help="Path to a CAR (Commissioning Activity Report) summary CSV. "
+                        "If given (or if 'car_summary.csv' is found in the package), "
+                        "CARs supersede any MAST program-span query.")
+
     return p
 
 
@@ -914,11 +1106,12 @@ def _handle_list_groups(groups_config: str) -> int:
         return 0
 
     # Nicely aligned listing
-    name_w = max(len(n) for n, _, _ in info)
-    label_w = max(len(l) for _, l, _ in info)
-    for name, label, count in info:
+    name_w = max(len(n) for n, _, _, _ in info)
+    label_w = max(len(l) for _, l, _, _ in info)
+    for name, label, count, alias_marker in info:
+        marker_str = f"  {alias_marker}" if alias_marker else ""
         print(f"{name.ljust(name_w)}  -  {label.ljust(label_w)}  "
-              f"({count} mnemonic{'s' if count != 1 else ''})")
+              f"({count} mnemonic{'s' if count != 1 else ''}){marker_str}")
     print(f"\nTotal: {len(info)} group{'s' if len(info) != 1 else ''}")
     return 0
 
@@ -989,6 +1182,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "Group shorthand requires a groups file. Place tlm_groups.yaml in the "
                 "current directory or set $ROMAN_TELEM_GROUPS."
             )
+        # Expand alias groups so 'temp_fps' becomes its constituent children
+        cfg = _load_yaml(args.plot_groups)
+        _group_shorthand = _expand_group_aliases(cfg, _group_shorthand)
         args.select_groups = ",".join(_group_shorthand)
         args.show = True
 
@@ -1173,6 +1369,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         selected = None
         if args.select_groups:
             selected = [s.strip() for s in args.select_groups.split(",") if s.strip()]
+            # Expand alias groups if not already expanded
+            if args.plot_groups:
+                cfg = _load_yaml(args.plot_groups)
+                selected = _expand_group_aliases(cfg, selected)
 
         label_map = {}
         if args.plot_groups:
@@ -1184,6 +1384,59 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 if verbose:
                     print(f"⚠ Could not load legend labels: {e}")
 
+        # Query for program spans: CARs take precedence, then MAST fallback
+        program_spans = None
+
+        # Try CAR CSV first (repo-local by default, or via --car-csv)
+        default_car_csv = os.path.join(
+            os.path.dirname(__file__),
+            "car_summary.csv"
+        )
+        car_csv_path = args.car_csv or default_car_csv
+
+        if os.path.exists(car_csv_path):
+            try:
+                from roman_telem_cars import load_car_spans, ROMAN_LAUNCH
+                start_window = pd.Timestamp(args.start)
+                end_window = pd.Timestamp(args.end)
+                if start_window.tz is None:
+                    start_window = start_window.tz_localize("UTC")
+                if end_window.tz is None:
+                    end_window = end_window.tz_localize("UTC")
+                program_spans = load_car_spans(
+                    car_csv_path,
+                    launch_time=ROMAN_LAUNCH,
+                    start_window=start_window,
+                    end_window=end_window,
+                    verbose=verbose,
+                )
+            except Exception as e:
+                if verbose:
+                    print(f"⚠ Could not load CAR spans from {car_csv_path}: {e}",
+                          file=sys.stderr)
+                program_spans = None
+
+        # Fall back to MAST if no CAR spans and --program-spans is set
+        if not program_spans and args.program_spans:
+            try:
+                from roman_telem_mast import query_program_spans
+                # Parse kinds parameter: 'all' or comma-separated list
+                kinds = args.program_spans_kinds
+                if kinds and kinds != 'all':
+                    kinds = tuple(k.strip() for k in kinds.split(',') if k.strip())
+                program_spans = query_program_spans(
+                    args.start, args.end,
+                    gap_minutes=args.program_gap_minutes,
+                    program=args.program_filter,
+                    kinds=kinds,
+                    token=args.mast_token or os.environ.get("MAST_API_TOKEN"),
+                    verbose=verbose,
+                )
+            except Exception as e:
+                print(f"⚠ --program-spans (MAST) failed ({e}); continuing without shading.",
+                      file=sys.stderr)
+                program_spans = None
+
         if plot_df.empty:
             print("WARNING: no data returned — skipping plot.", file=sys.stderr)
         elif args.plot_per_mnemonic:
@@ -1194,6 +1447,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 output=args.plot_output,
                 show=args.show,
                 label_map=label_map,
+                program_spans=program_spans,
             )
         else:
             plot_telemetry(
@@ -1204,6 +1458,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 output=args.plot_output,
                 show=args.show,
                 label_map=label_map,
+                program_spans=program_spans,
             )
 
         if verbose and args.plot_output:

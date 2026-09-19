@@ -117,6 +117,7 @@ DEFAULT_COLUMNS = [
     'ra', 'dec',  # per-exposure boresight (degrees, ICRS)
     'ra_v1', 'dec_v1',  # V1 (telescope) axis pointing (degrees, ICRS)
     'pa_v3',            # position angle of V3 axis E of N (degrees)
+    'investigator_name', 'program_title',  # proposal metadata
 ]
 
 # Every Roman WFI product kind we know how to build a filename for. A "kind"
@@ -383,6 +384,11 @@ class Exposure:
     observation: Optional[int]    = None
     visit: Optional[int]          = None
 
+    # Proposal-level metadata (populated in _group_exposures if MAST returns
+    # the columns; None otherwise).
+    pi: Optional[str] = None            # Principal Investigator, e.g. "Doe, Jane"
+    program_title: Optional[str] = None # Free-form program title
+
     def __post_init__(self):
         try:
             parts = parse_visit_id(self.visit_id)
@@ -606,6 +612,9 @@ def _group_exposures(results, data_level, filtered=None):
                 ra_v1=_as_float(_get(row, 'ra_v1')),
                 dec_v1=_as_float(_get(row, 'dec_v1')),
                 pa_v3=_as_float(_get(row, 'pa_v3')),
+                # Proposal metadata from MAST
+                pi=_get(row, 'investigator_name'),
+                program_title=_get(row, 'program_title'),
             )
         exp = exposures[key]
         if sca not in exp.scas:
@@ -1020,11 +1029,35 @@ def _pad_visible(text: str, visible_text: str, width: int) -> str:
     return text + (' ' * padding)
 
 
+def _visible_len(s: str) -> int:
+    """Length of `s` ignoring ANSI SGR escape sequences."""
+    import re
+    return len(re.sub(r'\x1b\[[0-9;]*m', '', s))
+
+
+def _pad_visible(text: str, width: int, align: str = '<') -> str:
+    """Pad `text` so its VISIBLE width is `width`, respecting `align`.
+
+    `align` is '<' (left), '>' (right), or '^' (center).  Handles strings
+    that already contain ANSI escapes.
+    """
+    vlen = _visible_len(text)
+    pad = max(0, width - vlen)
+    if align == '>':
+        return (' ' * pad) + text
+    if align == '^':
+        left = pad // 2
+        right = pad - left
+        return (' ' * left) + text + (' ' * right)
+    return text + (' ' * pad)
+
+
 def _fmt_int(v, w, changed):
-    """Right-aligned int column with bold-on-change / dim-when-repeated."""
+    """Integer with bold-on-change / dim-when-repeated.
+    `w` is a legacy hint; padding is done by the column layer now."""
     if v is None:
-        return '-' * w
-    s = f"{v:>{w}}"
+        return '—'
+    s = str(v) if w <= 0 else f"{v:>{w}}"
     return _ansi(s, '1') if changed else _ansi(s, '2')
 
 
@@ -1038,7 +1071,125 @@ def _fmt_scas(n_scas, expected=18):
     return s
 
 
-def print_summary(res: DataResults, max_rows: int = 50, show_files: bool = False):
+def _fmt_time(t) -> str:
+    """Format a timestamp as 'YYYY-MM-DDTHH:MM:SS' (whole seconds)."""
+    if t is None or t == '':
+        return ''
+    s = str(t).strip()
+    if '.' in s:
+        s = s.split('.', 1)[0]
+    for suf in ('Z', '+00:00'):
+        if s.endswith(suf):
+            s = s[: -len(suf)]
+    return s.replace(' ', 'T')[:19]
+
+
+def _truncate(s: str, w: int) -> str:
+    """Truncate string `s` to width `w` with ellipsis if needed."""
+    if s is None:
+        return ''
+    s = str(s)
+    return s if len(s) <= w else s[: max(0, w - 1)] + '…'
+
+
+# Column widths for print_summary
+PI_COL_WIDTH    = 22
+TITLE_COL_WIDTH = 40
+
+
+# ---------------------------------------------------------------------------
+# print_summary column definitions
+# ---------------------------------------------------------------------------
+# Each entry is (key, header, width, align, cell_fn, group).
+#   cell_fn(exp, ctx) -> str   returns the (possibly ANSI-colored) cell text.
+#   ctx is a dict with 'changed' (dict of flags), 'index' (1-based row #), etc.
+# Column visibility is filtered by the flags: proposal / pitch_roll.
+# ---------------------------------------------------------------------------
+
+def _c_index(exp, ctx):
+    return _ansi(f"{ctx['index']}", '2')
+
+def _c_visit_id(exp, ctx):
+    return _colorize_visit_id(exp.visit_id)
+
+def _c_prog(exp, ctx):
+    return _fmt_int(exp.program, 0, ctx['changed']['program'])
+def _c_ep(exp, ctx):
+    return _fmt_int(exp.execution_plan, 0, ctx['changed']['execution_plan'])
+def _c_pass(exp, ctx):
+    return _fmt_int(exp.pass_, 0, ctx['changed']['pass'])
+def _c_seg(exp, ctx):
+    return _fmt_int(exp.segment, 0, ctx['changed']['segment'])
+def _c_obs(exp, ctx):
+    return _fmt_int(exp.observation, 0, ctx['changed']['observation'])
+def _c_vis(exp, ctx):
+    return _fmt_int(exp.visit, 0, ctx['changed']['visit'])
+def _c_exp(exp, ctx):
+    return _fmt_int(exp.exposure, 0, ctx['changed']['exposure'])
+
+def _c_filter(exp, ctx):
+    return str(exp.optical_element) if exp.optical_element else ''
+
+def _c_scas(exp, ctx):
+    return _fmt_scas(exp.n_scas).strip()
+
+def _c_float(attr, fmt):
+    def fn(exp, ctx):
+        v = getattr(exp, attr)
+        return '—' if v is None else format(v, fmt)
+    return fn
+
+def _c_pi(exp, ctx):
+    return _truncate(exp.pi or '—', ctx['pi_width'])
+def _c_title(exp, ctx):
+    return _truncate(exp.program_title or '—', ctx['title_width'])
+
+def _c_start(exp, ctx):
+    return _fmt_time(exp.exposure_start_time)
+def _c_end(exp, ctx):
+    return _fmt_time(exp.exposure_end_time)
+
+# NB: `width` here is the *visible* width the cell/header will be padded to.
+_COLUMNS = [
+    # key            header           w   align  cell_fn                         group
+    ('index',        '#',             3,  '>',   _c_index,                       None),
+    ('visit_id',     'Visit ID',     19,  '<',   _c_visit_id,                    None),
+    ('program',      'Prog',          5,  '>',   _c_prog,                        None),
+    ('exec_plan',    'EP',            2,  '>',   _c_ep,                          None),
+    ('pass',         'Pass',          4,  '>',   _c_pass,                        None),
+    ('segment',      'Seg',           3,  '>',   _c_seg,                         None),
+    ('observation',  'Obs',           3,  '>',   _c_obs,                         None),
+    ('visit',        'Vis',           3,  '>',   _c_vis,                         None),
+    ('exposure',     'Exp',           4,  '>',   _c_exp,                         None),
+    ('filter',       'Filter',        7,  '<',   _c_filter,                      None),
+    ('scas',         'SCAs',          4,  '>',   _c_scas,                        None),
+    ('ra',           'RA',           10,  '>',   _c_float('ra',     '10.5f'),    None),
+    ('dec',          'Dec',          10,  '>',   _c_float('dec',    '+10.5f'),   None),
+    ('ra_v1',        'V1 RA',        10,  '>',   _c_float('ra_v1',  '10.5f'),    None),
+    ('dec_v1',       'V1 Dec',       10,  '>',   _c_float('dec_v1', '+10.5f'),   None),
+    ('pa_v3',        'PA(V3)',        7,  '>',   _c_float('pa_v3',  '7.3f'),     None),
+    ('pitch',        'Pitch',         7,  '>',   _c_float('pitch',  '7.3f'),     'pitch_roll'),
+    ('roll',         'Roll',          7,  '>',   _c_float('roll',   '7.3f'),     'pitch_roll'),
+    ('pi',           'PI',           22,  '<',   _c_pi,                          'proposal'),
+    ('program_title','Program Title', 40,  '<',   _c_title,                       'proposal'),
+    ('start',        'Start (UTC)',  19,  '<',   _c_start,                       None),
+    ('end',          'End (UTC)',    19,  '<',   _c_end,                         None),
+]
+
+# Header color per key (falls back to bold-only if not listed)
+_HEADER_COLORS = {
+    'program':     _CHUNK_COLORS['program'],
+    'exec_plan':   _CHUNK_COLORS['execution_plan'],
+    'pass':        _CHUNK_COLORS['pass'],
+    'segment':     _CHUNK_COLORS['segment'],
+    'observation': _CHUNK_COLORS['observation'],
+    'visit':       _CHUNK_COLORS['visit'],
+}
+
+
+def print_summary(res: DataResults, max_rows: int = 50, show_files: bool = False,
+                  show_proposal: bool = True, pi_width: int = PI_COL_WIDTH,
+                  title_width: int = TITLE_COL_WIDTH):
     """Print a compact, human-readable summary of a DataResults.
 
     Exposures (grouped per visit_id + exposure number) are always shown, since
@@ -1090,51 +1241,47 @@ def print_summary(res: DataResults, max_rows: int = 50, show_files: bool = False
         print(f"  visit_id decoded as PPPPPCCAAASSSOOOVVV → {legend}")
         print()
 
+        # Decide which columns are active for this run
         show_pitch_roll = any(e.pitch is not None for e in res.exposures)
+        show_proposal = show_proposal and any(e.pi is not None or e.program_title is not None for e in res.exposures)
 
-        # Header — chunk-colored labels above matching columns.
-        header_bits = [
-            _ansi(f"{'#':>3}", '1'),
-            _ansi(f"{'Visit ID':<20}", '1'),
-            _ansi(f"{'Prog':>5}", '1', _CHUNK_COLORS['program']),
-            _ansi(f"{'EP':>2}",   '1', _CHUNK_COLORS['execution_plan']),
-            _ansi(f"{'Pass':>4}", '1', _CHUNK_COLORS['pass']),
-            _ansi(f"{'Seg':>3}",  '1', _CHUNK_COLORS['segment']),
-            _ansi(f"{'Obs':>3}",  '1', _CHUNK_COLORS['observation']),
-            _ansi(f"{'Vis':>3}",  '1', _CHUNK_COLORS['visit']),
-            _ansi(f"{'Exp':>4}",   '1'),
-            _ansi(f"{'Filter':<7}",'1'),
-            _ansi(f"{'SCAs':>5}",  '1'),
-            _ansi(f"{'RA':>10}",     '1'),
-            _ansi(f"{'Dec':>10}",    '1'),
-            _ansi(f"{'V1 RA':>10}",  '1'),
-            _ansi(f"{'V1 Dec':>10}", '1'),
-            _ansi(f"{'PA(V3)':>7}",  '1'),
-            _ansi(f"{'Pitch':>7}",   '1'),
-            _ansi(f"{'Roll':>7}",    '1'),
-            _ansi("Start time",      '1'),
-            _ansi("End time",        '1'),
-        ]
-        hdr = ("  " + header_bits[0] + "  " + header_bits[1] + " "
-               + " ".join(header_bits[2:8]) + "  "
-               + header_bits[8] + " " + header_bits[9] + " " + header_bits[10]
-               + "  " + header_bits[11] + " " + header_bits[12]
-               + "  " + header_bits[13] + " " + header_bits[14]
-               + " " + header_bits[15])
-        if show_pitch_roll:
-            hdr += " " + header_bits[16] + " " + header_bits[17]
-        hdr += "  " + header_bits[18] + "  " + header_bits[19]
-        print(hdr)
-        print(_ansi("  " + "-" * (120 + (17 if show_pitch_roll else 0)), '2'))
+        # Build active column list, respecting groups and dynamic widths
+        active_cols = []
+        for col in _COLUMNS:
+            key, header, width, align, cell_fn, group = col
+            if group == 'pitch_roll' and not show_pitch_roll:
+                continue
+            if group == 'proposal' and not show_proposal:
+                continue
+            # Override width for proposal columns if caller specified it
+            if key == 'pi':
+                width = pi_width
+            elif key == 'program_title':
+                width = title_width
+            active_cols.append((key, header, width, align, cell_fn, group))
 
+        SEP = "  "   # single, consistent separator between every column
+
+        # --- Header --------------------------------------------------------------
+        header_cells = []
+        for key, header, width, align, _, _ in active_cols:
+            code_args = ['1']  # bold
+            if key in _HEADER_COLORS:
+                code_args.append(_HEADER_COLORS[key])
+            header_cells.append(_pad_visible(_ansi(header, *code_args), width, align))
+        header_line = SEP.join(header_cells)
+        print(header_line)
+        # Separator line matches actual header width (ignoring ANSI codes)
+        sep_width = _visible_len(header_line)
+        print(_ansi("  " + "-" * sep_width, '2'))
+
+        # --- Rows ----------------------------------------------------------------
         prev = None
         for i, exp in enumerate(res.exposures):
             if i >= max_rows:
                 print(_ansi(f"  ... and {res.n_exposures - max_rows} more exposures", '2'))
                 break
 
-            # Change-detection: bold if the field changed vs previous row,
-            # dim if it repeats.
             changed = {
                 'program':        prev is None or exp.program        != prev.program,
                 'execution_plan': prev is None or exp.execution_plan != prev.execution_plan,
@@ -1144,40 +1291,19 @@ def print_summary(res: DataResults, max_rows: int = 50, show_files: bool = False
                 'visit':          prev is None or exp.visit          != prev.visit,
                 'exposure':       prev is None or exp.exposure       != prev.exposure,
             }
+            ctx = {
+                'index':           i + 1,
+                'changed':         changed,
+                'show_pitch_roll': show_pitch_roll,
+                'pi_width':        pi_width,
+                'title_width':     title_width,
+            }
 
-            start = str(exp.exposure_start_time) if exp.exposure_start_time else ''
-            end   = str(exp.exposure_end_time)   if exp.exposure_end_time   else ''
-            filt  = str(exp.optical_element) if exp.optical_element else ''
-            vid_colored = _colorize_visit_id(exp.visit_id)
-
-            row = "  " + _ansi(f"{i+1:>3}", '2') + "  "
-            row += _pad_visible(vid_colored, exp.visit_id, 20) + " "
-            row += _fmt_int(exp.program,        5, changed['program']) + " "
-            row += _fmt_int(exp.execution_plan, 2, changed['execution_plan']) + " "
-            row += _fmt_int(exp.pass_,          4, changed['pass']) + " "
-            row += _fmt_int(exp.segment,        3, changed['segment']) + " "
-            row += _fmt_int(exp.observation,    3, changed['observation']) + " "
-            row += _fmt_int(exp.visit,          3, changed['visit']) + "  "
-            row += _fmt_int(exp.exposure,       4, changed['exposure']) + " "
-            row += f"{filt:<7} "
-            row += _fmt_scas(exp.n_scas) + "  "
-            row += (f"{exp.ra:>10.5f} " if exp.ra is not None
-                    else f"{'—':>10} ")
-            row += (f"{exp.dec:>+10.5f}  " if exp.dec is not None
-                    else f"{'—':>10}  ")
-            row += (f"{exp.ra_v1:>10.5f} " if exp.ra_v1 is not None
-                    else f"{'—':>10} ")
-            row += (f"{exp.dec_v1:>+10.5f} " if exp.dec_v1 is not None
-                    else f"{'—':>10} ")
-            row += (f"{exp.pa_v3:>7.3f} " if exp.pa_v3 is not None
-                    else f"{'—':>7} ")
-            if show_pitch_roll:
-                row += (f"{exp.pitch:>7.3f} " if exp.pitch is not None
-                        else f"{'—':>7} ")
-                row += (f"{exp.roll:>7.3f} " if exp.roll is not None
-                        else f"{'—':>7} ")
-            row += " " + start + "  " + end
-            print(row)
+            cells = []
+            for key, _, width, align, cell_fn, _ in active_cols:
+                raw = cell_fn(exp, ctx)
+                cells.append(_pad_visible(raw, width, align))
+            print(SEP.join(cells))
 
             prev = exp
 
@@ -1444,6 +1570,13 @@ Examples:
     p.add_argument('--show-files',      action='store_true',
                    help='Also print the flat filename list after the '
                         'per-exposure summary')
+    p.add_argument('--no-proposal',     dest='show_proposal',
+                   action='store_false', default=True,
+                   help='Suppress the PI and Program Title columns.')
+    p.add_argument('--pi-width',        type=int, default=22,
+                   help='Max width of the PI column (default 22).')
+    p.add_argument('--title-width',     type=int, default=40,
+                   help='Max width of the Program Title column (default 40).')
     p.add_argument('--pitch-roll',      action='store_true',
                    help='Compute sun-relative pitch and off-normal roll for each '
                         'exposure (requires roman_opup_tools)')
@@ -1463,7 +1596,10 @@ Examples:
         for exp in res.exposures:
             compute_pitch_roll(exp)
 
-    print_summary(res, max_rows=args.max_rows, show_files=args.show_files)
+    print_summary(res, max_rows=args.max_rows, show_files=args.show_files,
+                  show_proposal=args.show_proposal,
+                  pi_width=args.pi_width,
+                  title_width=args.title_width)
 
 
 main = _cli

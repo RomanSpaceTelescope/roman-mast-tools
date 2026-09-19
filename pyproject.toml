@@ -44,4 +44,4 @@ roman-color = "roman_color:main"
 
 
 [tool.setuptools]
-py-modules = ["roman_mast", "roman_fits", "roman_metadata", "roman_view_sca", "roman_phot", "roman_telem", "roman_telem_plot", "photometry", "roman_color"]
+py-modules = ["roman_mast", "roman_fits", "roman_metadata", "roman_view_sca", "roman_phot", "roman_telem", "roman_telem_plot", "roman_telem_mast", "roman_telem_cars", "photometry", "roman_color"]

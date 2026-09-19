@@ -213,24 +213,28 @@ groups:
   temp_mpa_ctrl:
     label: MPA Control Sensor (WTSF00, MCU-B)
     y_label: Temperature (K)
+    smoothing: 51
     mnemonics:
     - WFI_MCU_B_MPA_T_CTRLSENS
 
   temp_scea_ctrl:
     label: SCEA Control Sensor (WTSF02, MCU-B)
     y_label: Temperature (K)
+    smoothing: 151
     mnemonics:
     - WFI_MCU_B_SCEA_T_CTRLSENS
 
   temp_offs_ctrl:
     label: Offset (CPR) Control Sensor (WTSF04, MCU-B)
     y_label: Temperature (K)
+    smoothing: 51
     mnemonics:
     - WFI_MCU_B_OFFS_T_CTRLSENS
 
   temp_mpa_mon:
     label: MPA Monitor Sensors (WTSF01, MCU-B)
     y_label: Temperature (K)
+    smoothing: 51
     mnemonics:
     - WFI_MCU_B_MPA_MON_COLDEST
     - WFI_MCU_B_MPA_MON_COLD
@@ -240,25 +244,41 @@ groups:
   temp_scea_mon:
     label: SCEA Monitor Sensors (WTSF03, MCU-B)
     y_label: Temperature (K)
+    smoothing: 151
     mnemonics:
     - WFI_MCU_B_SCEA_MON_COLDEST
 
   temp_offs_mon:
     label: Offset (CPR) Monitor Sensors (WTSF05, MCU-B)
     y_label: Temperature (K)
+    smoothing: 51
     mnemonics:
     - WFI_MCU_B_OFFS_MON_COLDEST
     - WFI_MCU_B_OFFS_MON_COLD
     - WFI_MCU_B_OFFS_MON_MID
     - WFI_MCU_B_OFFS_MON_WARM
 
-  temp_mcu_b_board:
+  temp_mcu_board:
     label: MCU-B Board Temperatures
     y_label: Temperature (deg C)
     mnemonics:
     - WFI_MCU_B_BOARD_T
     - WFI_MCU_B_U7_CASE_T
     - WFI_MCU_B_FPGA_CASE_T
+
+  # -----------------------------------------------------------------
+  # FPS thermal overview — alias that expands to a union of other
+  # groups.  `includes:` is resolved at load time; any smoothing /
+  # label overrides here take precedence over the child groups.
+  # -----------------------------------------------------------------
+  temp_fps:
+    label: FPS Thermal Overview (MCU-B Control Sensors + Board)
+    y_label: Temperature (K)
+    smoothing: 51
+    includes:
+      - temp_mpa_ctrl
+      - temp_scea_ctrl
+      - temp_mcu_board
 
 
 # =====================================================================
@@ -321,6 +341,57 @@ splines:
       - [10903.3,  39.1254]
       - [12852.3,  36.1144]
       - [15384.8,  33.1063]
+
+  # From STOL entry:
+  #   WFI_MCU_B_SCEA_CSENS_FPSSEN_K  (FPA sensor SN 132430)
+  #   Input : thermistor resistance (ohms)
+  #   Output: temperature (K)
+  SCEA_CSENS_FPSSEN_SN132430:
+    x_units: ohm
+    y_units: K
+    knots:
+      - [  190.657, 330.002]
+      - [  194.561, 326.000]
+      - [  200.638, 320.005]
+      - [  206.002, 315.001]
+      - [  211.619, 310.000]
+      - [  223.693, 299.984]
+      - [  236.981, 289.969]
+      - [  251.726, 279.977]
+      - [  268.079, 269.966]
+      - [  286.351, 259.959]
+      - [  306.768, 249.974]
+      - [  329.744, 239.987]
+      - [  355.765, 229.986]
+      - [  385.374, 219.978]
+      - [  419.179, 209.987]
+      - [  458.073, 199.990]
+      - [  503.215, 189.985]
+      - [  555.939, 179.979]
+      - [  618.021, 169.975]
+      - [  691.852, 159.970]
+      - [  780.617, 149.968]
+      - [  888.759, 139.959]
+      - [ 1022.34,  129.951]
+      - [ 1189.58,  119.960]
+      - [ 1403.80,  109.967]
+      - [ 1685.61,   99.9359]
+      - [ 1860.43,   94.9333]
+      - [ 2064.69,   89.9378]
+      - [ 2306.29,   84.9404]
+      - [ 2593.90,   79.9471]
+      - [ 2941.35,   74.9479]
+      - [ 3365.79,   69.9545]
+      - [ 3892.78,   64.9633]
+      - [ 4559.62,   59.9668]
+      - [ 5420.23,   54.9637]
+      - [ 6557.26,   49.9664]
+      - [ 7118.88,   47.9605]
+      - [ 8103.41,   44.9722]
+      - [ 9320.94,   41.9676]
+      - [10832.8,    38.9750]
+      - [12763.2,    35.9735]
+      - [15257.2,    32.9843]
 
 # =====================================================================
 # Derived mnemonics
@@ -393,10 +464,11 @@ derived:
     formula: 'spline("MPA_CSENS_FPSSEN_SN132459", R)'
 
   # ---------------------------------------------------------------
-  # SCEA control sensor (channel 2)
+  # SCEA control sensor (channel 2) — RESISTANCE  (ohms)
+  # (quadratic polynomial of RAWC-corrected ADC counts)
   # ---------------------------------------------------------------
-  WFI_MCU_B_SCEA_T_CTRLSENS:
-    units: K
+  WFI_MCU_B_SCEA_T_CTRLSENS_RES:
+    units: ohm
     depends_on: [WFI_MCU_B_BOARD_T_RAW]
     inputs:
       A2: WFI_MCU_B_ANALOG_2
@@ -407,6 +479,17 @@ derived:
       + 0.00500165709400535 *
         (A2 - (-0.0128045349611677*BT_RAW + -202.013683375665))
       + 752.992610435348
+
+  # ---------------------------------------------------------------
+  # SCEA control sensor — TEMPERATURE (K), via STOL spline lookup
+  # Matches STOL WFI_MCU_B_SCEA_CSENS_FPSSEN_K (FPA sensor SN 132430).
+  # ---------------------------------------------------------------
+  WFI_MCU_B_SCEA_T_CTRLSENS:
+    units: K
+    depends_on: [WFI_MCU_B_SCEA_T_CTRLSENS_RES]
+    inputs:
+      R: WFI_MCU_B_SCEA_T_CTRLSENS_RES
+    formula: 'spline("SCEA_CSENS_FPSSEN_SN132430", R)'
 
   # ---------------------------------------------------------------
   # OFFS (Offset / CPR) control sensor (channel 3)
